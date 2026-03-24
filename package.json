@@ -1,0 +1,36 @@
+{
+  "name": "aeoess-gateway",
+  "version": "0.1.0",
+  "description": "AEOESS Hosted Enforcement Gateway",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "npx tsx src/server.ts"
+  },
+  "keywords": [],
+  "author": "Tymofii Pidlisnyi",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "agent-passport-system": "^1.21.8",
+    "better-sqlite3": "^12.8.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "rate-limiter-flexible": "^10.0.1",
+    "stripe": "^20.4.1",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.5.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
