@@ -327,3 +327,147 @@ gatewayRouter.post('/alerts/:id/acknowledge', (req: any, res) => {
     .run(req.params.id, tenant.id)
   res.json({ acknowledged: true })
 })
+
+// ═══════════════════════════════════════
+// DATA ATTRIBUTION (The Pixel)
+// ═══════════════════════════════════════
+
+// POST /api/v1/data-sources — Register a Data Source
+gatewayRouter.post('/data-sources', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const { source_id, source_name, source_url, data_terms, owner_agent_id } = req.body
+  if (!source_id || !source_name) {
+    return res.status(400).json({ error: 'Required: source_id, source_name' })
+  }
+  const db = getDB()
+  const id = randomUUID()
+  try {
+    db.prepare(`INSERT INTO data_sources (id, tenant_id, source_id, source_name, source_url, data_terms, owner_agent_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, tenant.id, source_id, source_name, source_url || null, JSON.stringify(data_terms || {}), owner_agent_id || null)
+    res.status(201).json({ id, source_id, status: 'active' })
+  } catch (e: any) {
+    if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Source already registered' })
+    return res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/v1/data-sources — List Data Sources
+gatewayRouter.get('/data-sources', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const sources = db.prepare(`SELECT * FROM data_sources WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
+  res.json({ sources, count: sources.length })
+})
+
+// POST /api/v1/access-receipts — Record Data Access
+gatewayRouter.post('/access-receipts', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const { source_id, agent_id, purpose, signature } = req.body
+  if (!source_id || !agent_id) {
+    return res.status(400).json({ error: 'Required: source_id, agent_id' })
+  }
+  const db = getDB()
+
+  // Verify source exists
+  const src = db.prepare(`SELECT * FROM data_sources WHERE tenant_id = ? AND source_id = ? AND status = 'active'`)
+    .get(tenant.id, source_id) as any
+  if (!src) return res.status(404).json({ error: `Data source "${source_id}" not found or revoked` })
+
+  const id = randomUUID()
+  db.prepare(`INSERT INTO access_receipts (id, tenant_id, source_id, agent_id, purpose, terms_snapshot, signature) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, source_id, agent_id, purpose || 'read', src.data_terms, signature || null)
+
+  // Upsert contribution ledger
+  const terms = JSON.parse(src.data_terms || '{}')
+  const rate = terms?.compensation?.rate || 0
+  const existing = db.prepare(`SELECT id, access_count, amount FROM contributions WHERE tenant_id = ? AND source_id = ? AND agent_id = ?`)
+    .get(tenant.id, source_id, agent_id) as any
+  if (existing) {
+    db.prepare(`UPDATE contributions SET access_count = access_count + 1, amount = amount + ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(rate, existing.id)
+  } else {
+    db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, currency) VALUES (?, ?, ?, ?, 1, ?, ?)`)
+      .run(randomUUID(), tenant.id, source_id, agent_id, rate, terms?.compensation?.currency || 'usd')
+  }
+
+  res.status(201).json({ receipt_id: id, source_id, agent_id, purpose: purpose || 'read' })
+})
+
+// GET /api/v1/attribution — Attribution Dashboard
+gatewayRouter.get('/attribution', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+
+  const sources = db.prepare(`SELECT COUNT(*) as c FROM data_sources WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
+  const totalAccess = db.prepare(`SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ?`).get(tenant.id) as any
+  const uniqueAgents = db.prepare(`SELECT COUNT(DISTINCT agent_id) as c FROM access_receipts WHERE tenant_id = ?`).get(tenant.id) as any
+  const totalOwed = db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM contributions WHERE tenant_id = ?`).get(tenant.id) as any
+
+  // Top sources by access count
+  const topSources = db.prepare(`
+    SELECT ds.source_name, ds.source_id, COUNT(ar.id) as accesses, COALESCE(SUM(c.amount), 0) as owed
+    FROM data_sources ds
+    LEFT JOIN access_receipts ar ON ar.tenant_id = ds.tenant_id AND ar.source_id = ds.source_id
+    LEFT JOIN contributions c ON c.tenant_id = ds.tenant_id AND c.source_id = ds.source_id
+    WHERE ds.tenant_id = ?
+    GROUP BY ds.source_id
+    ORDER BY accesses DESC LIMIT 10
+  `).all(tenant.id)
+
+  // Top consumers
+  const topAgents = db.prepare(`
+    SELECT agent_id, COUNT(*) as accesses, SUM(amount) as total_owed
+    FROM contributions WHERE tenant_id = ?
+    GROUP BY agent_id ORDER BY accesses DESC LIMIT 10
+  `).all(tenant.id)
+
+  // Recent access receipts
+  const recentAccess = db.prepare(`
+    SELECT ar.agent_id, ar.source_id, ar.purpose, ar.created_at
+    FROM access_receipts ar WHERE ar.tenant_id = ?
+    ORDER BY ar.created_at DESC LIMIT 20
+  `).all(tenant.id)
+
+  res.json({
+    summary: {
+      data_sources: sources.c,
+      total_accesses: totalAccess.c,
+      unique_agents: uniqueAgents.c,
+      total_owed: Math.round(totalOwed.total * 10000) / 10000,
+    },
+    top_sources: topSources,
+    top_agents: topAgents,
+    recent_access: recentAccess,
+  })
+})
+
+// POST /api/v1/settlements — Generate Settlement
+gatewayRouter.post('/settlements', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const { period_start, period_end } = req.body
+  if (!period_start || !period_end) {
+    return res.status(400).json({ error: 'Required: period_start, period_end' })
+  }
+  const db = getDB()
+  const contributions = db.prepare(`SELECT * FROM contributions WHERE tenant_id = ? AND amount > 0`).all(tenant.id) as any[]
+  if (contributions.length === 0) {
+    return res.status(404).json({ error: 'No contributions to settle' })
+  }
+  const lineItems = contributions.map((c: any) => ({
+    source_id: c.source_id, agent_id: c.agent_id,
+    accesses: c.access_count, amount: c.amount, currency: c.currency,
+  }))
+  const total = contributions.reduce((s: number, c: any) => s + c.amount, 0)
+  const id = randomUUID()
+  db.prepare(`INSERT INTO settlements (id, tenant_id, period_start, period_end, total_amount, line_items) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, period_start, period_end, total, JSON.stringify(lineItems))
+  res.status(201).json({ settlement_id: id, period_start, period_end, total_amount: Math.round(total * 10000) / 10000, line_items: lineItems.length })
+})
+
+// GET /api/v1/settlements — List Settlements
+gatewayRouter.get('/settlements', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const settlements = db.prepare(`SELECT id, period_start, period_end, total_amount, created_at FROM settlements WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
+  res.json({ settlements, count: settlements.length })
+})

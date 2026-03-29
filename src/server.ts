@@ -16,6 +16,12 @@
  *   GET  /api/v1/dashboard      — dashboard summary
  *   GET  /api/v1/usage          — usage history
  *   POST /api/v1/alerts/:id/ack — acknowledge alert
+ *   POST /api/v1/data-sources   — register data source (Pixel)
+ *   GET  /api/v1/data-sources   — list data sources
+ *   POST /api/v1/access-receipts — record data access
+ *   GET  /api/v1/attribution    — attribution dashboard
+ *   POST /api/v1/settlements    — generate settlement
+ *   GET  /api/v1/settlements    — list settlements
  *   GET  /healthz               — health check
  */
 
@@ -88,7 +94,7 @@ console.log(`
   AEOESS Gateway v0.1.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 11 API routes
+  Endpoints: 17 API routes
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {

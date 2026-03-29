@@ -134,6 +134,59 @@ function createTables() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Data Sources (Pixel: registered data with terms)
+    CREATE TABLE IF NOT EXISTS data_sources (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      source_id TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      source_url TEXT,
+      data_terms TEXT NOT NULL DEFAULT '{}',
+      owner_agent_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at TEXT,
+      UNIQUE(tenant_id, source_id)
+    );
+
+    -- Access Receipts (Pixel: who accessed what data, when)
+    CREATE TABLE IF NOT EXISTS access_receipts (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      source_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      purpose TEXT NOT NULL DEFAULT 'read',
+      terms_snapshot TEXT,
+      signature TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Contribution Ledger (Pixel: aggregated usage per source per agent)
+    CREATE TABLE IF NOT EXISTS contributions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      source_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      access_count INTEGER DEFAULT 0,
+      amount REAL DEFAULT 0.0,
+      currency TEXT DEFAULT 'usd',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, source_id, agent_id)
+    );
+
+    -- Settlements (Pixel: Merkle-committed payment records)
+    CREATE TABLE IF NOT EXISTS settlements (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      total_amount REAL DEFAULT 0.0,
+      line_items TEXT NOT NULL DEFAULT '[]',
+      merkle_root TEXT,
+      signature TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS idx_evals_tenant ON policy_evaluations(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_evals_agent ON policy_evaluations(tenant_id, agent_id);
@@ -141,6 +194,11 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_delegations_tenant ON delegations(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_usage_tenant ON usage(tenant_id, period);
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
+    CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_access_receipts_source ON access_receipts(tenant_id, source_id);
+    CREATE INDEX IF NOT EXISTS idx_contributions_tenant ON contributions(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_settlements_tenant ON settlements(tenant_id, period_start);
   `)
 }
 
