@@ -761,7 +761,7 @@ gatewayRouter.post('/verify-declaration', (req: any, res) => {
 
     // Classify evidence
     let evidence_class: string
-    if (rc.receipt_exists && lexical && lexical.verdict === 'high_overlap') {
+    if (rc.receipt_exists && lexical && (lexical.verdict === 'high_overlap' || lexical.verdict === 'moderate_overlap')) {
       evidence_class = 'supported_usage'
     } else if (rc.receipt_exists && (!lexical || lexical.verdict === 'low_overlap')) {
       evidence_class = 'access_without_surface_carryover'
@@ -920,7 +920,7 @@ gatewayRouter.get('/provenance-dossier', (req: any, res) => {
     },
     negative_evidence: {
       sources_accessed_but_not_declared: accessed_not_declared,
-      declaration_coverage: accessed_source_ids.size > 0 ? Math.round((declared_source_ids.size / accessed_source_ids.size) * 100) + '%' : 'n/a',
+      declaration_coverage: `${declared_source_ids.size} declared / ${accessed_source_ids.size} accessed`,
     },
     coverage: {
       scope: 'gateway_tracked_only',
