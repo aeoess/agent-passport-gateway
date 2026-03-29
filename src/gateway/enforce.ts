@@ -332,6 +332,28 @@ gatewayRouter.post('/alerts/:id/acknowledge', (req: any, res) => {
 // DATA ATTRIBUTION (The Pixel)
 // ═══════════════════════════════════════
 
+// Purpose weight multipliers — how much more valuable each usage type is
+const DEFAULT_PURPOSE_WEIGHTS: Record<string, number> = {
+  read: 1,
+  summary: 2,
+  citation: 1.5,
+  editorial_research: 1.5,
+  rag: 5,
+  rag_embedding: 5,
+  embedding: 5,
+  training: 10,
+  fine_tune: 10,
+}
+
+function getPurposeWeight(purpose: string, terms: any): number {
+  // Terms can override default weights via compensation.purpose_weights
+  const custom = terms?.compensation?.purpose_weights
+  if (custom && typeof custom === 'object' && custom[purpose] !== undefined) {
+    return custom[purpose]
+  }
+  return DEFAULT_PURPOSE_WEIGHTS[purpose] || 1
+}
+
 // POST /api/v1/data-sources — Register a Data Source
 gatewayRouter.post('/data-sources', (req: any, res) => {
   const tenant: Tenant = req.tenant
@@ -377,20 +399,22 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
   db.prepare(`INSERT INTO access_receipts (id, tenant_id, source_id, agent_id, purpose, terms_snapshot, signature) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, source_id, agent_id, purpose || 'read', src.data_terms, signature || null)
 
-  // Upsert contribution ledger
+  // Upsert contribution ledger (purpose-weighted)
   const terms = JSON.parse(src.data_terms || '{}')
-  const rate = terms?.compensation?.rate || 0
+  const baseRate = terms?.compensation?.rate || 0
+  const weight = getPurposeWeight(purpose || 'read', terms)
+  const effectiveRate = baseRate * weight
   const existing = db.prepare(`SELECT id, access_count, amount FROM contributions WHERE tenant_id = ? AND source_id = ? AND agent_id = ?`)
     .get(tenant.id, source_id, agent_id) as any
   if (existing) {
     db.prepare(`UPDATE contributions SET access_count = access_count + 1, amount = amount + ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(rate, existing.id)
+      .run(effectiveRate, existing.id)
   } else {
     db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, currency) VALUES (?, ?, ?, ?, 1, ?, ?)`)
-      .run(randomUUID(), tenant.id, source_id, agent_id, rate, terms?.compensation?.currency || 'usd')
+      .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate, terms?.compensation?.currency || 'usd')
   }
 
-  res.status(201).json({ receipt_id: id, source_id, agent_id, purpose: purpose || 'read' })
+  res.status(201).json({ receipt_id: id, source_id, agent_id, purpose: purpose || 'read', weight, effective_rate: effectiveRate })
 })
 
 // GET /api/v1/attribution — Attribution Dashboard
