@@ -12,7 +12,7 @@ RUN npm ci --production=false
 # Build TypeScript
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+RUN npm run build && echo "Build completed at $(date)"
 
 # Remove dev dependencies
 RUN npm prune --production
