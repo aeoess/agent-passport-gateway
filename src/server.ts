@@ -20,6 +20,16 @@
  */
 
 import express from 'express'
+import { mkdirSync, existsSync } from 'node:fs'
+import { dirname } from 'node:path'
+
+// Ensure DB directory exists (Railway Volumes mount at /data)
+const dbPath = process.env.DB_PATH || './gateway.db'
+const dbDir = dirname(dbPath)
+if (dbDir !== '.' && !existsSync(dbDir)) {
+  mkdirSync(dbDir, { recursive: true })
+  console.log('Created DB directory:', dbDir)
+}
 import cors from 'cors'
 import helmet from 'helmet'
 import { initDB } from './db/schema.js'
@@ -27,7 +37,7 @@ import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
-const DB_PATH = process.env.DB_PATH || './gateway.db'
+const DB_PATH = dbPath
 
 const app = express()
 
@@ -75,7 +85,7 @@ app.use((_req, res) => {
 const db = initDB(DB_PATH)
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.1.0
+  AEOESS Gateway v0.1.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
   Endpoints: 11 API routes

@@ -4,7 +4,7 @@
   "description": "AEOESS Hosted Enforcement Gateway",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npx tsc",
     "start": "node dist/server.js",
     "dev": "npx tsx src/server.ts"
   },
@@ -13,7 +13,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
-    "agent-passport-system": "^1.21.8",
+    "agent-passport-system": "^1.27.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
