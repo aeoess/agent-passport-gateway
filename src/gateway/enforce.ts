@@ -405,18 +405,17 @@ gatewayRouter.get('/attribution', (req: any, res) => {
 
   // Top sources by access count
   const topSources = db.prepare(`
-    SELECT ds.source_name, ds.source_id, COUNT(ar.id) as accesses, COALESCE(SUM(c.amount), 0) as owed
+    SELECT ds.source_name, ds.source_id,
+      (SELECT COUNT(*) FROM access_receipts ar WHERE ar.tenant_id = ds.tenant_id AND ar.source_id = ds.source_id) as accesses,
+      (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.tenant_id = ds.tenant_id AND c.source_id = ds.source_id) as owed
     FROM data_sources ds
-    LEFT JOIN access_receipts ar ON ar.tenant_id = ds.tenant_id AND ar.source_id = ds.source_id
-    LEFT JOIN contributions c ON c.tenant_id = ds.tenant_id AND c.source_id = ds.source_id
     WHERE ds.tenant_id = ?
-    GROUP BY ds.source_id
     ORDER BY accesses DESC LIMIT 10
   `).all(tenant.id)
 
   // Top consumers
   const topAgents = db.prepare(`
-    SELECT agent_id, COUNT(*) as accesses, SUM(amount) as total_owed
+    SELECT agent_id, SUM(access_count) as accesses, SUM(amount) as total_owed
     FROM contributions WHERE tenant_id = ?
     GROUP BY agent_id ORDER BY accesses DESC LIMIT 10
   `).all(tenant.id)
