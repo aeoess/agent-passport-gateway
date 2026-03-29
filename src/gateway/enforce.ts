@@ -18,6 +18,35 @@ import type { Tenant } from '../auth/api-keys.js'
 export const gatewayRouter = Router()
 
 // ═══════════════════════════════════════
+// Lexical similarity utilities (reusable)
+// ═══════════════════════════════════════
+
+function ngrams(text: string, n: number): Set<string> {
+  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2)
+  const grams = new Set<string>()
+  for (let i = 0; i <= words.length - n; i++) grams.add(words.slice(i, i + n).join(' '))
+  return grams
+}
+
+function jaccardOverlap(a: Set<string>, b: Set<string>): number {
+  let shared = 0
+  a.forEach(g => { if (b.has(g)) shared++ })
+  const union = new Set([...a, ...b]).size
+  return union > 0 ? shared / union : 0
+}
+
+function computeLexicalScore(sourceText: string, outputText: string) {
+  const uni = jaccardOverlap(ngrams(sourceText, 1), ngrams(outputText, 1))
+  const bi = jaccardOverlap(ngrams(sourceText, 2), ngrams(outputText, 2))
+  const tri = jaccardOverlap(ngrams(sourceText, 3), ngrams(outputText, 3))
+  const score = Math.round((uni * 0.2 + bi * 0.35 + tri * 0.45) * 10000) / 10000
+  return {
+    score, detail: { unigram: Math.round(uni * 10000) / 10000, bigram: Math.round(bi * 10000) / 10000, trigram: Math.round(tri * 10000) / 10000 },
+    verdict: score > 0.3 ? 'high_overlap' as const : score > 0.1 ? 'moderate_overlap' as const : 'low_overlap' as const,
+  }
+}
+
+// ═══════════════════════════════════════
 // Usage check middleware
 // ═══════════════════════════════════════
 
@@ -676,40 +705,228 @@ gatewayRouter.post('/reset-attribution', (req: any, res) => {
 // The honest attribution signal: 80% accurate on hard negatives.
 // Not derivation proof — lexical forensic evidence.
 gatewayRouter.post('/compare-texts', (req: any, res) => {
-  const { source_text, output_text } = req.body
+  const { source_text, output_text, method } = req.body
   if (!source_text || !output_text) {
     return res.status(400).json({ error: 'Required: source_text, output_text' })
   }
+  // Pluggable backend (future: bm25, custom). Default: tfidf/ngram_jaccard
+  const lex = computeLexicalScore(source_text, output_text)
+  res.json({
+    method: method || 'ngram_jaccard',
+    similarity_score: lex.score, detail: lex.detail, interpretation: lex.verdict,
+    note: 'Lexical forensic evidence. Not derivation proof. Combine with access receipts and temporal ordering.',
+  })
+})
 
-  // Simple n-gram overlap scoring (server-side TF-IDF approximation)
-  const ngrams = (text: string, n: number): Set<string> => {
-    const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2)
-    const grams = new Set<string>()
-    for (let i = 0; i <= words.length - n; i++) {
-      grams.add(words.slice(i, i + n).join(' '))
+
+// ═══════════════════════════════════════════════════════════════
+// VERIFIED SELF-DECLARATION (the core innovation)
+// Agent declares sources, gateway verifies plausibility
+// ═══════════════════════════════════════════════════════════════
+
+gatewayRouter.post('/verify-declaration', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const { agent_id, output_text, declared_sources, output_url } = req.body
+
+  if (!agent_id || !output_text || !declared_sources || !Array.isArray(declared_sources) || declared_sources.length === 0) {
+    return res.status(400).json({ error: 'Required: agent_id, output_text, declared_sources (array of source_id strings)' })
+  }
+
+  const db = getDB()
+  const id = randomUUID()
+
+  // 1. Check access receipts for each declared source
+  const receiptCheck = declared_sources.map((sourceId: string) => {
+    const receipts = db.prepare(
+      `SELECT id, created_at, purpose FROM access_receipts WHERE tenant_id = ? AND agent_id = ? AND source_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(tenant.id, agent_id, sourceId) as any
+    return { source_id: sourceId, receipt_exists: !!receipts, last_access: receipts?.created_at || null, purpose: receipts?.purpose || null }
+  })
+
+
+  // 2. Fetch source texts for lexical comparison
+  const plausibility = receiptCheck.map((rc: any) => {
+    const src = db.prepare(
+      `SELECT source_name, source_url FROM data_sources WHERE tenant_id = ? AND source_id = ?`
+    ).get(tenant.id, rc.source_id) as any
+
+    // If source has stored text (via source_url or name), compute lexical overlap
+    // For now, store the declaration and flag based on receipt status
+    let lexical = null as any
+    // Check if source content was provided inline
+    const sourceContent = (req.body.source_texts || {})[rc.source_id]
+    if (sourceContent) {
+      lexical = computeLexicalScore(sourceContent, output_text)
     }
-    return grams
+
+    // Classify evidence
+    let evidence_class: string
+    if (rc.receipt_exists && lexical && lexical.verdict === 'high_overlap') {
+      evidence_class = 'supported_usage'
+    } else if (rc.receipt_exists && (!lexical || lexical.verdict === 'low_overlap')) {
+      evidence_class = 'access_without_surface_carryover'
+    } else if (!rc.receipt_exists && lexical && lexical.verdict !== 'low_overlap') {
+      evidence_class = 'untracked_overlap'
+    } else {
+      evidence_class = 'no_observed_linkage'
+    }
+
+
+    let verdict: string
+    if (rc.receipt_exists && (!lexical || lexical.score >= 0.05)) {
+      verdict = 'plausible'
+    } else if (!rc.receipt_exists) {
+      verdict = 'no_receipt'
+    } else if (lexical && lexical.score < 0.02) {
+      verdict = 'implausible'
+    } else {
+      verdict = 'weak'
+    }
+
+    return {
+      source_id: rc.source_id, source_name: src?.source_name || null,
+      receipt_exists: rc.receipt_exists, last_access: rc.last_access, purpose: rc.purpose,
+      lexical: lexical ? { score: lexical.score, detail: lexical.detail, verdict: lexical.verdict } : null,
+      evidence_class, verdict,
+    }
+  })
+
+
+  // 3. Generate flags
+  const flags: string[] = []
+  for (const p of plausibility) {
+    if (p.verdict === 'implausible') flags.push(`Declared source ${p.source_id} shows near-zero lexical overlap with output`)
+    if (p.verdict === 'no_receipt') flags.push(`No access receipt found for declared source ${p.source_id}`)
+    if (p.evidence_class === 'untracked_overlap') flags.push(`High overlap with ${p.source_id} but no access receipt — possible untracked reuse`)
   }
 
-  const overlap = (a: Set<string>, b: Set<string>): number => {
-    let shared = 0
-    a.forEach(g => { if (b.has(g)) shared++ })
-    const union = new Set([...a, ...b]).size
-    return union > 0 ? shared / union : 0
+  // 4. Check for undeclared sources with high overlap (if source_texts provided)
+  const sources_accessed = db.prepare(
+    `SELECT DISTINCT source_id FROM access_receipts WHERE tenant_id = ? AND agent_id = ?`
+  ).all(tenant.id, agent_id) as any[]
+
+  const declared_set = new Set(declared_sources)
+  const sources_accessed_but_not_declared: string[] = []
+  for (const sa of sources_accessed) {
+    if (!declared_set.has(sa.source_id)) sources_accessed_but_not_declared.push(sa.source_id)
+  }
+  if (sources_accessed_but_not_declared.length > 0) {
+    flags.push(`Agent accessed ${sources_accessed_but_not_declared.length} source(s) not included in declaration`)
   }
 
-  // Compute Jaccard overlap at unigram, bigram, trigram levels
-  const uni = overlap(ngrams(source_text, 1), ngrams(output_text, 1))
-  const bi = overlap(ngrams(source_text, 2), ngrams(output_text, 2))
-  const tri = overlap(ngrams(source_text, 3), ngrams(output_text, 3))
 
-  // Weighted score (trigrams weighted higher — more specific signal)
-  const score = Math.round((uni * 0.2 + bi * 0.35 + tri * 0.45) * 10000) / 10000
+  // 5. Store the verified declaration as a derivation
+  db.prepare(`INSERT INTO derivations (id, tenant_id, agent_id, source_ids, output_description, output_url, access_receipt_ids, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, agent_id, JSON.stringify(declared_sources), 'verified-declaration', output_url || null, JSON.stringify([]), 'gateway-verified')
+
+  // 6. Fire alerts for anomalies
+  if (flags.length > 0) {
+    db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+      .run(randomUUID(), tenant.id, 'declaration_anomaly', flags.some(f => f.includes('untracked')) ? 'warning' : 'info',
+        `Declaration from "${agent_id}": ${flags.join('; ')}`)
+  }
+
+  // 7. Coverage scope
+  const total_sources = (db.prepare(`SELECT COUNT(*) as c FROM data_sources WHERE tenant_id = ?`).get(tenant.id) as any).c
+  const total_receipts = (db.prepare(`SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agent_id) as any).c
+
+  res.status(201).json({
+    declaration_id: id, agent_id,
+    plausibility,
+    flags,
+    sources_accessed_but_not_declared,
+    coverage: {
+      scope: 'gateway_tracked_only',
+      registered_sources: total_sources,
+      agent_total_accesses: total_receipts,
+      note: 'No receipt does not prove no access. Coverage limited to gateway-tracked interactions.',
+    },
+    evidence_limits: 'Lexical overlap is forensic evidence, not derivation proof. Combined with receipts and temporal ordering for multi-factor attribution.',
+  })
+})
+
+
+// ═══════════════════════════════════════════════════════════════
+// PROVENANCE DOSSIER — full evidence bundle for an agent's outputs
+// ═══════════════════════════════════════════════════════════════
+
+gatewayRouter.get('/provenance-dossier', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const agent_id = req.query.agent_id as string
+  if (!agent_id) return res.status(400).json({ error: 'Required: agent_id query parameter' })
+
+  const db = getDB()
+
+  // All access receipts for this agent
+  const receipts = db.prepare(
+    `SELECT ar.id, ar.source_id, ar.agent_id, ar.purpose, ar.created_at, ds.source_name
+     FROM access_receipts ar LEFT JOIN data_sources ds ON ar.source_id = ds.source_id AND ar.tenant_id = ds.tenant_id
+     WHERE ar.tenant_id = ? AND ar.agent_id = ? ORDER BY ar.created_at DESC LIMIT 100`
+  ).all(tenant.id, agent_id) as any[]
+
+  // All derivation declarations
+  const derivations = db.prepare(
+    `SELECT * FROM derivations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 50`
+  ).all(tenant.id, agent_id) as any[]
+
+
+  // Contributions owed
+  const contributions = db.prepare(
+    `SELECT source_id, access_count, amount, currency, updated_at FROM contributions WHERE tenant_id = ? AND agent_id = ?`
+  ).all(tenant.id, agent_id) as any[]
+
+  // Source access frequency (longitudinal pattern)
+  const sourceFrequency = db.prepare(
+    `SELECT source_id, COUNT(*) as accesses, MIN(created_at) as first_access, MAX(created_at) as last_access,
+     COUNT(DISTINCT date(created_at)) as distinct_days
+     FROM access_receipts WHERE tenant_id = ? AND agent_id = ? GROUP BY source_id ORDER BY accesses DESC`
+  ).all(tenant.id, agent_id) as any[]
+
+  // Purpose breakdown
+  const purposes = db.prepare(
+    `SELECT purpose, COUNT(*) as count FROM access_receipts WHERE tenant_id = ? AND agent_id = ? GROUP BY purpose`
+  ).all(tenant.id, agent_id) as any[]
+
+  // Sources accessed but never declared
+  const declared_source_ids = new Set<string>()
+  for (const d of derivations) {
+    for (const sid of JSON.parse(d.source_ids || '[]')) declared_source_ids.add(sid)
+  }
+  const accessed_source_ids = new Set(receipts.map((r: any) => r.source_id))
+  const accessed_not_declared = [...accessed_source_ids].filter(s => !declared_source_ids.has(s))
+
+
+  // Classify longitudinal patterns
+  const patterns: string[] = []
+  for (const sf of sourceFrequency) {
+    if (sf.distinct_days >= 5) patterns.push(`habitual_consumer: ${sf.source_id} (${sf.accesses} accesses over ${sf.distinct_days} days)`)
+    else if (sf.accesses >= 10) patterns.push(`heavy_consumer: ${sf.source_id} (${sf.accesses} accesses)`)
+  }
+  if (accessed_not_declared.length > 3) patterns.push(`low_declaration_rate: ${accessed_not_declared.length} sources accessed but never declared`)
+
+  // Coverage
+  const total_sources = (db.prepare(`SELECT COUNT(*) as c FROM data_sources WHERE tenant_id = ?`).get(tenant.id) as any).c
 
   res.json({
-    similarity_score: score,
-    detail: { unigram: Math.round(uni * 10000) / 10000, bigram: Math.round(bi * 10000) / 10000, trigram: Math.round(tri * 10000) / 10000 },
-    interpretation: score > 0.3 ? 'high_overlap' : score > 0.1 ? 'moderate_overlap' : 'low_overlap',
-    note: 'Lexical forensic evidence. Not derivation proof. Combine with access receipts and temporal ordering for multi-factor attribution.',
+    agent_id,
+    generated_at: new Date().toISOString(),
+    evidence: {
+      access_receipts: { count: receipts.length, items: receipts.slice(0, 20) },
+      declarations: { count: derivations.length, items: (derivations as any[]).map((d: any) => ({ ...d, source_ids: JSON.parse(d.source_ids || '[]') })).slice(0, 10) },
+      contributions: { total_owed: Math.round(contributions.reduce((s: number, c: any) => s + (c.amount || 0), 0) * 10000) / 10000, items: contributions },
+      purpose_breakdown: purposes,
+      source_frequency: sourceFrequency,
+      longitudinal_patterns: patterns,
+    },
+    negative_evidence: {
+      sources_accessed_but_not_declared: accessed_not_declared,
+      declaration_coverage: accessed_source_ids.size > 0 ? Math.round((declared_source_ids.size / accessed_source_ids.size) * 100) + '%' : 'n/a',
+    },
+    coverage: {
+      scope: 'gateway_tracked_only',
+      registered_sources: total_sources,
+      note: 'This dossier covers gateway-tracked interactions only. Absence of a receipt does not prove absence of access.',
+    },
+    evidence_limits: 'This is a structured evidentiary record that may support audit, compliance, contractual enforcement, or legal review depending on jurisdiction and context. It does not constitute a legal determination of derivation or infringement.',
   })
 })
