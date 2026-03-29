@@ -174,7 +174,7 @@ gatewayRouter.post('/revoke', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const { target_type, target_id, revoked_by } = req.body
   if (!target_type || !target_id) {
-    return res.status(400).json({ error: 'Required: target_type (agent|delegation), target_id' })
+    return res.status(400).json({ error: 'Required: target_type (agent|delegation|data_source), target_id' })
   }
 
   const db = getDB()
@@ -192,6 +192,14 @@ gatewayRouter.post('/revoke', (req: any, res) => {
     db.prepare(`UPDATE delegations SET status = 'revoked', revoked_at = datetime('now') WHERE tenant_id = ? AND id = ?`)
       .run(tenant.id, target_id)
     cascadeCount = 1
+  } else if (target_type === 'data_source') {
+    // Retract a data source — no more access receipts will be generated
+    db.prepare(`UPDATE data_sources SET status = 'revoked', revoked_at = datetime('now') WHERE tenant_id = ? AND source_id = ?`)
+      .run(tenant.id, target_id)
+    // Count affected agents (who consumed this source)
+    const affected = db.prepare(`SELECT COUNT(DISTINCT agent_id) as c FROM access_receipts WHERE tenant_id = ? AND source_id = ?`)
+      .get(tenant.id, target_id) as any
+    cascadeCount = affected.c
   }
 
   const revocationId = randomUUID()
@@ -487,6 +495,12 @@ gatewayRouter.get('/attribution', (req: any, res) => {
     GROUP BY DATE(created_at) ORDER BY day ASC
   `).all(tenant.id)
 
+  // Purpose breakdown
+  const purposeBreakdown = db.prepare(`
+    SELECT purpose, COUNT(*) as count FROM access_receipts WHERE tenant_id = ?
+    GROUP BY purpose ORDER BY count DESC
+  `).all(tenant.id)
+
   res.json({
     summary: {
       data_sources: sources.c,
@@ -498,6 +512,7 @@ gatewayRouter.get('/attribution', (req: any, res) => {
     top_agents: topAgents,
     recent_access: recentAccess,
     time_series: timeSeries,
+    purpose_breakdown: purposeBreakdown,
   })
 })
 
@@ -530,4 +545,57 @@ gatewayRouter.get('/settlements', (req: any, res) => {
   const db = getDB()
   const settlements = db.prepare(`SELECT id, period_start, period_end, total_amount, created_at FROM settlements WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
   res.json({ settlements, count: settlements.length })
+})
+
+// ═══════════════════════════════════════
+// AGENT SELF-SERVICE (transparency — agents audit their own usage)
+// ═══════════════════════════════════════
+
+// GET /api/v1/my-consumption?agent_id=X — Agent views what they've consumed
+gatewayRouter.get('/my-consumption', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const agent_id = req.query.agent_id as string
+  if (!agent_id) {
+    return res.status(400).json({ error: 'Required query param: agent_id' })
+  }
+  const db = getDB()
+
+  // What sources this agent has accessed
+  const sources = db.prepare(`
+    SELECT source_id, purpose, COUNT(*) as accesses, MIN(created_at) as first_access, MAX(created_at) as last_access
+    FROM access_receipts WHERE tenant_id = ? AND agent_id = ?
+    GROUP BY source_id, purpose ORDER BY accesses DESC
+  `).all(tenant.id, agent_id)
+
+  // What this agent owes
+  const contributions = db.prepare(`
+    SELECT source_id, access_count, amount, currency, updated_at
+    FROM contributions WHERE tenant_id = ? AND agent_id = ?
+    ORDER BY amount DESC
+  `).all(tenant.id, agent_id)
+
+  const totalOwed = contributions.reduce((s: number, c: any) => s + (c.amount || 0), 0)
+  const totalAccesses = sources.reduce((s: number, r: any) => s + r.accesses, 0)
+
+  // Terms the agent should be aware of
+  const sourceTerms = db.prepare(`
+    SELECT source_id, source_name, data_terms FROM data_sources
+    WHERE tenant_id = ? AND source_id IN (SELECT DISTINCT source_id FROM access_receipts WHERE tenant_id = ? AND agent_id = ?)
+  `).all(tenant.id, tenant.id, agent_id)
+
+  res.json({
+    agent_id,
+    summary: {
+      total_accesses: totalAccesses,
+      unique_sources: new Set(sources.map((s: any) => s.source_id)).size,
+      total_owed: Math.round(totalOwed * 10000) / 10000,
+    },
+    access_by_source: sources,
+    contributions,
+    source_terms: sourceTerms.map((s: any) => ({
+      source_id: s.source_id,
+      source_name: s.source_name,
+      terms: JSON.parse(s.data_terms || '{}'),
+    })),
+  })
 })

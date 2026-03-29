@@ -22,6 +22,7 @@
  *   GET  /api/v1/attribution    — attribution dashboard
  *   POST /api/v1/settlements    — generate settlement
  *   GET  /api/v1/settlements    — list settlements
+ *   GET  /api/v1/my-consumption — agent self-service (what did I consume?)
  *   GET  /healthz               — health check
  */
 
@@ -94,7 +95,7 @@ console.log(`
   AEOESS Gateway v0.1.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 17 API routes
+  Endpoints: 18 API routes
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {
