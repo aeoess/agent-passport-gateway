@@ -599,3 +599,25 @@ gatewayRouter.get('/my-consumption', (req: any, res) => {
     })),
   })
 })
+
+
+// POST /api/v1/reset-attribution — Clear all demo/test attribution data
+gatewayRouter.post('/reset-attribution', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const ar = db.prepare(`DELETE FROM access_receipts WHERE tenant_id = ?`).run(tenant.id)
+  const co = db.prepare(`DELETE FROM contributions WHERE tenant_id = ?`).run(tenant.id)
+  const ds = db.prepare(`DELETE FROM data_sources WHERE tenant_id = ?`).run(tenant.id)
+  const st = db.prepare(`DELETE FROM settlements WHERE tenant_id = ?`).run(tenant.id)
+  const al = db.prepare(`DELETE FROM alerts WHERE tenant_id = ?`).run(tenant.id)
+  res.json({
+    cleared: {
+      access_receipts: ar.changes,
+      contributions: co.changes,
+      data_sources: ds.changes,
+      settlements: st.changes,
+      alerts: al.changes,
+    },
+    message: 'Attribution data cleared. Real data will flow once MCP tracking is live.',
+  })
+})
