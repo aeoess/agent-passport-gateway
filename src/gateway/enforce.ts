@@ -574,8 +574,8 @@ gatewayRouter.get('/my-consumption', (req: any, res) => {
     ORDER BY amount DESC
   `).all(tenant.id, agent_id)
 
-  const totalOwed = contributions.reduce((s: number, c: any) => s + (c.amount || 0), 0)
-  const totalAccesses = sources.reduce((s: number, r: any) => s + r.accesses, 0)
+  const totalOwed: number = (contributions as any[]).reduce((s: number, c: any) => s + (c.amount || 0), 0)
+  const totalAccesses: number = (sources as any[]).reduce((s: number, r: any) => s + r.accesses, 0)
 
   // Terms the agent should be aware of
   const sourceTerms = db.prepare(`
@@ -587,7 +587,7 @@ gatewayRouter.get('/my-consumption', (req: any, res) => {
     agent_id,
     summary: {
       total_accesses: totalAccesses,
-      unique_sources: new Set(sources.map((s: any) => s.source_id)).size,
+      unique_sources: new Set((sources as any[]).map((s: any) => s.source_id)).size,
       total_owed: Math.round(totalOwed * 10000) / 10000,
     },
     access_by_source: sources,
