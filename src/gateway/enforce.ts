@@ -414,6 +414,35 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
       .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate, terms?.compensation?.currency || 'usd')
   }
 
+  // ── Attribution Alerts (fire-and-forget) ──
+  try {
+    // Alert: high access rate (>50 in last hour from same agent)
+    const hourAgo = new Date(Date.now() - 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+    const recentCount = db.prepare(
+      `SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ? AND agent_id = ? AND created_at > ?`
+    ).get(tenant.id, agent_id, hourAgo) as any
+    if (recentCount.c > 50 && recentCount.c % 50 === 1) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'high_access_rate', 'warning',
+          `Agent "${agent_id}" made ${recentCount.c} data accesses in the last hour`)
+    }
+    // Alert: training/fine-tune purpose (always notify — high-value event)
+    if (purpose === 'training' || purpose === 'fine_tune') {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'training_access', 'info',
+          `Agent "${agent_id}" accessed "${source_id}" for ${purpose} (${weight}x rate)`)
+    }
+    // Alert: new agent first seen
+    const agentHistory = db.prepare(
+      `SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ? AND agent_id = ? AND id != ?`
+    ).get(tenant.id, agent_id, id) as any
+    if (agentHistory.c === 0) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'new_consumer', 'info',
+          `New agent "${agent_id}" first accessed your data (source: "${source_id}", purpose: ${purpose || 'read'})`)
+    }
+  } catch (_) { /* alerts are non-critical */ }
+
   res.status(201).json({ receipt_id: id, source_id, agent_id, purpose: purpose || 'read', weight, effective_rate: effectiveRate })
 })
 
@@ -451,6 +480,13 @@ gatewayRouter.get('/attribution', (req: any, res) => {
     ORDER BY ar.created_at DESC LIMIT 20
   `).all(tenant.id)
 
+  // Time series: accesses per day (last 30 days)
+  const timeSeries = db.prepare(`
+    SELECT DATE(created_at) as day, COUNT(*) as accesses, COUNT(DISTINCT agent_id) as agents
+    FROM access_receipts WHERE tenant_id = ? AND created_at > datetime('now', '-30 days')
+    GROUP BY DATE(created_at) ORDER BY day ASC
+  `).all(tenant.id)
+
   res.json({
     summary: {
       data_sources: sources.c,
@@ -461,6 +497,7 @@ gatewayRouter.get('/attribution', (req: any, res) => {
     top_sources: topSources,
     top_agents: topAgents,
     recent_access: recentAccess,
+    time_series: timeSeries,
   })
 })
 
