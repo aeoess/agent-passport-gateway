@@ -463,6 +463,7 @@ gatewayRouter.get('/attribution', (req: any, res) => {
   const totalAccess = db.prepare(`SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ?`).get(tenant.id) as any
   const uniqueAgents = db.prepare(`SELECT COUNT(DISTINCT agent_id) as c FROM access_receipts WHERE tenant_id = ?`).get(tenant.id) as any
   const totalOwed = db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM contributions WHERE tenant_id = ?`).get(tenant.id) as any
+  const derivationCount = db.prepare(`SELECT COUNT(*) as c FROM derivations WHERE tenant_id = ?`).get(tenant.id) as any
 
   // Top sources by access count
   const topSources = db.prepare(`
@@ -507,6 +508,7 @@ gatewayRouter.get('/attribution', (req: any, res) => {
       total_accesses: totalAccess.c,
       unique_agents: uniqueAgents.c,
       total_owed: Math.round(totalOwed.total * 10000) / 10000,
+      derivations_declared: derivationCount.c,
     },
     top_sources: topSources,
     top_agents: topAgents,
@@ -600,6 +602,51 @@ gatewayRouter.get('/my-consumption', (req: any, res) => {
   })
 })
 
+// ═══════════════════════════════════════
+// DERIVATIONS (agent-declared usage chain)
+// ═══════════════════════════════════════
+
+// POST /api/v1/derivations — Agent declares "I used these sources to produce this output"
+gatewayRouter.post('/derivations', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const { agent_id, source_ids, output_description, output_url, signature } = req.body
+  if (!agent_id || !source_ids || !Array.isArray(source_ids) || source_ids.length === 0) {
+    return res.status(400).json({ error: 'Required: agent_id, source_ids (array of source_id strings)' })
+  }
+  const db = getDB()
+  const placeholders = source_ids.map(() => '?').join(',')
+  const receipts = db.prepare(
+    `SELECT id, source_id FROM access_receipts WHERE tenant_id = ? AND agent_id = ? AND source_id IN (${placeholders})`
+  ).all(tenant.id, agent_id, ...source_ids) as any[]
+  const id = randomUUID()
+  db.prepare(`INSERT INTO derivations (id, tenant_id, agent_id, source_ids, output_description, output_url, access_receipt_ids, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, agent_id, JSON.stringify(source_ids), output_description || null, output_url || null, JSON.stringify(receipts.map((r: any) => r.id)), signature || null)
+  db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+    .run(randomUUID(), tenant.id, 'derivation_declared', 'info',
+      `Agent "${agent_id}" declared usage of ${source_ids.length} source(s) for "${output_description || output_url || 'undescribed'}"`)
+  res.status(201).json({
+    derivation_id: id, agent_id,
+    sources_declared: source_ids.length,
+    access_receipts_linked: receipts.length,
+    coverage: source_ids.length > 0 ? Math.round((receipts.length / source_ids.length) * 100) + '%' : '0%',
+  })
+})
+
+// GET /api/v1/derivations — List derivation declarations
+gatewayRouter.get('/derivations', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const agent = req.query.agent_id as string
+  let query = `SELECT * FROM derivations WHERE tenant_id = ?`
+  const params: any[] = [tenant.id]
+  if (agent) { query += ` AND agent_id = ?`; params.push(agent) }
+  query += ` ORDER BY created_at DESC LIMIT 50`
+  const rows = db.prepare(query).all(...params)
+  res.json({ derivations: (rows as any[]).map((d: any) => ({
+    ...d, source_ids: JSON.parse(d.source_ids || '[]'), access_receipt_ids: JSON.parse(d.access_receipt_ids || '[]'),
+  })), count: rows.length })
+})
+
 
 // POST /api/v1/reset-attribution — Clear all demo/test attribution data
 gatewayRouter.post('/reset-attribution', (req: any, res) => {
@@ -609,6 +656,7 @@ gatewayRouter.post('/reset-attribution', (req: any, res) => {
   const co = db.prepare(`DELETE FROM contributions WHERE tenant_id = ?`).run(tenant.id)
   const ds = db.prepare(`DELETE FROM data_sources WHERE tenant_id = ?`).run(tenant.id)
   const st = db.prepare(`DELETE FROM settlements WHERE tenant_id = ?`).run(tenant.id)
+  const dv = db.prepare(`DELETE FROM derivations WHERE tenant_id = ?`).run(tenant.id)
   const al = db.prepare(`DELETE FROM alerts WHERE tenant_id = ?`).run(tenant.id)
   res.json({
     cleared: {
@@ -616,6 +664,7 @@ gatewayRouter.post('/reset-attribution', (req: any, res) => {
       contributions: co.changes,
       data_sources: ds.changes,
       settlements: st.changes,
+      derivations: dv.changes,
       alerts: al.changes,
     },
     message: 'Attribution data cleared. Real data will flow once MCP tracking is live.',

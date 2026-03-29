@@ -199,6 +199,22 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_access_receipts_source ON access_receipts(tenant_id, source_id);
     CREATE INDEX IF NOT EXISTS idx_contributions_tenant ON contributions(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_settlements_tenant ON settlements(tenant_id, period_start);
+
+    -- Derivations (Pixel: agent declares "I used these sources to produce this output")
+    CREATE TABLE IF NOT EXISTS derivations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      agent_id TEXT NOT NULL,
+      source_ids TEXT NOT NULL DEFAULT '[]',
+      output_description TEXT,
+      output_url TEXT,
+      access_receipt_ids TEXT NOT NULL DEFAULT '[]',
+      signature TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_derivations_tenant ON derivations(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_derivations_agent ON derivations(tenant_id, agent_id);
   `)
 }
 
