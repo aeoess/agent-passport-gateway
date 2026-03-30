@@ -15,6 +15,23 @@ import { randomUUID } from 'node:crypto'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import type { Tenant } from '../auth/api-keys.js'
 
+// SDK scope matching — respects monotonic narrowing invariant
+let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
+async function getScopeAuthorizes() {
+  if (!_scopeAuthorizes) {
+    try {
+      const sdk = await import('agent-passport-system')
+      _scopeAuthorizes = sdk.scopeAuthorizes
+    } catch {
+      // Fallback if SDK not available — manual match
+      _scopeAuthorizes = (scopes: string[], required: string) =>
+        scopes.some(s => s === required || s === '*' ||
+          (s.endsWith(':*') && required.startsWith(s.slice(0, -1))))
+    }
+  }
+  return _scopeAuthorizes
+}
+
 export const gatewayRouter = Router()
 
 // ═══════════════════════════════════════
@@ -66,19 +83,17 @@ function checkUsageLimit(tenant: Tenant): { allowed: boolean; reason?: string } 
 function incrementUsage(tenantId: string) {
   const db = getDB()
   const period = new Date().toISOString().slice(0, 7)
-  const existing = db.prepare(`SELECT id FROM usage WHERE tenant_id = ? AND period = ?`).get(tenantId, period)
-  if (existing) {
-    db.prepare(`UPDATE usage SET evaluations = evaluations + 1, updated_at = datetime('now') WHERE tenant_id = ? AND period = ?`).run(tenantId, period)
-  } else {
-    db.prepare(`INSERT INTO usage (tenant_id, period, evaluations) VALUES (?, ?, 1)`).run(tenantId, period)
-  }
+  // Atomic upsert — no TOCTOU race
+  db.prepare(`INSERT INTO usage (tenant_id, period, evaluations) VALUES (?, ?, 1)
+    ON CONFLICT(tenant_id, period) DO UPDATE SET evaluations = evaluations + 1, updated_at = datetime('now')`)
+    .run(tenantId, period)
 }
 
 // ═══════════════════════════════════════
 // POST /api/v1/evaluate — Policy Evaluation
 // ═══════════════════════════════════════
 
-gatewayRouter.post('/evaluate', (req: any, res) => {
+gatewayRouter.post('/evaluate', async (req: any, res) => {
   const tenant: Tenant = req.tenant
   const start = Date.now()
 
@@ -117,12 +132,10 @@ gatewayRouter.post('/evaluate', (req: any, res) => {
     verdict = 'deny'
     violations.push('No active delegation for agent')
   } else {
-    // Scope check
+    // Scope check — uses SDK scopeAuthorizes() for monotonic narrowing
     const allowedScopes = delegation.scope.split(',').map((s: string) => s.trim())
-    const scopeMatch = allowedScopes.some((s: string) =>
-      s === scope_required || s === '*' ||
-      (s.endsWith(':*') && scope_required.startsWith(s.slice(0, -1)))
-    )
+    const scopeAuth = await getScopeAuthorizes()
+    const scopeMatch = scopeAuth(allowedScopes, scope_required)
     if (!scopeMatch) {
       verdict = 'deny'
       violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
@@ -444,15 +457,13 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
   const baseRate = terms?.compensation?.rate || 0
   const weight = getPurposeWeight(purpose || 'read', terms)
   const effectiveRate = baseRate * weight
-  const existing = db.prepare(`SELECT id, access_count, amount FROM contributions WHERE tenant_id = ? AND source_id = ? AND agent_id = ?`)
-    .get(tenant.id, source_id, agent_id) as any
-  if (existing) {
-    db.prepare(`UPDATE contributions SET access_count = access_count + 1, amount = amount + ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(effectiveRate, existing.id)
-  } else {
-    db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, currency) VALUES (?, ?, ?, ?, 1, ?, ?)`)
-      .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate, terms?.compensation?.currency || 'usd')
-  }
+  // Atomic upsert — no TOCTOU race on concurrent access receipts
+  db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, currency)
+    VALUES (?, ?, ?, ?, 1, ?, ?)
+    ON CONFLICT(tenant_id, source_id, agent_id)
+    DO UPDATE SET access_count = access_count + 1, amount = amount + ?, updated_at = datetime('now')`)
+    .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate,
+      terms?.compensation?.currency || 'usd', effectiveRate)
 
   // ── Attribution Alerts (fire-and-forget) ──
   try {

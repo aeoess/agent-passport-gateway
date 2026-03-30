@@ -109,7 +109,8 @@ function createTables() {
       agents_active INTEGER DEFAULT 0,
       receipts_stored INTEGER DEFAULT 0,
       data_lineage_queries INTEGER DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, period)
     );
 
     -- Revocation Events

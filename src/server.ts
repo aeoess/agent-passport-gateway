@@ -54,6 +54,7 @@ if (dbDir !== '.' && !existsSync(dbDir)) {
 }
 import cors from 'cors'
 import helmet from 'helmet'
+import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { initDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
@@ -75,14 +76,31 @@ app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.2.0' })
 })
 
+// Rate limiter for public signup endpoint
+const signupLimiter = new RateLimiterMemory({
+  points: 5,        // 5 signups
+  duration: 3600,   // per hour per IP
+  keyPrefix: 'signup',
+})
+
 // Public: create tenant (signup)
-app.post('/api/v1/signup', (req, res) => {
+app.post('/api/v1/signup', async (req, res) => {
+  // Rate limit by IP
+  try {
+    await signupLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Signup rate limit exceeded. Try again later.' })
+  }
+
   const { name, email, plan } = req.body
   if (!name || !email) {
     return res.status(400).json({ error: 'Required: name, email' })
   }
+  // Validate plan — only 'free' allowed via self-signup
+  // 'pro' and 'enterprise' require manual provisioning
+  const validPlan = plan === 'free' || !plan ? 'free' : 'free'
   try {
-    const { tenant, apiKey } = createTenant({ name, email, plan })
+    const { tenant, apiKey } = createTenant({ name, email, plan: validPlan })
     res.status(201).json({
       message: 'Account created. Save your API key — it will not be shown again.',
       tenant_id: tenant.id,
