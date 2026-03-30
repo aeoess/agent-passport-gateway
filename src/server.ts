@@ -29,6 +29,15 @@
  *   GET  /api/v1/pay/nano/balance    — gateway wallet balance
  *   GET  /api/v1/pay/nano/history    — recent Nano transactions
  *   POST /api/v1/pay/nano/verify     — verify on-chain transaction
+ *   POST /api/v1/wallets/provision        — create wallet for agent
+ *   GET  /api/v1/wallets/:id/balance      — live on-chain balance
+ *   POST /api/v1/wallets/send             — delegation-gated send
+ *   POST /api/v1/wallets/:id/receive      — pocket pending funds
+ *   GET  /api/v1/wallets/:id/txs          — transaction history
+ *   POST /api/v1/wallets/:id/freeze       — freeze wallet
+ *   POST /api/v1/wallets/:id/unfreeze     — reactivate wallet
+ *   GET  /api/v1/wallets                  — list all wallets
+ *   GET  /api/v1/wallets/dashboard        — tenant wallet overview
  *   GET  /healthz               — health check
  */
 
@@ -49,6 +58,7 @@ import { initDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { paymentRouter } from './payment-rails/routes.js'
+import { walletRouter } from './payment-rails/wallet-routes.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -90,6 +100,7 @@ app.post('/api/v1/signup', (req, res) => {
 // Authenticated routes
 app.use('/api/v1', authMiddleware, gatewayRouter)
 app.use('/api/v1', authMiddleware, paymentRouter)
+app.use('/api/v1', authMiddleware, walletRouter)
 
 // 404
 app.use((_req, res) => {
@@ -103,7 +114,7 @@ console.log(`
   AEOESS Gateway v0.2.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 24 API routes
+  Endpoints: 33 API routes
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {

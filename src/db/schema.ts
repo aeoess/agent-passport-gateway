@@ -236,6 +236,46 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_payments_tenant ON payment_transactions(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_payments_settlement ON payment_transactions(settlement_id);
     CREATE INDEX IF NOT EXISTS idx_payments_rail ON payment_transactions(rail, status);
+
+    -- Agent Wallets (Nano address per agent, delegation-gated)
+    CREATE TABLE IF NOT EXISTS agent_wallets (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      agent_id TEXT NOT NULL,
+      nano_address TEXT NOT NULL,
+      wallet_index INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      balance_raw TEXT NOT NULL DEFAULT '0',
+      total_received_raw TEXT NOT NULL DEFAULT '0',
+      total_sent_raw TEXT NOT NULL DEFAULT '0',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agent_wallets_tenant ON agent_wallets(tenant_id, status);
+
+    -- Wallet Transactions (every send/receive/denied, linked to delegations)
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      from_agent_id TEXT NOT NULL,
+      to_agent_id TEXT,
+      to_address TEXT NOT NULL,
+      amount_raw TEXT NOT NULL,
+      amount_xno TEXT NOT NULL,
+      block_hash TEXT,
+      delegation_id TEXT,
+      scope_used TEXT,
+      evaluation_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      denial_reason TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      confirmed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wallet_tx_tenant ON wallet_transactions(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_wallet_tx_agent ON wallet_transactions(tenant_id, from_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_wallet_tx_status ON wallet_transactions(tenant_id, status);
   `)
 }
 
