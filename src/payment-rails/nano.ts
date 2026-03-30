@@ -3,7 +3,7 @@
  * Nano Payment Rail — AEOESS Gateway Adapter
  *
  * Feeless, instant, Layer 1. Perfect for agent micro-transactions.
- * Uses Nano JSON-RPC via public proxy (reads) and optional
+ * Uses Nano JSON-RPC via public node (reads) and optional
  * wallet-enabled node (sends).
  *
  * Nano units: 1 XNO = 10^30 raw.
@@ -307,7 +307,7 @@ export function createNanoRail(opts: {
   sendingAddress?: string
 }): NanoPaymentRail {
   return new NanoPaymentRail({
-    rpcUrl: opts.rpcUrl || 'https://proxy.nanos.cc/proxy',
+    rpcUrl: opts.rpcUrl || 'https://rpc.nano.to',
     sendRpcUrl: opts.sendRpcUrl,
     walletId: opts.walletId,
     receivingAddress: opts.receivingAddress,
@@ -324,7 +324,7 @@ export function getNanoRail(): NanoPaymentRail {
     const addr = process.env.NANO_RECEIVING_ADDRESS
     if (!addr) throw new Error('NANO_RECEIVING_ADDRESS env var required')
     _instance = createNanoRail({
-      rpcUrl: process.env.NANO_RPC_URL || 'https://proxy.nanos.cc/proxy',
+      rpcUrl: process.env.NANO_RPC_URL || 'https://rpc.nano.to',
       sendRpcUrl: process.env.NANO_SEND_RPC_URL,
       walletId: process.env.NANO_WALLET_ID,
       receivingAddress: addr,
