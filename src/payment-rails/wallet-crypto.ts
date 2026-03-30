@@ -64,6 +64,12 @@ export function deriveAccount(seed: string, index: number): DerivedAccount {
   }
 }
 
+/** Safe version — returns only address + publicKey, no private key */
+export function deriveAddress(seed: string, index: number): { address: string; publicKey: string } {
+  const accounts = nanoWallet.accounts(seed, index, index)
+  return { address: accounts[0].address, publicKey: accounts[0].publicKey }
+}
+
 // ── Account Info (from public RPC) ──
 
 export async function getAccountInfo(rpcUrl: string, address: string): Promise<{

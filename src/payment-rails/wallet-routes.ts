@@ -7,10 +7,34 @@
  */
 
 import { Router } from 'express'
+import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getWalletService } from './wallet.js'
 import type { Tenant } from '../auth/api-keys.js'
 
 export const walletRouter = Router()
+
+// ── Rate Limiters ──
+const provisionLimiter = new RateLimiterMemory({
+  points: 10,       // 10 wallet creations
+  duration: 60,     // per minute per tenant
+  keyPrefix: 'wallet_provision',
+})
+const sendLimiter = new RateLimiterMemory({
+  points: 30,       // 30 sends
+  duration: 60,     // per minute per tenant
+  keyPrefix: 'wallet_send',
+})
+
+function rateLimit(limiter: RateLimiterMemory) {
+  return async (req: any, res: any, next: any) => {
+    try {
+      await limiter.consume(req.tenant?.id || req.ip)
+      next()
+    } catch {
+      res.status(429).json({ error: 'Rate limit exceeded. Try again shortly.' })
+    }
+  }
+}
 
 // ═══════════════════════════════════════
 // STATIC ROUTES (must come before :agentId)
@@ -50,7 +74,7 @@ walletRouter.get('/wallets', (req: any, res) => {
 })
 
 // ── POST /wallets/provision — Create wallet for agent ──
-walletRouter.post('/wallets/provision', async (req: any, res) => {
+walletRouter.post('/wallets/provision', rateLimit(provisionLimiter), async (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
     const ws = getWalletService()
@@ -71,7 +95,7 @@ walletRouter.post('/wallets/provision', async (req: any, res) => {
 })
 
 // ── POST /wallets/send — Delegation-gated send ──
-walletRouter.post('/wallets/send', async (req: any, res) => {
+walletRouter.post('/wallets/send', rateLimit(sendLimiter), async (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
     const ws = getWalletService()

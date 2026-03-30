@@ -57,7 +57,7 @@ export interface WalletTransaction {
 
 import { xnoToRaw, rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
-import { NanoLocalWallet, getLocalWallet, deriveAccount, getMasterSeed } from './wallet-crypto.js'
+import { NanoLocalWallet, getLocalWallet, deriveAddress, getMasterSeed } from './wallet-crypto.js'
 
 // Dynamic import for SDK scope matching (ESM)
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
@@ -97,9 +97,9 @@ export class AgentWalletService {
     ).get() as any
     const walletIndex = (maxIdx?.mx ?? -1) + 1
 
-    // Derive address locally from master seed — no node needed
+    // Derive address locally from master seed — no private key exposed here
     const seed = getMasterSeed()
-    const derived = deriveAccount(seed, walletIndex)
+    const derived = deriveAddress(seed, walletIndex)
     const nanoAddress = derived.address
 
     const id = randomUUID()
