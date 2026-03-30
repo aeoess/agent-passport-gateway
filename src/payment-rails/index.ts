@@ -8,6 +8,7 @@
  */
 
 export type { PaymentRail, PaymentInvoice, PaymentConfirmation, PaymentTransaction } from './types.js'
+export { nanoRpc } from './rpc-client.js'
 export { NanoPaymentRail, createNanoRail, getNanoRail, xnoToRaw, rawToXno } from './nano.js'
 export { paymentRouter } from './routes.js'
 export { AgentWalletService, getWalletService } from './wallet.js'

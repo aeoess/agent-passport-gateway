@@ -59,6 +59,16 @@ import { xnoToRaw, rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
 import { NanoLocalWallet, getLocalWallet, deriveAccount, getMasterSeed } from './wallet-crypto.js'
 
+// Dynamic import for SDK scope matching (ESM)
+let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
+async function loadScopeAuthorizes() {
+  if (!_scopeAuthorizes) {
+    const sdk = await import('agent-passport-system')
+    _scopeAuthorizes = sdk.scopeAuthorizes
+  }
+  return _scopeAuthorizes
+}
+
 export class AgentWalletService {
   private localWallet: NanoLocalWallet
 
@@ -80,10 +90,11 @@ export class AgentWalletService {
     ).get(tenantId, agentId) as AgentWallet | undefined
     if (existing) return existing
 
-    // Determine next wallet index
+    // Determine next wallet index — GLOBAL across all tenants
+    // because master seed is shared, index must be unique globally
     const maxIdx = db.prepare(
-      `SELECT MAX(wallet_index) as mx FROM agent_wallets WHERE tenant_id = ?`
-    ).get(tenantId) as any
+      `SELECT MAX(wallet_index) as mx FROM agent_wallets`
+    ).get() as any
     const walletIndex = (maxIdx?.mx ?? -1) + 1
 
     // Derive address locally from master seed — no node needed
@@ -177,6 +188,7 @@ export class AgentWalletService {
     }
 
     // ── Gate 2: Active delegation with commerce scope ──
+    // Uses SDK scopeAuthorizes() — respects monotonic narrowing invariant
     const delegation = db.prepare(`
       SELECT * FROM delegations
       WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
@@ -187,22 +199,22 @@ export class AgentWalletService {
     }
 
     const scopes = delegation.scope.split(',').map((s: string) => s.trim())
-    const hasCommerceScope = scopes.some((s: string) =>
-      s === '*' || s === 'commerce:*' || s === 'commerce:send'
-      || s === 'commerce:checkout'
-      || (s.endsWith(':*') && 'commerce:send'.startsWith(s.slice(0, -1)))
-    )
+    const scopeAuth = await loadScopeAuthorizes()
+    const hasCommerceScope = scopeAuth
+      ? scopeAuth(scopes, 'commerce:send')
+      : scopes.some((s: string) => s === '*' || s === 'commerce:*' || s === 'commerce:send')
     if (!hasCommerceScope) {
       return this.recordDenied(txId, opts, amountRaw,
-        `Agent lacks commerce scope. Has: [${delegation.scope}]`)
+        `Agent lacks commerce:send scope. Has: [${delegation.scope}]`)
     }
 
-    // ── Gate 3: Spend limit check ──
+    // ── Gate 3: Spend limit check (rounded to avoid float drift) ──
     if (delegation.spend_limit) {
-      const remaining = delegation.spend_limit - (delegation.spend_used || 0)
-      if (opts.amountXno > remaining) {
+      const remaining = Math.round((delegation.spend_limit - (delegation.spend_used || 0)) * 1e6) / 1e6
+      const amount = Math.round(opts.amountXno * 1e6) / 1e6
+      if (amount > remaining) {
         return this.recordDenied(txId, opts, amountRaw,
-          `Amount ${opts.amountXno} XNO exceeds remaining budget ${remaining.toFixed(6)} XNO`)
+          `Amount ${amount} XNO exceeds remaining budget ${remaining} XNO`)
       }
     }
 
@@ -316,6 +328,14 @@ export class AgentWalletService {
 
     // Local crypto: derive key, sign receive blocks, publish via public RPC
     const result = await this.localWallet.receive(wallet.wallet_index)
+
+    // Update balance cache after receiving
+    if (result.received > 0) {
+      const info = await this.localWallet.getBalance(wallet.nano_address)
+      db.prepare(`UPDATE agent_wallets SET balance_raw = ?, total_received_raw = ? WHERE id = ?`)
+        .run(info.balance, info.balance, wallet.id)
+    }
+
     return result
   }
 
@@ -338,6 +358,15 @@ export class AgentWalletService {
     const db = getDB()
     db.prepare(`UPDATE agent_wallets SET status = 'revoked' WHERE tenant_id = ? AND agent_id = ?`)
       .run(tenantId, agentId)
+  }
+
+  /** Unfreeze a wallet — reactivate from frozen state only */
+  unfreezeWallet(tenantId: string, agentId: string): boolean {
+    const db = getDB()
+    const result = db.prepare(
+      `UPDATE agent_wallets SET status = 'active' WHERE tenant_id = ? AND agent_id = ? AND status = 'frozen'`
+    ).run(tenantId, agentId)
+    return result.changes > 0
   }
 
   /** Get wallet info */

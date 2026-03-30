@@ -215,6 +215,9 @@ gatewayRouter.post('/revoke', (req: any, res) => {
       .run(tenant.id, target_id)
     const result = db.prepare(`UPDATE delegations SET status = 'revoked', revoked_at = datetime('now') WHERE tenant_id = ? AND (child_agent_id = ? OR parent_agent_id = ?)`)
       .run(tenant.id, target_id, target_id)
+    // Freeze agent wallet as part of revocation cascade
+    db.prepare(`UPDATE agent_wallets SET status = 'frozen' WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`)
+      .run(tenant.id, target_id)
     cascadeCount = result.changes
   } else if (target_type === 'delegation') {
     // Revoke specific delegation and downstream

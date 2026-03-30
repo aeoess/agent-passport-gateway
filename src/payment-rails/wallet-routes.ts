@@ -2,26 +2,54 @@
 /**
  * Agent Wallet Routes — APS-Native Nano Wallets
  *
- * POST /api/v1/wallets/provision           — create wallet for agent
- * GET  /api/v1/wallets/:agentId/balance    — live on-chain balance
- * POST /api/v1/wallets/send                — delegation-gated send
- * POST /api/v1/wallets/:agentId/receive    — pocket pending funds
- * GET  /api/v1/wallets/:agentId/txs        — transaction history
- * POST /api/v1/wallets/:agentId/freeze     — freeze wallet
- * POST /api/v1/wallets/:agentId/unfreeze   — reactivate wallet
- * GET  /api/v1/wallets                     — list all wallets
- * GET  /api/v1/wallets/dashboard           — tenant wallet overview
+ * Static routes registered BEFORE parameterized :agentId routes
+ * to prevent Express matching "dashboard" as an agentId.
  */
 
 import { Router } from 'express'
 import { getWalletService } from './wallet.js'
-import { getDB } from '../db/schema.js'
 import type { Tenant } from '../auth/api-keys.js'
 
 export const walletRouter = Router()
 
-// ── POST /wallets/provision — Create wallet for agent ──
+// ═══════════════════════════════════════
+// STATIC ROUTES (must come before :agentId)
+// ═══════════════════════════════════════
 
+// ── GET /wallets/dashboard — Tenant wallet overview ──
+walletRouter.get('/wallets/dashboard', async (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  try {
+    const ws = getWalletService()
+    const dashboard = await ws.walletDashboard(tenant.id)
+    res.json({ rail: 'nano', ...dashboard })
+  } catch (e: any) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── GET /wallets — List all wallets ──
+walletRouter.get('/wallets', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  try {
+    const ws = getWalletService()
+    const wallets = ws.listWallets(tenant.id)
+    res.json({
+      wallets: wallets.map(w => ({
+        agent_id: w.agent_id,
+        nano_address: w.nano_address,
+        status: w.status,
+        balance_raw: w.balance_raw,
+        created_at: w.created_at,
+      })),
+      count: wallets.length,
+    })
+  } catch (e: any) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── POST /wallets/provision — Create wallet for agent ──
 walletRouter.post('/wallets/provision', async (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
@@ -42,21 +70,7 @@ walletRouter.post('/wallets/provision', async (req: any, res) => {
   }
 })
 
-// ── GET /wallets/:agentId/balance — Live on-chain balance ──
-
-walletRouter.get('/wallets/:agentId/balance', async (req: any, res) => {
-  const tenant: Tenant = req.tenant
-  try {
-    const ws = getWalletService()
-    const balance = await ws.getBalance(tenant.id, req.params.agentId)
-    res.json({ agent_id: req.params.agentId, ...balance })
-  } catch (e: any) {
-    res.status(404).json({ error: e.message })
-  }
-})
-
 // ── POST /wallets/send — Delegation-gated send ──
-
 walletRouter.post('/wallets/send', async (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
@@ -68,11 +82,16 @@ walletRouter.post('/wallets/send', async (req: any, res) => {
       })
     }
 
-    // If to_agent_id provided, resolve their nano address
+    // Resolve destination: agent_id → nano address, or validate raw address
     let resolvedAddress = to_address
     if (to_agent_id && !to_address.startsWith('nano_')) {
       const targetWallet = ws.getWallet(tenant.id, to_agent_id)
       if (targetWallet) resolvedAddress = targetWallet.nano_address
+    }
+
+    // Bug #14 fix: validate Nano address format
+    if (!resolvedAddress.startsWith('nano_') || resolvedAddress.length !== 65) {
+      return res.status(400).json({ error: `Invalid Nano address: ${resolvedAddress}` })
     }
 
     const tx = await ws.send({
@@ -100,8 +119,23 @@ walletRouter.post('/wallets/send', async (req: any, res) => {
   }
 })
 
-// ── POST /wallets/:agentId/receive — Pocket pending funds ──
+// ═══════════════════════════════════════
+// PARAMETERIZED ROUTES (:agentId)
+// ═══════════════════════════════════════
 
+// ── GET /wallets/:agentId/balance — Live on-chain balance ──
+walletRouter.get('/wallets/:agentId/balance', async (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  try {
+    const ws = getWalletService()
+    const balance = await ws.getBalance(tenant.id, req.params.agentId)
+    res.json({ agent_id: req.params.agentId, ...balance })
+  } catch (e: any) {
+    res.status(404).json({ error: e.message })
+  }
+})
+
+// ── POST /wallets/:agentId/receive — Pocket pending funds ──
 walletRouter.post('/wallets/:agentId/receive', async (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
@@ -118,7 +152,6 @@ walletRouter.post('/wallets/:agentId/receive', async (req: any, res) => {
 })
 
 // ── GET /wallets/:agentId/txs — Transaction history ──
-
 walletRouter.get('/wallets/:agentId/txs', (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
@@ -132,7 +165,6 @@ walletRouter.get('/wallets/:agentId/txs', (req: any, res) => {
 })
 
 // ── POST /wallets/:agentId/freeze — Freeze wallet ──
-
 walletRouter.post('/wallets/:agentId/freeze', (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
@@ -145,50 +177,15 @@ walletRouter.post('/wallets/:agentId/freeze', (req: any, res) => {
 })
 
 // ── POST /wallets/:agentId/unfreeze — Reactivate wallet ──
-
 walletRouter.post('/wallets/:agentId/unfreeze', (req: any, res) => {
   const tenant: Tenant = req.tenant
   try {
     const ws = getWalletService()
-    const db = getDB()
-    db.prepare(`UPDATE agent_wallets SET status = 'active' WHERE tenant_id = ? AND agent_id = ? AND status = 'frozen'`)
-      .run(tenant.id, req.params.agentId)
+    const unfrozen = ws.unfreezeWallet(tenant.id, req.params.agentId)
+    if (!unfrozen) {
+      return res.status(404).json({ error: 'No frozen wallet found for this agent' })
+    }
     res.json({ agent_id: req.params.agentId, status: 'active' })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ── GET /wallets — List all wallets ──
-
-walletRouter.get('/wallets', (req: any, res) => {
-  const tenant: Tenant = req.tenant
-  try {
-    const ws = getWalletService()
-    const wallets = ws.listWallets(tenant.id)
-    res.json({
-      wallets: wallets.map(w => ({
-        agent_id: w.agent_id,
-        nano_address: w.nano_address,
-        status: w.status,
-        balance_raw: w.balance_raw,
-        created_at: w.created_at,
-      })),
-      count: wallets.length,
-    })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ── GET /wallets/dashboard — Tenant wallet overview ──
-
-walletRouter.get('/wallets/dashboard', async (req: any, res) => {
-  const tenant: Tenant = req.tenant
-  try {
-    const ws = getWalletService()
-    const dashboard = await ws.walletDashboard(tenant.id)
-    res.json({ rail: 'nano', ...dashboard })
   } catch (e: any) {
     res.status(500).json({ error: e.message })
   }

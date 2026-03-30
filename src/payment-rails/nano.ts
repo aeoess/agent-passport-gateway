@@ -14,6 +14,8 @@
 
 import { randomUUID } from 'node:crypto'
 import type { PaymentRail, PaymentInvoice, PaymentConfirmation } from './types.js'
+import { nanoRpc } from './rpc-client.js'
+import { getLocalWallet } from './wallet-crypto.js'
 
 // ── Unit Conversion ──
 
@@ -51,18 +53,6 @@ interface NanoRpcConfig {
   receivingAddress: string
   /** Source account address for outbound sends (must be in wallet) */
   sendingAddress?: string
-}
-
-async function nanoRpc(url: string, body: Record<string, unknown>): Promise<any> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error(`Nano RPC error: ${res.status} ${res.statusText}`)
-  const data = await res.json()
-  if (data.error) throw new Error(`Nano RPC: ${data.error}`)
-  return data
 }
 
 // ── Invoice Store (in-memory, backed by DB in routes) ──
@@ -130,7 +120,25 @@ export class NanoPaymentRail implements PaymentRail {
    * Check invoice status by polling account history for matching amount.
    */
   async checkStatus(invoiceId: string): Promise<PaymentInvoice> {
-    const invoice = pendingInvoices.get(invoiceId)
+    let invoice = pendingInvoices.get(invoiceId)
+
+    // Fallback: reconstruct from DB if not in memory (e.g. after restart)
+    if (!invoice) {
+      try {
+        // Import lazily to avoid circular deps
+        const { getDB } = await import('../db/schema.js')
+        const db = getDB()
+        const row = db.prepare(
+          `SELECT * FROM payment_transactions WHERE id = ? AND rail = 'nano'`
+        ).get(invoiceId) as any
+        if (row?.invoice_data) {
+          const stored = JSON.parse(row.invoice_data)
+          invoice = { ...stored, expectedRaw: stored.metadata?.amountRaw || '0' }
+          pendingInvoices.set(invoiceId, invoice as any)
+        }
+      } catch { /* DB not available in standalone mode */ }
+    }
+
     if (!invoice) throw new Error(`Invoice ${invoiceId} not found`)
 
     // Already confirmed or expired
@@ -175,36 +183,27 @@ export class NanoPaymentRail implements PaymentRail {
 
   /**
    * Send payment from gateway wallet (outbound settlement).
-   * Requires wallet-enabled node (sendRpcUrl + walletId).
+   * Uses local key derivation + signing via NanoLocalWallet.
+   * Gateway wallet = index 0 of the master seed.
    */
   async sendPayment(opts: {
     destination: string
     amount: number        // in XNO
     memo?: string
   }): Promise<PaymentConfirmation> {
-    if (!this.config.sendRpcUrl || !this.config.walletId || !this.config.sendingAddress) {
-      throw new Error('Outbound Nano payments require sendRpcUrl, walletId, and sendingAddress')
-    }
-
     const amountRaw = xnoToRaw(String(opts.amount))
-    const idempotencyId = randomUUID() // prevent double-sends
-
     const start = Date.now()
-    const result = await nanoRpc(this.config.sendRpcUrl, {
-      action: 'send',
-      wallet: this.config.walletId,
-      source: this.config.sendingAddress,
-      destination: opts.destination,
-      amount: amountRaw,
-      id: idempotencyId,
-    })
+
+    // Use local crypto — gateway wallet is always seed index 0
+    const localWallet = getLocalWallet()
+    const result = await localWallet.send(0, opts.destination, amountRaw)
 
     return {
-      invoiceId: idempotencyId,
+      invoiceId: randomUUID(),
       rail: 'nano',
       amount: opts.amount,
       currency: 'XNO',
-      txProof: result.block, // block hash
+      txProof: result.blockHash,
       confirmedAt: new Date().toISOString(),
       confirmationTimeMs: Date.now() - start,
     }

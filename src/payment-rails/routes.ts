@@ -192,7 +192,6 @@ paymentRouter.get('/pay/nano/balance', async (_req: any, res) => {
     const balance = await nano.getBalance()
     res.json({
       rail: 'nano',
-      address: balance.balanceXno ? undefined : undefined,
       balance_xno: balance.balanceXno,
       balance_raw: balance.balance,
       receivable_raw: balance.receivable,

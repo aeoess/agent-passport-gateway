@@ -12,28 +12,24 @@
 // @ts-ignore — nanocurrency-web has no type declarations
 import nanoWebImport from 'nanocurrency-web'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { nanoRpc } from './rpc-client.js'
 
 // Handle CJS/ESM interop — nanocurrency-web is CJS
 const nanoWeb = (nanoWebImport as any).default || nanoWebImport
 const { wallet: nanoWallet, block: nanoBlock, tools: nanoTools } = nanoWeb
 
-// ── RPC helper ──
-
-async function nanoRpc(url: string, body: Record<string, unknown>): Promise<any> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error(`Nano RPC: ${res.status}`)
-  const data = await res.json()
-  if (data.error) throw new Error(`Nano RPC: ${data.error}`)
-  return data
-}
-
 // ── Seed Management ──
 
-const DEFAULT_SEED_PATH = process.env.NANO_SEED_PATH || '$HOME/.aeoess-nano-seed'
+// Determine seed path: env var > /data/ (Railway) > home dir
+function defaultSeedPath(): string {
+  if (process.env.NANO_SEED_PATH) return process.env.NANO_SEED_PATH
+  const dbPath = process.env.DB_PATH || ''
+  if (dbPath.startsWith('/data')) return '/data/.aeoess-nano-seed'
+  const home = process.env.HOME || '/tmp'
+  return `${home}/.aeoess-nano-seed`
+}
+
+const DEFAULT_SEED_PATH = defaultSeedPath()
 
 export function getMasterSeed(seedPath?: string): string {
   const path = seedPath || DEFAULT_SEED_PATH
