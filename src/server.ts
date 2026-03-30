@@ -58,6 +58,7 @@ import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { initDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
+import { initLineageTables } from './gateway/lineage.js'
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 
@@ -127,9 +128,10 @@ app.use((_req, res) => {
 
 // Init and start
 const db = initDB(DB_PATH)
+initLineageTables()
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.2.0 (Railway)
+  AEOESS Gateway v0.3.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
   Endpoints: 33 API routes

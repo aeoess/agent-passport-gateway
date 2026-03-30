@@ -14,6 +14,7 @@ import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import type { Tenant } from '../auth/api-keys.js'
+import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 
 // SDK scope matching — respects monotonic narrowing invariant
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
@@ -350,10 +351,19 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
           `pubkey ${public_key_hash.slice(0, 12)}... has ${velocityCheck.c} dossiers. Possible re-issuance.`)
     }
 
+    // Compute lineage links and cluster risk
+    const dossierRow = db.prepare(
+      `SELECT * FROM issuance_dossiers WHERE id = ?`
+    ).get(id) as any
+    const links = computeLineageLinks(dossierRow)
+    const cluster = storeAndCluster(tenant.id, id, passport_id, links)
+
     res.status(201).json({
       dossier_id: id,
       passport_id,
       grade: passport_grade || 0,
+      cluster_risk: cluster.risk,
+      cluster_size: cluster.clusterSize,
       stored: true,
     })
   } catch (e: any) {
@@ -478,6 +488,7 @@ gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
       destination_convergence: destinationRisk,
       convergent_agents_24h: convergenceCount,
       denial_rate: evalCount > 0 ? Math.round((deniedCount / evalCount) * 100) / 100 : 0,
+      lineage_cluster: dossier ? getClusterRisk(tenant.id, agentId).risk : 'no_dossier',
     },
     attestation: dossier ? {
       grade_source: 'sdk',
