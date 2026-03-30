@@ -19,7 +19,6 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { createHash } from 'node:crypto'
 
 // ── Types ──
 
@@ -58,32 +57,13 @@ export interface WalletTransaction {
 
 import { xnoToRaw, rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
-
-async function walletRpc(url: string, body: Record<string, unknown>): Promise<any> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error(`Wallet RPC error: ${res.status} ${res.statusText}`)
-  const data = await res.json()
-  if (data.error) throw new Error(`Wallet RPC: ${data.error}`)
-  return data
-}
+import { NanoLocalWallet, getLocalWallet, deriveAccount, getMasterSeed } from './wallet-crypto.js'
 
 export class AgentWalletService {
-  private rpcUrl: string         // wallet-enabled node (enable_control)
-  private readRpcUrl: string     // public node for reads
-  private walletId: string       // master wallet ID on the node
+  private localWallet: NanoLocalWallet
 
-  constructor(opts: {
-    rpcUrl: string               // wallet-enabled node URL
-    readRpcUrl?: string          // public node for balance checks
-    walletId: string             // pre-created wallet ID
-  }) {
-    this.rpcUrl = opts.rpcUrl
-    this.readRpcUrl = opts.readRpcUrl || opts.rpcUrl
-    this.walletId = opts.walletId
+  constructor(opts?: { localWallet?: NanoLocalWallet }) {
+    this.localWallet = opts?.localWallet || getLocalWallet()
   }
 
   /**
@@ -100,19 +80,16 @@ export class AgentWalletService {
     ).get(tenantId, agentId) as AgentWallet | undefined
     if (existing) return existing
 
-    // Create new account in the master wallet
-    const result = await walletRpc(this.rpcUrl, {
-      action: 'account_create',
-      wallet: this.walletId,
-    })
+    // Determine next wallet index
+    const maxIdx = db.prepare(
+      `SELECT MAX(wallet_index) as mx FROM agent_wallets WHERE tenant_id = ?`
+    ).get(tenantId) as any
+    const walletIndex = (maxIdx?.mx ?? -1) + 1
 
-    const nanoAddress = result.account
-    // Get the wallet index (how many accounts exist)
-    const countResult = await walletRpc(this.rpcUrl, {
-      action: 'account_list',
-      wallet: this.walletId,
-    })
-    const walletIndex = (countResult.accounts || []).length
+    // Derive address locally from master seed — no node needed
+    const seed = getMasterSeed()
+    const derived = deriveAccount(seed, walletIndex)
+    const nanoAddress = derived.address
 
     const id = randomUUID()
     const wallet: AgentWallet = {
@@ -153,10 +130,7 @@ export class AgentWalletService {
     ).get(tenantId, agentId) as AgentWallet | undefined
     if (!wallet) throw new Error(`No active wallet for agent "${agentId}"`)
 
-    const result = await walletRpc(this.readRpcUrl, {
-      action: 'account_balance',
-      account: wallet.nano_address,
-    })
+    const result = await this.localWallet.getBalance(wallet.nano_address)
 
     // Update cached balance
     db.prepare(`UPDATE agent_wallets SET balance_raw = ? WHERE id = ?`)
@@ -165,8 +139,8 @@ export class AgentWalletService {
     return {
       balance_raw: result.balance,
       balance_xno: rawToXno(result.balance),
-      receivable_raw: result.receivable || result.pending || '0',
-      receivable_xno: rawToXno(result.receivable || result.pending || '0'),
+      receivable_raw: '0',
+      receivable_xno: '0',
       nano_address: wallet.nano_address,
     }
   }
@@ -232,16 +206,11 @@ export class AgentWalletService {
       }
     }
 
-    // ── Gate 4: Execute on-chain send ──
+    // ── Gate 4: Execute on-chain send (local signing, public RPC publish) ──
     try {
-      const result = await walletRpc(this.rpcUrl, {
-        action: 'send',
-        wallet: this.walletId,
-        source: wallet.nano_address,
-        destination: opts.toAddress,
-        amount: amountRaw,
-        id: txId,  // idempotency
-      })
+      const result = await this.localWallet.send(
+        wallet.wallet_index, opts.toAddress, amountRaw
+      )
 
       // Update delegation spend tracking
       db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
@@ -261,7 +230,7 @@ export class AgentWalletService {
         to_address: opts.toAddress,
         amount_raw: amountRaw,
         amount_xno: String(opts.amountXno),
-        block_hash: result.block,
+        block_hash: result.blockHash,
         delegation_id: delegation.id,
         scope_used: 'commerce:send',
         status: 'confirmed',
@@ -276,7 +245,7 @@ export class AgentWalletService {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', datetime('now'))`)
         .run(txId, opts.tenantId, opts.fromAgentId,
           opts.toAgentId || null, opts.toAddress,
-          amountRaw, String(opts.amountXno), result.block,
+          amountRaw, String(opts.amountXno), result.blockHash,
           delegation.id, 'commerce:send')
 
       return tx
@@ -345,29 +314,9 @@ export class AgentWalletService {
     ).get(tenantId, agentId) as AgentWallet | undefined
     if (!wallet) throw new Error(`No active wallet for agent "${agentId}"`)
 
-    // Get receivable blocks
-    const receivable = await walletRpc(this.readRpcUrl, {
-      action: 'receivable',
-      account: wallet.nano_address,
-      count: '100',
-    })
-
-    const hashes = Object.keys(receivable.blocks || {})
-    const blocks: string[] = []
-
-    for (const hash of hashes) {
-      try {
-        const result = await walletRpc(this.rpcUrl, {
-          action: 'receive',
-          wallet: this.walletId,
-          account: wallet.nano_address,
-          block: hash,
-        })
-        blocks.push(result.block)
-      } catch { /* skip failed receives */ }
-    }
-
-    return { received: blocks.length, blocks }
+    // Local crypto: derive key, sign receive blocks, publish via public RPC
+    const result = await this.localWallet.receive(wallet.wallet_index)
+    return result
   }
 
   /**
@@ -452,16 +401,7 @@ let _walletService: AgentWalletService | null = null
 
 export function getWalletService(): AgentWalletService {
   if (!_walletService) {
-    const rpcUrl = process.env.NANO_WALLET_RPC_URL
-    const walletId = process.env.NANO_WALLET_ID
-    if (!rpcUrl || !walletId) {
-      throw new Error('Agent wallet service requires NANO_WALLET_RPC_URL and NANO_WALLET_ID')
-    }
-    _walletService = new AgentWalletService({
-      rpcUrl,
-      readRpcUrl: process.env.NANO_RPC_URL || 'https://rpc.nano.to',
-      walletId,
-    })
+    _walletService = new AgentWalletService()
   }
   return _walletService
 }

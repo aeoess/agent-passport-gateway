@@ -12,4 +12,5 @@ export { NanoPaymentRail, createNanoRail, getNanoRail, xnoToRaw, rawToXno } from
 export { paymentRouter } from './routes.js'
 export { AgentWalletService, getWalletService } from './wallet.js'
 export type { AgentWallet, WalletTransaction } from './wallet.js'
+export { NanoLocalWallet, getLocalWallet, deriveAccount, getMasterSeed } from './wallet-crypto.js'
 export { walletRouter } from './wallet-routes.js'
