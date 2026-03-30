@@ -290,6 +290,117 @@ gatewayRouter.post('/agents', (req: any, res) => {
   res.status(201).json({ id, agent_id, status: 'active' })
 })
 
+// ═══════════════════════════════════════
+// GET /api/v1/passport/:agentId/trust-profile
+// The presentation query API. One call, one JSON, one decision.
+// This is what Nik's service (and every partner) actually calls.
+// ═══════════════════════════════════════
+gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const { agentId } = req.params
+
+  // Agent existence
+  const agent = db.prepare(
+    `SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any
+  if (!agent) {
+    return res.status(404).json({ error: `Unknown agent: ${agentId}`, grade: 0, trust: 'unknown' })
+  }
+
+  // Delegation (endorsement proxy)
+  const delegation = db.prepare(
+    `SELECT * FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+  ).get(tenant.id, agentId) as any
+
+  // Wallet
+  const wallet = db.prepare(
+    `SELECT * FROM agent_wallets WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any
+
+  // Activity stats
+  const evalCount = (db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any).c
+  const receiptCount = (db.prepare(
+    `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any).c
+  const deniedCount = (db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'DENY'`
+  ).get(tenant.id, agentId) as any).c
+
+  // Data contribution receipts
+  const contributionReceipts = (db.prepare(
+    `SELECT COUNT(*) as c FROM access_receipts WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any).c
+
+  // Wallet transaction stats
+  const txCount = wallet ? (db.prepare(
+    `SELECT COUNT(*) as c FROM wallet_transactions WHERE tenant_id = ? AND from_agent_id = ?`
+  ).get(tenant.id, agentId) as any).c : 0
+  const walletDenied = wallet ? (db.prepare(
+    `SELECT COUNT(*) as c FROM wallet_transactions WHERE tenant_id = ? AND from_agent_id = ? AND status = 'denied'`
+  ).get(tenant.id, agentId) as any).c : 0
+
+  // Destination convergence (farming detector)
+  // How many OTHER agents sent to the same top destination in 24h?
+  let destinationRisk: 'low' | 'medium' | 'high' = 'low'
+  let convergenceCount = 0
+  if (wallet) {
+    const topDest = db.prepare(
+      `SELECT to_address, COUNT(*) as c FROM wallet_transactions
+       WHERE tenant_id = ? AND from_agent_id = ? AND status = 'confirmed'
+       GROUP BY to_address ORDER BY c DESC LIMIT 1`
+    ).get(tenant.id, agentId) as any
+    if (topDest) {
+      const convergence = db.prepare(
+        `SELECT COUNT(DISTINCT from_agent_id) as c FROM wallet_transactions
+         WHERE tenant_id = ? AND to_address = ? AND from_agent_id != ?
+         AND status = 'confirmed' AND created_at > datetime('now', '-24 hours')`
+      ).get(tenant.id, topDest.to_address, agentId) as any
+      convergenceCount = convergence.c
+      if (convergenceCount >= 10) destinationRisk = 'high'
+      else if (convergenceCount >= 3) destinationRisk = 'medium'
+    }
+  }
+
+  // Compute coarse grade (0-3)
+  let grade = 0
+  if (agent.status === 'active') grade = 1                    // registered + active
+  if (delegation) grade = 2                                    // endorsed by principal
+  if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3 // proven through usage
+
+  // Age
+  const createdAt = new Date(agent.created_at)
+  const ageDays = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24))
+
+  res.json({
+    agent_id: agentId,
+    grade,
+    trust: grade >= 3 ? 'established' : grade >= 2 ? 'endorsed' : grade >= 1 ? 'registered' : 'unknown',
+    age_days: ageDays,
+    has_delegation: !!delegation,
+    has_wallet: !!wallet,
+    activity: {
+      evaluations: evalCount,
+      receipts: receiptCount,
+      denials: deniedCount,
+      contribution_receipts: contributionReceipts,
+    },
+    wallet_activity: wallet ? {
+      transactions: txCount,
+      denied: walletDenied,
+      status: wallet.status,
+    } : null,
+    risk: {
+      destination_convergence: destinationRisk,
+      convergent_agents_24h: convergenceCount,
+      denial_rate: evalCount > 0 ? Math.round((deniedCount / evalCount) * 100) / 100 : 0,
+    },
+    queried_at: new Date().toISOString(),
+  })
+})
+
 // POST /api/v1/delegations — Create Delegation
 gatewayRouter.post('/delegations', (req: any, res) => {
   const tenant: Tenant = req.tenant

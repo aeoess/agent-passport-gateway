@@ -78,8 +78,12 @@ export class AgentWalletService {
 
   /**
    * Provision a new Nano wallet for an agent.
-   * Creates a new account in the master wallet via RPC.
-   * Stores the mapping in agent_wallets table.
+   *
+   * Sybil defense (4-gate pipeline):
+   *   Gate 1: Agent must be registered with a public key
+   *   Gate 2: Agent must have an active delegation (someone vouched for them)
+   *   Gate 3: publicKey dedup — same key can't get multiple wallets
+   *   Gate 4: Anomaly rate — same principal can't mass-provision wallets
    */
   async provisionWallet(tenantId: string, agentId: string): Promise<AgentWallet> {
     const db = getDB()
@@ -89,6 +93,55 @@ export class AgentWalletService {
       `SELECT * FROM agent_wallets WHERE tenant_id = ? AND agent_id = ?`
     ).get(tenantId, agentId) as AgentWallet | undefined
     if (existing) return existing
+
+    // ── Sybil Gate 1: Agent must be registered ──
+    const agent = db.prepare(
+      `SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`
+    ).get(tenantId, agentId) as any
+    if (!agent) {
+      throw new Error(`Sybil gate: agent "${agentId}" is not registered. Register first via POST /agents.`)
+    }
+
+    // ── Sybil Gate 2: Agent must have active delegation ──
+    // A delegation means a known principal vouched for this agent
+    const delegation = db.prepare(
+      `SELECT * FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' LIMIT 1`
+    ).get(tenantId, agentId) as any
+    if (!delegation) {
+      throw new Error(`Sybil gate: agent "${agentId}" has no active delegation. A principal must delegate authority before wallet provisioning.`)
+    }
+
+    // ── Sybil Gate 3: publicKey dedup ──
+    // Same public key can't get wallets under different agent_ids
+    if (agent.public_key) {
+      const keyDupe = db.prepare(
+        `SELECT aw.agent_id FROM agent_wallets aw
+         JOIN agents a ON aw.tenant_id = a.tenant_id AND aw.agent_id = a.agent_id
+         WHERE a.public_key = ? AND aw.agent_id != ?`
+      ).get(agent.public_key, agentId) as any
+      if (keyDupe) {
+        db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
+          VALUES (?, ?, ?, ?, ?)`)
+          .run(randomUUID(), tenantId, 'sybil_key_reuse', 'critical',
+            `publicKey dedup: "${agentId}" shares key with "${keyDupe.agent_id}"`)
+        throw new Error(`Sybil gate: this public key already has a wallet under agent "${keyDupe.agent_id}".`)
+      }
+    }
+
+    // ── Sybil Gate 4: Anomaly rate — same principal can't mass-provision ──
+    const principalId = delegation.parent_agent_id
+    const recentProvisions = db.prepare(
+      `SELECT COUNT(*) as c FROM agent_wallets aw
+       JOIN delegations d ON aw.tenant_id = d.tenant_id AND aw.agent_id = d.child_agent_id
+       WHERE d.parent_agent_id = ? AND aw.created_at > datetime('now', '-1 hour')`
+    ).get(principalId) as any
+    if (recentProvisions.c >= 5) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
+        VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenantId, 'sybil_mass_provision', 'critical',
+          `Principal "${principalId}" provisioned ${recentProvisions.c} wallets in 1hr. Possible farming.`)
+      throw new Error(`Sybil gate: principal "${principalId}" has provisioned too many wallets recently. Max 5 per hour.`)
+    }
 
     // Determine next wallet index — GLOBAL across all tenants
     // because master seed is shared, index must be unique globally
