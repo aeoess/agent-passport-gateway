@@ -291,6 +291,77 @@ gatewayRouter.post('/agents', (req: any, res) => {
 })
 
 // ═══════════════════════════════════════
+// POST /api/v1/issuance-dossier
+// MCP server POSTs IssuanceContext after every passport issuance.
+// Gateway stores the full evidence record privately.
+// ═══════════════════════════════════════
+gatewayRouter.post('/issuance-dossier', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const {
+    passport_id, public_key_hash, passport_grade, flags,
+    attestation_bundle_hash, observed_context,
+    runtime_attestations, provider_attestations,
+    self_declared_signals, derived_signals, prior_passport_ref
+  } = req.body
+
+  if (!passport_id || !public_key_hash) {
+    return res.status(400).json({ error: 'Required: passport_id, public_key_hash' })
+  }
+
+  const id = randomUUID()
+  const obs = observed_context || {}
+
+  try {
+    db.prepare(`INSERT OR REPLACE INTO issuance_dossiers
+      (id, tenant_id, passport_id, public_key_hash, passport_grade,
+       flags, attestation_bundle_hash, observed_context,
+       runtime_attestations, provider_attestations,
+       self_declared_signals, derived_signals, prior_passport_ref,
+       transport_type, issuance_velocity, connection_timing_ms,
+       request_payload_fingerprint)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        id, tenant.id, passport_id, public_key_hash,
+        passport_grade || 0,
+        JSON.stringify(flags || []),
+        attestation_bundle_hash || null,
+        JSON.stringify(obs),
+        JSON.stringify(runtime_attestations || []),
+        JSON.stringify(provider_attestations || []),
+        JSON.stringify(self_declared_signals || []),
+        JSON.stringify(derived_signals || []),
+        prior_passport_ref || null,
+        obs.transportType || null,
+        obs.issuanceVelocity ?? null,
+        obs.connectionTimingMs ?? null,
+        obs.requestPayloadFingerprint || null
+      )
+
+    // Check for velocity anomaly — many passports from same pubkey hash
+    const velocityCheck = db.prepare(
+      `SELECT COUNT(*) as c FROM issuance_dossiers
+       WHERE tenant_id = ? AND public_key_hash = ?`
+    ).get(tenant.id, public_key_hash) as any
+    if (velocityCheck.c > 1) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
+        VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'issuance_velocity', 'warning',
+          `pubkey ${public_key_hash.slice(0, 12)}... has ${velocityCheck.c} dossiers. Possible re-issuance.`)
+    }
+
+    res.status(201).json({
+      dossier_id: id,
+      passport_id,
+      grade: passport_grade || 0,
+      stored: true,
+    })
+  } catch (e: any) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ═══════════════════════════════════════
 // GET /api/v1/passport/:agentId/trust-profile
 // The presentation query API. One call, one JSON, one decision.
 // This is what Nik's service (and every partner) actually calls.
@@ -364,11 +435,22 @@ gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
     }
   }
 
+  // Issuance dossier (if MCP server has sent one)
+  const dossier = db.prepare(
+    `SELECT * FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).get(tenant.id, agentId) as any
+
   // Compute coarse grade (0-3)
+  // If dossier exists, use its grade (computed by SDK with full evidence model).
+  // Otherwise fall back to SQL-based heuristic.
   let grade = 0
-  if (agent.status === 'active') grade = 1                    // registered + active
-  if (delegation) grade = 2                                    // endorsed by principal
-  if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3 // proven through usage
+  if (dossier) {
+    grade = dossier.passport_grade
+  } else {
+    if (agent.status === 'active') grade = 1
+    if (delegation) grade = 2
+    if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3
+  }
 
   // Age
   const createdAt = new Date(agent.created_at)
@@ -397,6 +479,16 @@ gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
       convergent_agents_24h: convergenceCount,
       denial_rate: evalCount > 0 ? Math.round((deniedCount / evalCount) * 100) / 100 : 0,
     },
+    attestation: dossier ? {
+      grade_source: 'sdk',
+      transport_type: dossier.transport_type,
+      issuance_velocity: dossier.issuance_velocity,
+      has_runtime_attestation: JSON.parse(dossier.runtime_attestations || '[]').length > 0,
+      has_provider_attestation: JSON.parse(dossier.provider_attestations || '[]').length > 0,
+      flags: JSON.parse(dossier.flags || '[]'),
+      attestation_bundle_hash: dossier.attestation_bundle_hash,
+      dossier_created_at: dossier.created_at,
+    } : { grade_source: 'heuristic' },
     queried_at: new Date().toISOString(),
   })
 })
@@ -1054,4 +1146,109 @@ gatewayRouter.get('/provenance-dossier', (req: any, res) => {
     },
     evidence_limits: 'This is a structured evidentiary record that may support audit, compliance, contractual enforcement, or legal review depending on jurisdiction and context. It does not constitute a legal determination of derivation or infringement.',
   })
+})
+
+
+// ═══════════════════════════════════════
+// POST /api/v1/issuance-dossier
+// Receives IssuanceContext from MCP server after every passport issuance.
+// Fire-and-forget from MCP side — this endpoint stores the full evidence dossier.
+// ═══════════════════════════════════════
+gatewayRouter.post('/issuance-dossier', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const {
+    passport_id, public_key_hash, passport_grade, flags,
+    attestation_bundle_hash, observed_context,
+    runtime_attestations, provider_attestations,
+    self_declared_signals, derived_signals, prior_passport_ref,
+  } = req.body
+
+  if (!passport_id || !public_key_hash) {
+    return res.status(400).json({ error: 'Required: passport_id, public_key_hash' })
+  }
+
+  const id = randomUUID()
+  const obs = observed_context || {}
+
+  try {
+    db.prepare(`INSERT INTO issuance_dossiers
+      (id, tenant_id, passport_id, public_key_hash, passport_grade,
+       flags, attestation_bundle_hash, observed_context,
+       runtime_attestations, provider_attestations,
+       self_declared_signals, derived_signals, prior_passport_ref,
+       transport_type, issuance_velocity, connection_timing_ms,
+       request_payload_fingerprint)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        id, tenant.id, passport_id, public_key_hash,
+        passport_grade || 0,
+        JSON.stringify(flags || []),
+        attestation_bundle_hash || null,
+        JSON.stringify(obs),
+        JSON.stringify(runtime_attestations || []),
+        JSON.stringify(provider_attestations || []),
+        JSON.stringify(self_declared_signals || []),
+        JSON.stringify(derived_signals || []),
+        prior_passport_ref || null,
+        obs.transportType || null,
+        obs.issuanceVelocity || null,
+        obs.connectionTimingMs || null,
+        obs.requestPayloadFingerprint || null,
+      )
+
+    // Velocity anomaly: if same public_key_hash issued 5+ passports in 1 hour
+    const recentFromKey = db.prepare(
+      `SELECT COUNT(*) as c FROM issuance_dossiers
+       WHERE public_key_hash = ? AND created_at > datetime('now', '-1 hour')`
+    ).get(public_key_hash) as any
+    if (recentFromKey.c >= 5) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
+        VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'sybil_issuance_velocity', 'critical',
+          `Key ${public_key_hash.slice(0, 16)}... issued ${recentFromKey.c} passports in 1hr`)
+    }
+
+    // Fingerprint clustering: if same request_payload_fingerprint from 10+ different keys
+    if (obs.requestPayloadFingerprint) {
+      const fpCluster = db.prepare(
+        `SELECT COUNT(DISTINCT public_key_hash) as c FROM issuance_dossiers
+         WHERE request_payload_fingerprint = ? AND created_at > datetime('now', '-24 hours')`
+      ).get(obs.requestPayloadFingerprint) as any
+      if (fpCluster.c >= 10) {
+        db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
+          VALUES (?, ?, ?, ?, ?)`)
+          .run(randomUUID(), tenant.id, 'sybil_fingerprint_cluster', 'critical',
+            `Payload fingerprint ${obs.requestPayloadFingerprint.slice(0, 16)}... seen from ${fpCluster.c} distinct keys in 24h — farming script?`)
+      }
+    }
+
+    res.status(201).json({
+      dossier_id: id,
+      passport_id,
+      passport_grade: passport_grade || 0,
+      stored: true,
+    })
+  } catch (e: any) {
+    if (e.message?.includes('UNIQUE constraint')) {
+      // Update existing dossier (passport reissued)
+      db.prepare(`UPDATE issuance_dossiers SET
+        passport_grade = ?, flags = ?, attestation_bundle_hash = ?,
+        observed_context = ?, runtime_attestations = ?,
+        provider_attestations = ?, self_declared_signals = ?,
+        derived_signals = ?
+        WHERE tenant_id = ? AND passport_id = ?`)
+        .run(
+          passport_grade || 0, JSON.stringify(flags || []),
+          attestation_bundle_hash || null, JSON.stringify(obs),
+          JSON.stringify(runtime_attestations || []),
+          JSON.stringify(provider_attestations || []),
+          JSON.stringify(self_declared_signals || []),
+          JSON.stringify(derived_signals || []),
+          tenant.id, passport_id,
+        )
+      return res.json({ passport_id, updated: true })
+    }
+    res.status(500).json({ error: e.message })
+  }
 })

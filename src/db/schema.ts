@@ -277,6 +277,35 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_wallet_tx_tenant ON wallet_transactions(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_wallet_tx_agent ON wallet_transactions(tenant_id, from_agent_id);
     CREATE INDEX IF NOT EXISTS idx_wallet_tx_status ON wallet_transactions(tenant_id, status);
+
+    -- Issuance Dossiers (attestation evidence per passport)
+    CREATE TABLE IF NOT EXISTS issuance_dossiers (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      passport_id TEXT NOT NULL,
+      public_key_hash TEXT NOT NULL,
+      passport_grade INTEGER NOT NULL DEFAULT 0,
+      flags TEXT NOT NULL DEFAULT '[]',
+      attestation_bundle_hash TEXT,
+      observed_context TEXT NOT NULL DEFAULT '{}',
+      runtime_attestations TEXT NOT NULL DEFAULT '[]',
+      provider_attestations TEXT NOT NULL DEFAULT '[]',
+      self_declared_signals TEXT NOT NULL DEFAULT '[]',
+      derived_signals TEXT NOT NULL DEFAULT '[]',
+      prior_passport_ref TEXT,
+      transport_type TEXT,
+      issuance_velocity INTEGER,
+      connection_timing_ms INTEGER,
+      request_payload_fingerprint TEXT,
+      cluster_risk TEXT DEFAULT 'unknown',
+      cluster_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, passport_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dossiers_tenant ON issuance_dossiers(tenant_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_dossiers_pubkey ON issuance_dossiers(public_key_hash);
+    CREATE INDEX IF NOT EXISTS idx_dossiers_grade ON issuance_dossiers(tenant_id, passport_grade);
   `)
 }
 
