@@ -215,6 +215,27 @@ function createTables() {
 
     CREATE INDEX IF NOT EXISTS idx_derivations_tenant ON derivations(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_derivations_agent ON derivations(tenant_id, agent_id);
+
+    -- Payment Transactions (Nano adapter + future rails)
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      settlement_id TEXT REFERENCES settlements(id),
+      rail TEXT NOT NULL DEFAULT 'nano',
+      direction TEXT NOT NULL,
+      amount REAL NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'XNO',
+      destination TEXT,
+      tx_proof TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      invoice_data TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      confirmed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_payments_tenant ON payment_transactions(tenant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_payments_settlement ON payment_transactions(settlement_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_rail ON payment_transactions(rail, status);
   `)
 }
 

@@ -23,6 +23,12 @@
  *   POST /api/v1/settlements    — generate settlement
  *   GET  /api/v1/settlements    — list settlements
  *   GET  /api/v1/my-consumption — agent self-service (what did I consume?)
+ *   POST /api/v1/pay/nano/invoice    — create Nano payment request
+ *   GET  /api/v1/pay/nano/status/:id — check invoice status
+ *   POST /api/v1/pay/nano/settle/:id — execute settlement via Nano
+ *   GET  /api/v1/pay/nano/balance    — gateway wallet balance
+ *   GET  /api/v1/pay/nano/history    — recent Nano transactions
+ *   POST /api/v1/pay/nano/verify     — verify on-chain transaction
  *   GET  /healthz               — health check
  */
 
@@ -42,6 +48,7 @@ import helmet from 'helmet'
 import { initDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
+import { paymentRouter } from './payment-rails/routes.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -82,6 +89,7 @@ app.post('/api/v1/signup', (req, res) => {
 
 // Authenticated routes
 app.use('/api/v1', authMiddleware, gatewayRouter)
+app.use('/api/v1', authMiddleware, paymentRouter)
 
 // 404
 app.use((_req, res) => {
@@ -95,7 +103,7 @@ console.log(`
   AEOESS Gateway v0.2.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 18 API routes
+  Endpoints: 24 API routes
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {
