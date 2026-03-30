@@ -112,13 +112,13 @@ export class AgentWalletService {
     }
 
     // ── Sybil Gate 3: publicKey dedup ──
-    // Same public key can't get wallets under different agent_ids
+    // Same public key can't get wallets under different agent_ids WITHIN THIS TENANT
     if (agent.public_key) {
       const keyDupe = db.prepare(
         `SELECT aw.agent_id FROM agent_wallets aw
          JOIN agents a ON aw.tenant_id = a.tenant_id AND aw.agent_id = a.agent_id
-         WHERE a.public_key = ? AND aw.agent_id != ?`
-      ).get(agent.public_key, agentId) as any
+         WHERE aw.tenant_id = ? AND a.public_key = ? AND aw.agent_id != ?`
+      ).get(tenantId, agent.public_key, agentId) as any
       if (keyDupe) {
         db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
           VALUES (?, ?, ?, ?, ?)`)
@@ -133,8 +133,8 @@ export class AgentWalletService {
     const recentProvisions = db.prepare(
       `SELECT COUNT(*) as c FROM agent_wallets aw
        JOIN delegations d ON aw.tenant_id = d.tenant_id AND aw.agent_id = d.child_agent_id
-       WHERE d.parent_agent_id = ? AND aw.created_at > datetime('now', '-1 hour')`
-    ).get(principalId) as any
+       WHERE d.tenant_id = ? AND d.parent_agent_id = ? AND aw.created_at > datetime('now', '-1 hour')`
+    ).get(tenantId, principalId) as any
     if (recentProvisions.c >= 5) {
       db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
         VALUES (?, ?, ?, ?, ?)`)
@@ -143,39 +143,34 @@ export class AgentWalletService {
       throw new Error(`Sybil gate: principal "${principalId}" has provisioned too many wallets recently. Max 5 per hour.`)
     }
 
-    // Determine next wallet index — GLOBAL across all tenants
-    // because master seed is shared, index must be unique globally
-    const maxIdx = db.prepare(
-      `SELECT MAX(wallet_index) as mx FROM agent_wallets`
-    ).get() as any
-    const walletIndex = (maxIdx?.mx ?? -1) + 1
+    // Atomic wallet creation — prevents index collision under concurrent requests
+    const createWallet = db.transaction(() => {
+      const maxIdx = db.prepare(
+        `SELECT MAX(wallet_index) as mx FROM agent_wallets`
+      ).get() as any
+      const walletIndex = (maxIdx?.mx ?? -1) + 1
 
-    // Derive address locally from master seed — no private key exposed here
-    const seed = getMasterSeed()
-    const derived = deriveAddress(seed, walletIndex)
-    const nanoAddress = derived.address
+      const seed = getMasterSeed()
+      const derived = deriveAddress(seed, walletIndex)
+      const nanoAddress = derived.address
 
-    const id = randomUUID()
-    const wallet: AgentWallet = {
-      id,
-      tenant_id: tenantId,
-      agent_id: agentId,
-      nano_address: nanoAddress,
-      wallet_index: walletIndex,
-      status: 'active',
-      balance_raw: '0',
-      total_received_raw: '0',
-      total_sent_raw: '0',
-      created_at: new Date().toISOString(),
-    }
+      const id = randomUUID()
+      db.prepare(`INSERT INTO agent_wallets
+        (id, tenant_id, agent_id, nano_address, wallet_index, status,
+         balance_raw, total_received_raw, total_sent_raw)
+        VALUES (?, ?, ?, ?, ?, 'active', '0', '0', '0')`)
+        .run(id, tenantId, agentId, nanoAddress, walletIndex)
 
-    db.prepare(`INSERT INTO agent_wallets
-      (id, tenant_id, agent_id, nano_address, wallet_index, status,
-       balance_raw, total_received_raw, total_sent_raw)
-      VALUES (?, ?, ?, ?, ?, 'active', '0', '0', '0')`)
-      .run(id, tenantId, agentId, nanoAddress, walletIndex)
+      return {
+        id, tenant_id: tenantId, agent_id: agentId,
+        nano_address: nanoAddress, wallet_index: walletIndex,
+        status: 'active' as const, balance_raw: '0',
+        total_received_raw: '0', total_sent_raw: '0',
+        created_at: new Date().toISOString(),
+      } as AgentWallet
+    })
 
-    return wallet
+    return createWallet()
   }
 
   /**

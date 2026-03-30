@@ -16,6 +16,12 @@ import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 
+function safeError(e: any, context: string): { error: string; ref: string } {
+  const ref = randomUUID().slice(0, 8)
+  console.error(`[ERR:${ref}] ${context}:`, e.message || e)
+  return { error: `Internal error (ref: ${ref}). Contact support.`, ref }
+}
+
 // SDK scope matching — respects monotonic narrowing invariant
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
 async function getScopeAuthorizes() {
@@ -310,6 +316,8 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
     return res.status(400).json({ error: 'Required: passport_id, public_key_hash' })
   }
 
+  // Clamp grade to 0-3 — malicious MCP can't send passport_grade: 99
+  const grade = Math.min(3, Math.max(0, Math.floor(passport_grade || 0)))
   const id = randomUUID()
   const obs = observed_context || {}
 
@@ -324,7 +332,7 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         id, tenant.id, passport_id, public_key_hash,
-        passport_grade || 0,
+        grade,
         JSON.stringify(flags || []),
         attestation_bundle_hash || null,
         JSON.stringify(obs),
@@ -361,13 +369,13 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
     res.status(201).json({
       dossier_id: id,
       passport_id,
-      grade: passport_grade || 0,
+      grade,
       cluster_risk: cluster.risk,
       cluster_size: cluster.clusterSize,
       stored: true,
     })
   } catch (e: any) {
-    res.status(500).json({ error: e.message })
+    res.status(500).json(safeError(e, 'issuance-dossier'))
   }
 })
 
@@ -636,7 +644,7 @@ gatewayRouter.post('/data-sources', (req: any, res) => {
     res.status(201).json({ id, source_id, status: 'active' })
   } catch (e: any) {
     if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Source already registered' })
-    return res.status(500).json({ error: e.message })
+    return res.status(500).json(safeError(e, 'data-source-register'))
   }
 })
 
@@ -1260,6 +1268,6 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
         )
       return res.json({ passport_id, updated: true })
     }
-    res.status(500).json({ error: e.message })
+    res.status(500).json(safeError(e, 'behavioral-sequence'))
   }
 })

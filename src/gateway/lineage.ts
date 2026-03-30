@@ -15,7 +15,7 @@
  *   recoveryLink — continuity for honest reissue
  */
 
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, randomBytes } from 'node:crypto'
 import { getDB } from '../db/schema.js'
 
 // ── HMAC secret (generated once, stored in DB) ──
@@ -33,8 +33,8 @@ function getIssuerSecret(): string {
     _issuerSecret = row.value
     return _issuerSecret!
   }
-  // First run — generate and persist
-  const secret = randomUUID() + '-' + randomUUID()
+  // First run — generate proper 256-bit key and persist
+  const secret = randomBytes(32).toString('hex')
   db.prepare(
     `INSERT INTO gateway_config (key, value) VALUES ('issuer_secret', ?)`
   ).run(secret)
@@ -62,7 +62,8 @@ function hmacLink(scope: string, claims: Record<string, any>): string {
 // ── Bucket helpers (normalization per consilium) ──
 
 function hourFloor(isoDate: string): string {
-  return isoDate?.slice(0, 13) + ':00:00Z' || 'unknown'
+  if (!isoDate || isoDate.length < 13) return 'unknown'
+  return isoDate.slice(0, 13) + ':00:00Z'
 }
 
 function timingBucket(ms: number | null): string {
@@ -175,8 +176,10 @@ export interface ClusterRisk {
 export function storeAndCluster(tenantId: string, dossierId: string, passportId: string, links: LineageLinks): ClusterRisk {
   const db = getDB()
 
-  // Store links
-  db.prepare(`INSERT OR REPLACE INTO lineage_links
+  // Store links (replace any prior links for this passport)
+  db.prepare(`DELETE FROM lineage_links WHERE tenant_id = ? AND passport_id = ?`)
+    .run(tenantId, passportId)
+  db.prepare(`INSERT INTO lineage_links
     (id, tenant_id, dossier_id, passport_id,
      runtime_link, owner_link, behavioral_link, recovery_link)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -259,15 +262,43 @@ export function getClusterRisk(tenantId: string, passportId: string): ClusterRis
   ).get(tenantId, passportId) as any
   if (!link) return { clusterId: null, clusterSize: 1, risk: 'low', matchedLinks: [] }
 
+  // Compute actual cluster size and matched links
+  const matchedLinks: string[] = []
+  let clusterMembers: string[] = []
+
+  if (link.runtime_link) {
+    const matches = db.prepare(
+      `SELECT DISTINCT passport_id FROM lineage_links
+       WHERE tenant_id = ? AND runtime_link = ? AND passport_id != ?`
+    ).all(tenantId, link.runtime_link, passportId) as any[]
+    if (matches.length > 0) {
+      matchedLinks.push('runtime')
+      clusterMembers.push(...matches.map((m: any) => m.passport_id))
+    }
+  }
+  if (link.owner_link) {
+    const matches = db.prepare(
+      `SELECT DISTINCT passport_id FROM lineage_links
+       WHERE tenant_id = ? AND owner_link = ? AND passport_id != ?`
+    ).all(tenantId, link.owner_link, passportId) as any[]
+    if (matches.length > 0) {
+      matchedLinks.push('owner')
+      clusterMembers.push(...matches.map((m: any) => m.passport_id))
+    }
+  }
+
+  const uniqueMembers = [...new Set(clusterMembers)]
+  const clusterSize = uniqueMembers.length + 1
+
   const dossier = db.prepare(
     `SELECT cluster_risk, cluster_id FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ?`
   ).get(tenantId, passportId) as any
 
   return {
     clusterId: dossier?.cluster_id || null,
-    clusterSize: 1, // would need full cluster query for exact count
+    clusterSize,
     risk: (dossier?.cluster_risk as any) || 'low',
-    matchedLinks: [],
+    matchedLinks,
   }
 }
 
