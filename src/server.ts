@@ -55,7 +55,7 @@ if (dbDir !== '.' && !existsSync(dbDir)) {
 import cors from 'cors'
 import helmet from 'helmet'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
-import { initDB } from './db/schema.js'
+import { initDB, getDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
@@ -114,6 +114,116 @@ app.post('/api/v1/signup', async (req, res) => {
     }
     return res.status(500).json({ error: e.message })
   }
+})
+
+// ═══════════════════════════════════════
+// Public Trust Profile (no auth required)
+// Cross-org trust querying: any sandbox, registry, or agent
+// can check an agent's grade before interaction.
+// From 0xbrainkid on NVIDIA/OpenShell#682.
+// ═══════════════════════════════════════
+const publicTrustLimiter = new RateLimiterMemory({
+  points: 60,       // 60 requests
+  duration: 60,     // per minute per IP
+  keyPrefix: 'public_trust',
+})
+
+const trustProfileCache = new Map<string, { data: any; expires: number }>()
+const TRUST_CACHE_TTL = 5 * 60 * 1000 // 5 min
+
+app.get('/api/v1/public/trust/:agentId', async (req, res) => {
+  // Rate limit
+  try {
+    await publicTrustLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' })
+  }
+
+  const { agentId } = req.params
+
+  // Cache check
+  const cached = trustProfileCache.get(agentId)
+  if (cached && cached.expires > Date.now()) {
+    return res.json(cached.data)
+  }
+
+  const db = getDB()
+
+  // Search across ALL tenants — this is the public lookup
+  const agent = db.prepare(
+    `SELECT * FROM agents WHERE agent_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1`
+  ).get(agentId) as any
+
+  if (!agent) {
+    const notFound = { agent_id: agentId, grade: 0, grade_label: 'unknown', found: false, queried_at: new Date().toISOString() }
+    return res.json(notFound)
+  }
+
+  const tenantId = agent.tenant_id
+
+  // Delegation
+  const delegation = db.prepare(
+    `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' LIMIT 1`
+  ).get(tenantId, agentId) as any
+
+  // Wallet
+  const wallet = db.prepare(
+    `SELECT status FROM agent_wallets WHERE tenant_id = ? AND agent_id = ? LIMIT 1`
+  ).get(tenantId, agentId) as any
+
+  // Dossier grade (if exists)
+  const dossier = db.prepare(
+    `SELECT passport_grade FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).get(tenantId, agentId) as any
+
+  // Grade: dossier if exists, else heuristic
+  let grade = 0
+  if (dossier) {
+    grade = dossier.passport_grade
+  } else {
+    const evalCount = (db.prepare(
+      `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenantId, agentId) as any).c
+    const receiptCount = (db.prepare(
+      `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenantId, agentId) as any).c
+    if (agent.status === 'active') grade = 1
+    if (delegation) grade = 2
+    if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3
+  }
+
+  const gradeLabels: Record<number, string> = { 0: 'unknown', 1: 'registered', 2: 'endorsed', 3: 'established' }
+  const trustLabels: Record<number, string> = { 0: 'unknown', 1: 'registered', 2: 'endorsed', 3: 'established' }
+
+  // Risk — simple denial rate only (no internal metrics)
+  const deniedCount = (db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'DENY'`
+  ).get(tenantId, agentId) as any).c
+  const evalTotal = (db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenantId, agentId) as any).c
+  const denialRate = evalTotal > 0 ? Math.round((deniedCount / evalTotal) * 100) / 100 : 0
+  const riskLevel = denialRate > 0.3 ? 'high' : denialRate > 0.1 ? 'medium' : 'low'
+
+  const ageDays = Math.floor((Date.now() - new Date(agent.created_at).getTime()) / (1000 * 60 * 60 * 24))
+
+  const profile = {
+    agent_id: agentId,
+    grade,
+    grade_label: gradeLabels[grade] || 'unknown',
+    trust: trustLabels[grade] || 'unknown',
+    age_days: ageDays,
+    risk_level: riskLevel,
+    has_delegation: !!delegation,
+    has_wallet: !!wallet,
+    found: true,
+    queried_at: new Date().toISOString(),
+  }
+
+  // Cache
+  trustProfileCache.set(agentId, { data: profile, expires: Date.now() + TRUST_CACHE_TTL })
+
+  res.json(profile)
 })
 
 // Authenticated routes
