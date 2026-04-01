@@ -216,6 +216,13 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   const ageDays = Math.floor((Date.now() - new Date(agent.created_at).getTime()) / (1000 * 60 * 60 * 24))
 
+  // Freshness signals (from 0xbrainkid on NVIDIA/OpenShell#682)
+  const lastEval = db.prepare(
+    `SELECT created_at FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).get(tenantId, agentId) as any
+  const lastActivityAt = lastEval ? lastEval.created_at : agent.created_at
+  const gradeComputedAt = dossier ? dossier.created_at : agent.created_at
+
   const profile = {
     agent_id: agentId,
     grade,
@@ -225,6 +232,9 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     risk_level: riskLevel,
     has_delegation: !!delegation,
     has_wallet: !!wallet,
+    grade_computed_at: gradeComputedAt,
+    last_activity_at: lastActivityAt,
+    attestation_bundle_hash: dossier ? dossier.attestation_bundle_hash : null,
     found: true,
     queried_at: new Date().toISOString(),
   }
