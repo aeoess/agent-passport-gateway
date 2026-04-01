@@ -59,6 +59,7 @@ import { initDB, getDB } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
+import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 
@@ -75,6 +76,14 @@ app.use(express.json({ limit: '1mb' }))
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.0' })
+})
+
+// JWKS endpoint — public key for verifying gateway-signed attestations
+// Used by insumer-examples multi-attestation verifier, OATR, and any
+// relying party that needs to verify APS trust attestation JWS.
+app.get('/.well-known/jwks.json', (_req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=3600')
+  res.json(getJwks())
 })
 
 // Rate limiter for public signup endpoint
@@ -226,6 +235,51 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   res.json(profile)
 })
 
+// Signed trust attestation — JWS compact format for multi-attestation verifiers
+// Returns the same trust profile but Ed25519-signed by the gateway.
+// Verifiable via /.well-known/jwks.json
+app.get('/api/v1/public/trust/:agentId/attestation', async (req, res) => {
+  // Same rate limit as trust profile
+  try {
+    await publicTrustLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' })
+  }
+
+  const { agentId } = req.params
+
+  // Reuse the trust profile logic — fetch from cache or compute
+  const cached = trustProfileCache.get(agentId)
+  let profile: any
+  if (cached && cached.expires > Date.now()) {
+    profile = cached.data
+  } else {
+    // Profile not cached — consumer should query trust profile first
+    return res.status(404).json({
+      error: 'Trust profile not cached. Query /api/v1/public/trust/' + agentId + ' first.',
+      hint: 'The attestation endpoint signs a cached trust profile. Fetch the profile first, then request the signed attestation.',
+    })
+  }
+
+  const identity = getGatewayIdentity()
+  const jws = identity.sign({
+    ...profile,
+    iss: 'https://gateway.aeoess.com',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 300, // 5 min validity
+  })
+
+  res.json({
+    issuer: 'https://gateway.aeoess.com',
+    type: 'passport_grade',
+    kid: identity.kid,
+    alg: 'EdDSA',
+    jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
+    signed: profile,
+    jws,
+  })
+})
+
 // Authenticated routes
 app.use('/api/v1', authMiddleware, gatewayRouter)
 app.use('/api/v1', authMiddleware, paymentRouter)
@@ -239,6 +293,7 @@ app.use((_req, res) => {
 // Init and start
 const db = initDB(DB_PATH)
 initLineageTables()
+initGatewayIdentity()
 console.log(`
 ═══════════════════════════════════════
   AEOESS Gateway v0.3.0 (Railway)
