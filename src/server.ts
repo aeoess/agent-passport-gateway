@@ -227,6 +227,71 @@ const publicTrustLimiter = new RateLimiterMemory({
 const trustProfileCache = new Map<string, { data: any; expires: number }>()
 const TRUST_CACHE_TTL = 5 * 60 * 1000 // 5 min
 
+/**
+ * Context Continuity Score (0-100)
+ * Measures behavioral consistency for an agent. Higher = more consistent.
+ * Three dimensions: activity regularity, behavioral consistency, identity maturity.
+ * Context break detected when activity gap + behavioral shift co-occur.
+ */
+function computeContinuityScore(db: any, tenantId: string, agentId: string, ageDays: number) {
+  // Fetch last 50 evaluation timestamps and verdicts
+  const evals = db.prepare(
+    `SELECT created_at, verdict FROM policy_evaluations
+     WHERE tenant_id = ? AND agent_id = ?
+     ORDER BY created_at DESC LIMIT 50`
+  ).all(tenantId, agentId) as { created_at: string, verdict: string }[]
+
+  if (evals.length < 2) {
+    return { score: ageDays > 7 ? 30 : 10, context_break: false, signals: ['insufficient_data'] }
+  }
+
+  // 1. Activity Regularity (0-40): std dev of time gaps between evals
+  const timestamps = evals.map(e => new Date(e.created_at).getTime()).reverse()
+  const gaps: number[] = []
+  for (let i = 1; i < timestamps.length; i++) {
+    gaps.push(timestamps[i] - timestamps[i - 1])
+  }
+  const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length
+  const variance = gaps.reduce((a, g) => a + Math.pow(g - meanGap, 2), 0) / gaps.length
+  const stdDev = Math.sqrt(variance)
+  const cv = meanGap > 0 ? stdDev / meanGap : 0 // coefficient of variation
+  // cv < 0.5 = very regular, cv > 2 = erratic
+  const activityScore = Math.round(Math.max(0, Math.min(40, 40 * (1 - Math.min(cv, 2) / 2))))
+
+  // 2. Behavioral Consistency (0-30): recent denial rate vs historical
+  const totalDenials = evals.filter(e => e.verdict === 'DENY').length
+  const historicalDenialRate = totalDenials / evals.length
+  const recentEvals = evals.slice(0, Math.min(10, evals.length))
+  const recentDenials = recentEvals.filter(e => e.verdict === 'DENY').length
+  const recentDenialRate = recentDenials / recentEvals.length
+  const denialDrift = Math.abs(recentDenialRate - historicalDenialRate)
+  // drift < 0.1 = consistent, drift > 0.3 = behavioral shift
+  const behaviorScore = Math.round(Math.max(0, Math.min(30, 30 * (1 - Math.min(denialDrift, 0.5) / 0.5))))
+
+  // 3. Identity Maturity (0-30): age + evaluation volume
+  const ageScore = Math.min(15, ageDays)  // max 15 from age
+  const volumeScore = Math.min(15, Math.round(evals.length / 50 * 15)) // max 15 from volume
+  const maturityScore = ageScore + volumeScore
+
+  const score = activityScore + behaviorScore + maturityScore
+
+  // Context break detection: large gap + behavioral shift
+  const signals: string[] = []
+  const maxGap = Math.max(...gaps)
+  const maxGapHours = maxGap / (1000 * 60 * 60)
+  let contextBreak = false
+
+  if (maxGapHours > 24) signals.push('activity_gap_' + Math.round(maxGapHours) + 'h')
+  if (denialDrift > 0.2) signals.push('denial_drift_' + Math.round(denialDrift * 100) + 'pct')
+  if (cv > 1.5) signals.push('erratic_timing')
+  if (maxGapHours > 24 && denialDrift > 0.15) {
+    contextBreak = true
+    signals.push('context_break')
+  }
+
+  return { score: Math.max(0, Math.min(100, score)), context_break: contextBreak, signals }
+}
+
 app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   // Rate limit
   try {
@@ -303,6 +368,9 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   const ageDays = Math.floor((Date.now() - new Date(agent.created_at).getTime()) / (1000 * 60 * 60 * 24))
 
+  // Context continuity scoring
+  const continuity = computeContinuityScore(db, tenantId, agentId, ageDays)
+
   // Freshness signals (from 0xbrainkid on NVIDIA/OpenShell#682)
   const lastEval = db.prepare(
     `SELECT created_at FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1`
@@ -322,6 +390,11 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     grade_computed_at: gradeComputedAt,
     last_activity_at: lastActivityAt,
     attestation_bundle_hash: dossier ? dossier.attestation_bundle_hash : null,
+    context_continuity: {
+      score: continuity.score,
+      context_break: continuity.context_break,
+      signals: continuity.signals,
+    },
     found: true,
     queried_at: new Date().toISOString(),
   }
