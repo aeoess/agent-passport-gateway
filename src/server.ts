@@ -62,6 +62,7 @@ import { initLineageTables } from './gateway/lineage.js'
 import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
+import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -75,7 +76,7 @@ app.use(express.json({ limit: '1mb' }))
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
-  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.1' })
+  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.2' })
 })
 
 // ═══════════════════════════════════════
@@ -380,6 +381,7 @@ app.get('/api/v1/public/trust/:agentId/attestation', async (req, res) => {
 app.use('/api/v1', authMiddleware, gatewayRouter)
 app.use('/api/v1', authMiddleware, paymentRouter)
 app.use('/api/v1', authMiddleware, walletRouter)
+app.use('/api/v1', authMiddleware, rekorRouter)
 
 // 404
 app.use((_req, res) => {
@@ -390,12 +392,13 @@ app.use((_req, res) => {
 const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
+initAnchorTable()
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.3.1 (Railway)
+  AEOESS Gateway v0.3.2 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 34 API routes + 2 public (.well-known)
+  Endpoints: 36 API routes + 2 public (.well-known)
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {
