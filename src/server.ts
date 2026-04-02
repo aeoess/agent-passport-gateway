@@ -75,7 +75,93 @@ app.use(express.json({ limit: '1mb' }))
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
-  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.0' })
+  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.1' })
+})
+
+// ═══════════════════════════════════════
+// Receipt Resolution (WG interop, no auth)
+// GET /.well-known/receipts/:id
+// Cross-system lineage traversal: any WG member can resolve
+// a proof reference to its full receipt + signature + JWKS.
+// From desiorac on A2A#1672 + MCP#1763.
+// ═══════════════════════════════════════
+const receiptResolutionLimiter = new RateLimiterMemory({
+  points: 120,      // 120 requests
+  duration: 60,     // per minute per IP
+  keyPrefix: 'receipt_resolve',
+})
+
+const receiptResolutionCache = new Map<string, { data: any; expires: number }>()
+const RECEIPT_CACHE_TTL = 10 * 60 * 1000 // 10 min (receipts are immutable)
+
+app.get('/.well-known/receipts/:receiptId', async (req, res) => {
+  try {
+    await receiptResolutionLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Rate limit exceeded. 120 req/min.' })
+  }
+
+  const { receiptId } = req.params
+
+  // Cache check (receipts are immutable — long cache is safe)
+  const cached = receiptResolutionCache.get(receiptId)
+  if (cached && cached.expires > Date.now()) {
+    res.setHeader('Cache-Control', 'public, max-age=600')
+    return res.json(cached.data)
+  }
+
+  const db = getDB()
+
+  // Search across receipt tables — receipts are identified by prefix or universal lookup
+  // Tables: receipts (policy), access_receipts (data), derivations (lineage), settlements
+  const tables = [
+    { table: 'receipts', type: 'policy_receipt', payloadField: 'payload', signatureField: 'signature' },
+    { table: 'access_receipts', type: 'access_receipt', payloadField: null, signatureField: 'signature' },
+    { table: 'derivations', type: 'derivation_receipt', payloadField: 'derivation_json', signatureField: 'signature' },
+    { table: 'settlements', type: 'settlement', payloadField: 'merkle_root', signatureField: 'signature' },
+  ]
+
+  for (const { table, type, payloadField, signatureField } of tables) {
+    try {
+      const row = db.prepare(`SELECT * FROM ${table} WHERE id = ? LIMIT 1`).get(receiptId) as any
+      if (row) {
+        let body: any
+        if (payloadField && row[payloadField]) {
+          try { body = JSON.parse(row[payloadField]) } catch { body = row[payloadField] }
+        } else {
+          // Reconstruct body from row fields (strip internal fields)
+          const { tenant_id, ...publicFields } = row
+          body = publicFields
+        }
+
+        const result = {
+          proofId: `aps:${receiptId}`,
+          proofType: type,
+          issuer: 'https://gateway.aeoess.com',
+          issuedAt: row.created_at,
+          agentId: row.agent_id,
+          signature: row[signatureField] || null,
+          body,
+          jwksUrl: 'https://gateway.aeoess.com/.well-known/jwks.json',
+          resolvedAt: new Date().toISOString(),
+        }
+
+        receiptResolutionCache.set(receiptId, { data: result, expires: Date.now() + RECEIPT_CACHE_TTL })
+        res.setHeader('Cache-Control', 'public, max-age=600')
+        return res.json(result)
+      }
+    } catch {
+      // Table might not have the right columns — skip
+      continue
+    }
+  }
+
+  res.status(404).json({
+    proofId: `aps:${receiptId}`,
+    error: 'Receipt not found',
+    hint: 'This endpoint resolves APS receipt IDs. Try the trust profile at /api/v1/public/trust/:agentId for agent lookups.',
+    resolvedAt: new Date().toISOString(),
+  })
 })
 
 // JWKS endpoint — public key for verifying gateway-signed attestations
@@ -306,10 +392,10 @@ initLineageTables()
 initGatewayIdentity()
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.3.0 (Railway)
+  AEOESS Gateway v0.3.1 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 33 API routes
+  Endpoints: 34 API routes + 2 public (.well-known)
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {

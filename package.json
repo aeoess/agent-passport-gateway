@@ -1,6 +1,6 @@
 {
   "name": "aeoess-gateway",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "AEOESS Hosted Enforcement Gateway",
   "main": "dist/server.js",
   "scripts": {
