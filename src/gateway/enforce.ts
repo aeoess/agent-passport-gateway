@@ -196,7 +196,11 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     action: { type: action_type, target: action_target, scope_required },
   })
   } catch (e) {
-    console.error('[EVALUATE ERROR]', (e as Error).message, (e as Error).stack)
+    const msg = (e as Error).message || String(e)
+    const stack = (e as Error).stack || ''
+    console.error('[EVALUATE ERROR]', msg)
+    console.error('[EVALUATE STACK]', stack)
+    console.error('[EVALUATE BODY]', JSON.stringify(req.body))
     const err = safeError(e, 'evaluate')
     res.status(500).json(err)
   }
