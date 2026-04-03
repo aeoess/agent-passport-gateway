@@ -90,10 +90,13 @@ function checkUsageLimit(tenant: Tenant): { allowed: boolean; reason?: string } 
 function incrementUsage(tenantId: string) {
   const db = getDB()
   const period = new Date().toISOString().slice(0, 7)
-  // Atomic upsert — no TOCTOU race
-  db.prepare(`INSERT INTO usage (tenant_id, period, evaluations) VALUES (?, ?, 1)
-    ON CONFLICT(tenant_id, period) DO UPDATE SET evaluations = evaluations + 1, updated_at = datetime('now')`)
-    .run(tenantId, period)
+  // Manual upsert — works regardless of UNIQUE constraint on table
+  const existing = db.prepare(`SELECT id FROM usage WHERE tenant_id = ? AND period = ?`).get(tenantId, period) as any
+  if (existing) {
+    db.prepare(`UPDATE usage SET evaluations = evaluations + 1, updated_at = datetime('now') WHERE id = ?`).run(existing.id)
+  } else {
+    db.prepare(`INSERT INTO usage (tenant_id, period, evaluations) VALUES (?, ?, 1)`).run(tenantId, period)
+  }
 }
 
 // ═══════════════════════════════════════
@@ -199,10 +202,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     const msg = (e as Error).message || String(e)
     const stack = (e as Error).stack || ''
     console.error('[EVALUATE ERROR]', msg)
-    console.error('[EVALUATE STACK]', stack)
-    console.error('[EVALUATE BODY]', JSON.stringify(req.body))
-    // Temporary debug — remove after fixing
-    res.status(500).json({ error: msg, stack: stack.split('\n').slice(0, 5) })
+    const err = safeError(e, 'evaluate')
+    res.status(500).json(err)
   }
 })
 
