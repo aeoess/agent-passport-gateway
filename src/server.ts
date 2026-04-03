@@ -324,7 +324,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   // Delegation
   const delegation = db.prepare(
-    `SELECT scope, spend_limit, spend_used, expires_at FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+    `SELECT scope, spend_limit, spend_used FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
   ).get(tenantId, agentId) as any
 
   // Wallet
@@ -391,7 +391,6 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
       scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
       spend_limit: delegation.spend_limit || null,
       spend_used: delegation.spend_used || 0,
-      expires_at: delegation.expires_at || null,
     } : null,
     grade_computed_at: gradeComputedAt,
     last_activity_at: lastActivityAt,
