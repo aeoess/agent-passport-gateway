@@ -201,8 +201,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     console.error('[EVALUATE ERROR]', msg)
     console.error('[EVALUATE STACK]', stack)
     console.error('[EVALUATE BODY]', JSON.stringify(req.body))
-    const err = safeError(e, 'evaluate')
-    res.status(500).json(err)
+    // Temporary debug — remove after fixing
+    res.status(500).json({ error: msg, stack: stack.split('\n').slice(0, 5) })
   }
 })
 
