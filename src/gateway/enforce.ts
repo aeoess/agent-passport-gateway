@@ -101,6 +101,7 @@ function incrementUsage(tenantId: string) {
 // ═══════════════════════════════════════
 
 gatewayRouter.post('/evaluate', async (req: any, res) => {
+  try {
   const tenant: Tenant = req.tenant
   const start = Date.now()
 
@@ -194,6 +195,11 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     agent_id,
     action: { type: action_type, target: action_target, scope_required },
   })
+  } catch (e) {
+    console.error('[EVALUATE ERROR]', (e as Error).message, (e as Error).stack)
+    const err = safeError(e, 'evaluate')
+    res.status(500).json(err)
+  }
 })
 
 // ═══════════════════════════════════════
