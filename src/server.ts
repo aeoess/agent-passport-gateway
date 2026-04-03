@@ -169,7 +169,8 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
 // Used by insumer-examples multi-attestation verifier, OATR, and any
 // relying party that needs to verify APS trust attestation JWS.
 app.get('/.well-known/jwks.json', (_req, res) => {
-  res.setHeader('Cache-Control', 'public, max-age=3600')
+  res.setHeader('Cache-Control', 'public, max-age=3600, stale-if-error=86400')
+  res.setHeader('CDN-Cache-Control', 'public, max-age=3600, stale-if-error=86400')
   res.json(getJwks())
 })
 
@@ -302,6 +303,10 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   const { agentId } = req.params
 
+  // CDN caching: serve stale responses during deploys
+  res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
+  res.setHeader('CDN-Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
+
   // Cache check
   const cached = trustProfileCache.get(agentId)
   if (cached && cached.expires > Date.now()) {
@@ -420,6 +425,10 @@ app.get('/api/v1/public/trust/:agentId/attestation', async (req, res) => {
   } catch {
     return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' })
   }
+
+  // CDN caching: attestations valid for 60s, serve stale during deploys
+  res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
+  res.setHeader('CDN-Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
 
   const { agentId } = req.params
 
