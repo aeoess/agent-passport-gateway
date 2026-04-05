@@ -44,6 +44,7 @@
 import express from 'express'
 import { mkdirSync, existsSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { createHash } from 'node:crypto'
 
 // Ensure DB directory exists (Railway Volumes mount at /data)
 const dbPath = process.env.DB_PATH || './gateway.db'
@@ -293,6 +294,50 @@ function computeContinuityScore(db: any, tenantId: string, agentId: string, ageD
   return { score: Math.max(0, Math.min(100, score)), context_break: contextBreak, signals }
 }
 
+// Recursive canonical JSON stringifier — sorted object keys, arrays preserved.
+// Used to hash delegation chains deterministically for delegation_chain_hash.
+function canonicalJsonStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v)
+  if (Array.isArray(v)) return '[' + v.map(canonicalJsonStringify).join(',') + ']'
+  const keys = Object.keys(v as Record<string, unknown>).sort()
+  return '{' + keys.map(k =>
+    JSON.stringify(k) + ':' + canonicalJsonStringify((v as Record<string, unknown>)[k])
+  ).join(',') + '}'
+}
+
+// Resolve the delegation chain root→current for an agent, then SHA-256
+// the canonicalized array. Returns lowercase hex. Empty chain → hash of "[]".
+function computeDelegationChainHash(
+  db: import('better-sqlite3').Database,
+  tenantId: string,
+  agentId: string,
+): string {
+  const chain: Array<{ parent: string; child: string; scope: string; spend_limit: number | null }> = []
+  let currentChild: string | null = agentId
+  const seen = new Set<string>()
+  // Walk root-ward: at each step the row where this agent is the child.
+  while (currentChild && !seen.has(currentChild)) {
+    seen.add(currentChild)
+    const row = db.prepare(
+      `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations
+       WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
+       ORDER BY created_at DESC LIMIT 1`
+    ).get(tenantId, currentChild) as
+      | { parent_agent_id: string; child_agent_id: string; scope: string; spend_limit: number | null }
+      | undefined
+    if (!row) break
+    chain.push({
+      parent: row.parent_agent_id,
+      child: row.child_agent_id,
+      scope: row.scope,
+      spend_limit: row.spend_limit,
+    })
+    currentChild = row.parent_agent_id
+  }
+  chain.reverse() // root → current
+  return createHash('sha256').update(canonicalJsonStringify(chain)).digest('hex')
+}
+
 app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   // Rate limit
   try {
@@ -307,9 +352,11 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
   res.setHeader('CDN-Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
 
-  // Cache check
+  // Cache check — cached entries serve the default passport_grade shape only.
+  // For ?signal= projections, fall through and recompute so the signed envelope
+  // carries a fresh evaluation_timestamp and delegation_chain_hash.
   const cached = trustProfileCache.get(agentId)
-  if (cached && cached.expires > Date.now()) {
+  if (cached && cached.expires > Date.now() && !req.query.signal) {
     return res.json(cached.data)
   }
 
@@ -321,6 +368,13 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   ).get(agentId) as any
 
   if (!agent) {
+    if (req.query.signal === 'governance_attestation') {
+      return res.status(404).json({
+        error: 'Agent not found',
+        agent_id: agentId,
+        hint: 'governance_attestation can only be issued for registered agents.',
+      })
+    }
     const notFound = { agent_id: agentId, grade: 0, grade_label: 'unknown', found: false, queried_at: new Date().toISOString() }
     return res.json(notFound)
   }
@@ -411,6 +465,47 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   // Cache
   trustProfileCache.set(agentId, { data: profile, expires: Date.now() + TRUST_CACHE_TTL })
+
+  // Signal projection: ?signal=governance_attestation returns a signed
+  // governance_attestation envelope per
+  // agent-passport-system/specs/governance-attestation-schema.md
+  // Default (no param) preserves the existing passport_grade response.
+  if (req.query.signal === 'governance_attestation') {
+    const evalTs = new Date().toISOString()
+    const expTs = new Date(Date.now() + 5 * 60 * 1000).toISOString()
+    const chainHash = computeDelegationChainHash(db, tenantId, agentId)
+    const activeConstraints = delegation
+      ? {
+          scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
+          spend_limit: delegation.spend_limit ?? null,
+          spend_used: delegation.spend_used ?? 0,
+          spend_currency: 'XNO',
+        }
+      : { scopes: [], spend_limit: null, spend_used: 0, spend_currency: 'XNO' }
+
+    const claim = {
+      signal_type: 'governance_attestation' as const,
+      iss: 'https://gateway.aeoess.com',
+      gateway_id: 'gateway.aeoess.com',
+      policy_version: 'floor-v1.2.0',
+      attestation_grade: grade,
+      evaluation_timestamp: evalTs,
+      expires_at: expTs,
+      delegation_chain_hash: chainHash,
+      active_constraints: activeConstraints,
+    }
+    const identity = getGatewayIdentity()
+    const jws = identity.sign(claim)
+    return res.json({
+      issuer: 'https://gateway.aeoess.com',
+      type: 'governance_attestation',
+      kid: identity.kid,
+      alg: 'EdDSA',
+      jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
+      signed: claim,
+      jws,
+    })
+  }
 
   res.json(profile)
 })
