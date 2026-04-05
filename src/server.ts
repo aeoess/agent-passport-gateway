@@ -464,6 +464,160 @@ app.get('/api/v1/public/trust/:agentId/attestation', async (req, res) => {
   })
 })
 
+// ═══════════════════════════════════════
+// MCP Stats Persistence
+// POST /api/v1/mcp-stats — authenticated heartbeat from MCP server
+// GET  /api/v1/mcp-stats/cumulative — public cumulative totals (powers /stats page)
+// ═══════════════════════════════════════
+
+// Public cumulative totals — no auth, powers mcp.aeoess.com/stats page
+app.get('/api/v1/mcp-stats/cumulative', (_req, res) => {
+  try {
+    const db = getDB()
+    // Cumulative = sum of the MAX counter per session_id (each session's peak
+    // value across all its snapshots). Counters are monotonic within a session.
+    const perSession = db.prepare(`
+      SELECT session_id,
+             MAX(uptime_seconds)      AS uptime_seconds,
+             MAX(passports_issued)    AS passports_issued,
+             MAX(sessions_total)      AS sessions_total,
+             MAX(tool_calls_total)    AS tool_calls_total,
+             MAX(evaluations_total)   AS evaluations_total,
+             MAX(delegations_created) AS delegations_created,
+             MAX(receipts_stored)     AS receipts_stored
+      FROM mcp_stats_snapshots
+      GROUP BY session_id
+    `).all() as Array<{
+      session_id: string
+      uptime_seconds: number
+      passports_issued: number
+      sessions_total: number
+      tool_calls_total: number
+      evaluations_total: number
+      delegations_created: number
+      receipts_stored: number
+    }>
+
+    let passports_issued = 0, sessions_total = 0, tool_calls_total = 0
+    let evaluations_total = 0, delegations_created = 0, receipts_stored = 0
+    let total_uptime_seconds = 0
+    for (const r of perSession) {
+      passports_issued    += r.passports_issued    || 0
+      sessions_total      += r.sessions_total      || 0
+      tool_calls_total    += r.tool_calls_total    || 0
+      evaluations_total   += r.evaluations_total   || 0
+      delegations_created += r.delegations_created || 0
+      receipts_stored     += r.receipts_stored     || 0
+      total_uptime_seconds += r.uptime_seconds     || 0
+    }
+
+    const meta = db.prepare(`
+      SELECT COUNT(*) AS snapshot_count,
+             MIN(snapshot_at) AS first_snapshot_at,
+             MAX(snapshot_at) AS last_snapshot_at
+      FROM mcp_stats_snapshots
+    `).get() as { snapshot_count: number; first_snapshot_at: string | null; last_snapshot_at: string | null }
+
+    // Current session = most recent snapshot
+    const latest = db.prepare(`
+      SELECT session_id, uptime_seconds, sessions_active
+      FROM mcp_stats_snapshots
+      ORDER BY snapshot_at DESC
+      LIMIT 1
+    `).get() as { session_id: string; uptime_seconds: number; sessions_active: number } | undefined
+
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=120')
+    res.json({
+      cumulative: {
+        passports_issued,
+        sessions_total,
+        tool_calls_total,
+        evaluations_total,
+        delegations_created,
+        receipts_stored,
+        total_uptime_hours: Math.round((total_uptime_seconds / 3600) * 10) / 10,
+      },
+      current_session: latest ? {
+        session_id: latest.session_id,
+        uptime_seconds: latest.uptime_seconds,
+        sessions_active: latest.sessions_active,
+      } : null,
+      snapshot_count: meta.snapshot_count,
+      first_snapshot_at: meta.first_snapshot_at,
+      last_snapshot_at: meta.last_snapshot_at,
+    })
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch cumulative stats' })
+  }
+})
+
+// Authenticated heartbeat — MCP posts its counters every ~5min + on SIGTERM
+app.post('/api/v1/mcp-stats', authMiddleware, (req: any, res) => {
+  try {
+    const b = req.body || {}
+    if (typeof b.session_id !== 'string' || !b.session_id) {
+      return res.status(400).json({ error: 'session_id required' })
+    }
+    const db = getDB()
+    const snapshotAt = new Date().toISOString()
+    // Upsert window: if a snapshot for this session exists within the last 5 min,
+    // update it (monotonic counters overwrite). Otherwise insert a new row.
+    const existing = db.prepare(`
+      SELECT id FROM mcp_stats_snapshots
+      WHERE session_id = ?
+        AND snapshot_at >= datetime('now', '-5 minutes')
+      ORDER BY snapshot_at DESC LIMIT 1
+    `).get(b.session_id) as { id: number } | undefined
+
+    const values = {
+      snapshot_at: snapshotAt,
+      uptime_seconds: Number(b.uptime_seconds) || 0,
+      passports_issued: Number(b.passports_issued) || 0,
+      sessions_total: Number(b.sessions_total) || 0,
+      sessions_active: Number(b.sessions_active) || 0,
+      tool_calls_total: Number(b.tool_calls_total) || 0,
+      evaluations_total: Number(b.evaluations_total) || 0,
+      delegations_created: Number(b.delegations_created) || 0,
+      receipts_stored: Number(b.receipts_stored) || 0,
+      version: typeof b.version === 'string' ? b.version : null,
+      tenant_id: req.tenant?.id ?? null,
+    }
+
+    if (existing) {
+      db.prepare(`
+        UPDATE mcp_stats_snapshots SET
+          snapshot_at = ?, uptime_seconds = ?, passports_issued = ?,
+          sessions_total = ?, sessions_active = ?, tool_calls_total = ?,
+          evaluations_total = ?, delegations_created = ?, receipts_stored = ?,
+          version = ?, tenant_id = ?
+        WHERE id = ?
+      `).run(
+        values.snapshot_at, values.uptime_seconds, values.passports_issued,
+        values.sessions_total, values.sessions_active, values.tool_calls_total,
+        values.evaluations_total, values.delegations_created, values.receipts_stored,
+        values.version, values.tenant_id, existing.id,
+      )
+      return res.json({ ok: true, action: 'updated', snapshot_id: existing.id })
+    }
+
+    const info = db.prepare(`
+      INSERT INTO mcp_stats_snapshots (
+        session_id, snapshot_at, uptime_seconds, passports_issued,
+        sessions_total, sessions_active, tool_calls_total, evaluations_total,
+        delegations_created, receipts_stored, version, tenant_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      b.session_id, values.snapshot_at, values.uptime_seconds, values.passports_issued,
+      values.sessions_total, values.sessions_active, values.tool_calls_total,
+      values.evaluations_total, values.delegations_created, values.receipts_stored,
+      values.version, values.tenant_id,
+    )
+    res.json({ ok: true, action: 'inserted', snapshot_id: info.lastInsertRowid })
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to record snapshot' })
+  }
+})
+
 // Authenticated routes
 app.use('/api/v1', authMiddleware, gatewayRouter)
 app.use('/api/v1', authMiddleware, paymentRouter)

@@ -306,6 +306,26 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_dossiers_tenant ON issuance_dossiers(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_dossiers_pubkey ON issuance_dossiers(public_key_hash);
     CREATE INDEX IF NOT EXISTS idx_dossiers_grade ON issuance_dossiers(tenant_id, passport_grade);
+
+    -- MCP Stats Snapshots (persistent counters across Railway restarts)
+    CREATE TABLE IF NOT EXISTS mcp_stats_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      snapshot_at TEXT NOT NULL,
+      uptime_seconds REAL NOT NULL DEFAULT 0,
+      passports_issued INTEGER DEFAULT 0,
+      sessions_total INTEGER DEFAULT 0,
+      sessions_active INTEGER DEFAULT 0,
+      tool_calls_total INTEGER DEFAULT 0,
+      evaluations_total INTEGER DEFAULT 0,
+      delegations_created INTEGER DEFAULT 0,
+      receipts_stored INTEGER DEFAULT 0,
+      version TEXT,
+      tenant_id TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mcp_stats_session ON mcp_stats_snapshots(session_id, snapshot_at);
+    CREATE INDEX IF NOT EXISTS idx_mcp_stats_time ON mcp_stats_snapshots(snapshot_at);
   `)
 }
 
