@@ -344,6 +344,29 @@ function createTables() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_rotations_agent ON key_rotations(tenant_id, agent_id);
+
+    -- Evaluation Receipts (auto-minted from every policy evaluation)
+    CREATE TABLE IF NOT EXISTS evaluation_receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      evaluation_id TEXT,
+      event_type TEXT NOT NULL CHECK(event_type IN ('authorization_permit', 'authorization_deny')),
+      decision_stage TEXT NOT NULL DEFAULT 'gateway_authorization',
+      action_type TEXT,
+      scope_requested_json TEXT,
+      verdict TEXT NOT NULL CHECK(verdict IN ('permit', 'deny')),
+      reason_code TEXT,
+      delegation_id TEXT,
+      policy_hash TEXT,
+      schema_version TEXT NOT NULL DEFAULT '1.0.0',
+      receipt_hash TEXT,
+      gateway_signature TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_eval_receipts_agent ON evaluation_receipts(tenant_id, agent_id);
+    CREATE INDEX IF NOT EXISTS idx_eval_receipts_deny ON evaluation_receipts(verdict) WHERE verdict = 'deny';
   `)
 }
 

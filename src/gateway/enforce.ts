@@ -11,8 +11,9 @@
  */
 
 import { Router } from 'express'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
+import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 
@@ -20,6 +21,80 @@ function safeError(e: any, context: string): { error: string; ref: string } {
   const ref = randomUUID().slice(0, 8)
   console.error(`[ERR:${ref}] ${context}:`, e.message || e)
   return { error: `Internal error (ref: ${ref}). Contact support.`, ref }
+}
+
+// ── Auto-Mint Evaluation Receipts ──
+// Non-blocking: logs failures but never blocks the evaluation response.
+// Denials are signed (proof of restraint). Permits are unsigned (routine).
+
+function canonicalJsonStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v)
+  if (Array.isArray(v)) return '[' + v.map(canonicalJsonStringify).join(',') + ']'
+  const keys = Object.keys(v as Record<string, unknown>).sort()
+  return '{' + keys.map(k =>
+    JSON.stringify(k) + ':' + canonicalJsonStringify((v as Record<string, unknown>)[k])
+  ).join(',') + '}'
+}
+
+function mintEvaluationReceipt(opts: {
+  tenantId: string; agentId: string; evaluationId: string;
+  verdict: string; actionType: string; scopeRequired: string;
+  reason: string; delegationId: string | null;
+}) {
+  try {
+    const db = getDB()
+    const scopeJson = JSON.stringify(
+      (opts.scopeRequired || '').split(',').map(s => s.trim()).filter(Boolean).sort()
+    )
+    const policyHash = createHash('sha256')
+      .update('floor-v1-scope-spend-depth-delegation')
+      .digest('hex').slice(0, 16)
+
+    const receiptData: Record<string, unknown> = {
+      tenant_id: opts.tenantId,
+      agent_id: opts.agentId,
+      evaluation_id: opts.evaluationId,
+      event_type: opts.verdict === 'permit' ? 'authorization_permit' : 'authorization_deny',
+      decision_stage: 'gateway_authorization',
+      action_type: opts.actionType,
+      scope_requested_json: scopeJson,
+      verdict: opts.verdict === 'permit' ? 'permit' : 'deny',
+      reason_code: opts.verdict !== 'permit' ? (opts.reason || 'policy_deny') : null,
+      delegation_id: opts.delegationId,
+      policy_hash: policyHash,
+      schema_version: '1.0.0',
+    }
+
+    const receiptHash = createHash('sha256')
+      .update(canonicalJsonStringify(receiptData))
+      .digest('hex')
+
+    // Only sign denials (proof of restraint)
+    let gatewaySignature: string | null = null
+    if (opts.verdict !== 'permit') {
+      try {
+        const identity = getGatewayIdentity()
+        gatewaySignature = identity.sign({ ...receiptData, receipt_hash: receiptHash })
+      } catch { /* signing optional, log below */ }
+    }
+
+    db.prepare(`
+      INSERT INTO evaluation_receipts (
+        tenant_id, agent_id, evaluation_id, event_type, decision_stage,
+        action_type, scope_requested_json, verdict, reason_code,
+        delegation_id, policy_hash, schema_version, receipt_hash, gateway_signature
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      receiptData.tenant_id, receiptData.agent_id, receiptData.evaluation_id,
+      receiptData.event_type, receiptData.decision_stage,
+      receiptData.action_type, receiptData.scope_requested_json,
+      receiptData.verdict, receiptData.reason_code,
+      receiptData.delegation_id, receiptData.policy_hash,
+      receiptData.schema_version, receiptHash, gatewaySignature,
+    )
+  } catch (e: any) {
+    console.error('[receipt-mint] FAILED:', opts.agentId, e.message)
+  }
 }
 
 // SDK scope matching — respects monotonic narrowing invariant
@@ -173,6 +248,13 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   // Record evaluation
   db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs)
+
+  // Auto-mint evaluation receipt (non-blocking)
+  mintEvaluationReceipt({
+    tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
+    verdict, actionType: action_type, scopeRequired: scope_required,
+    reason, delegationId: delegation?.id || null,
+  })
 
   incrementUsage(tenant.id)
 
@@ -591,6 +673,15 @@ gatewayRouter.get('/dashboard', (req: any, res) => {
         : 'unlimited',
     },
     receipts: { total: receipts.c },
+    evaluation_receipts: (() => {
+      const stats = db.prepare(`
+        SELECT COUNT(*) as total,
+               SUM(CASE WHEN verdict='permit' THEN 1 ELSE 0 END) as permits,
+               SUM(CASE WHEN verdict='deny' THEN 1 ELSE 0 END) as denials
+        FROM evaluation_receipts WHERE tenant_id = ?
+      `).get(tenant.id) as any
+      return { total: stats?.total || 0, permits: stats?.permits || 0, denials: stats?.denials || 0 }
+    })(),
     alerts: { unacknowledged: alerts.length, items: alerts },
     recent_denials: recentDenials,
     compliance_reports_available: limit.complianceReports,
@@ -1281,4 +1372,44 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
     }
     res.status(500).json(safeError(e, 'behavioral-sequence'))
   }
+})
+
+// ═══════════════════════════════════════
+// Evaluation Receipts — authenticated endpoints
+// ═══════════════════════════════════════
+
+// GET /api/v1/receipts/:agentId — all receipts for an agent (paginated)
+gatewayRouter.get('/receipts/:agentId', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const { agentId } = req.params
+  const limit = Math.min(parseInt(req.query.limit || '50'), 100)
+  const offset = parseInt(req.query.offset || '0')
+  const db = getDB()
+
+  const rows = db.prepare(
+    `SELECT * FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(tenant.id, agentId, limit, offset)
+  const total = (db.prepare(
+    `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any).c
+
+  res.json({ receipts: rows, total, limit, offset })
+})
+
+// GET /api/v1/receipts/:agentId/denials — denial receipts only (proof of restraint)
+gatewayRouter.get('/receipts/:agentId/denials', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const { agentId } = req.params
+  const limit = Math.min(parseInt(req.query.limit || '50'), 100)
+  const offset = parseInt(req.query.offset || '0')
+  const db = getDB()
+
+  const rows = db.prepare(
+    `SELECT * FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny' ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(tenant.id, agentId, limit, offset)
+  const total = (db.prepare(
+    `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny'`
+  ).get(tenant.id, agentId) as any).c
+
+  res.json({ denials: rows, total, limit, offset })
 })

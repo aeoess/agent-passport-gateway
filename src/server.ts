@@ -813,12 +813,56 @@ const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
+
+// Backfill evaluation receipts from existing evaluations (one-time on first deploy)
+try {
+  const receiptCount = (db.prepare('SELECT COUNT(*) as c FROM evaluation_receipts').get() as any).c
+  if (receiptCount === 0) {
+    const evals = db.prepare('SELECT * FROM policy_evaluations').all() as any[]
+    if (evals.length > 0) {
+      const insert = db.prepare(`
+        INSERT INTO evaluation_receipts (
+          tenant_id, agent_id, evaluation_id, event_type, decision_stage,
+          action_type, scope_requested_json, verdict, reason_code,
+          policy_hash, schema_version, receipt_hash, created_at
+        ) VALUES (?, ?, ?, ?, 'gateway_authorization', ?, ?, ?, ?, ?, '1.0.0', ?, ?)
+      `)
+      let backfilled = 0
+      for (const ev of evals) {
+        try {
+          const verd = (ev.verdict || '').toLowerCase() === 'permit' ? 'permit' : 'deny'
+          const scopeJson = JSON.stringify(
+            (ev.scope_required || '').split(',').map((s: string) => s.trim()).filter(Boolean).sort()
+          )
+          const eventType = verd === 'permit' ? 'authorization_permit' : 'authorization_deny'
+          const reasonCode = verd === 'deny' ? (ev.reason || 'policy_deny') : null
+          const policyHash = createHash('sha256')
+            .update('floor-v1-scope-spend-depth-delegation')
+            .digest('hex').slice(0, 16)
+          const receiptHash = createHash('sha256')
+            .update(JSON.stringify({ evaluation_id: ev.id, verdict: verd, agent_id: ev.agent_id }))
+            .digest('hex')
+          insert.run(
+            ev.tenant_id, ev.agent_id, ev.id, eventType,
+            ev.action_type, scopeJson, verd, reasonCode,
+            policyHash, receiptHash, ev.created_at,
+          )
+          backfilled++
+        } catch { /* skip individual failures */ }
+      }
+      console.log(`[receipt-mint] Backfilled ${backfilled} receipts from ${evals.length} evaluations`)
+    }
+  }
+} catch (e: any) {
+  console.error('[receipt-mint] Backfill failed:', e.message)
+}
+
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.3.3 (Railway)
+  AEOESS Gateway v0.3.4 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 36 API routes + 2 public (.well-known)
+  Endpoints: 39 API routes + 2 public (.well-known)
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {
