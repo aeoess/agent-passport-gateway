@@ -367,7 +367,27 @@ function createTables() {
 
     CREATE INDEX IF NOT EXISTS idx_eval_receipts_agent ON evaluation_receipts(tenant_id, agent_id);
     CREATE INDEX IF NOT EXISTS idx_eval_receipts_deny ON evaluation_receipts(verdict) WHERE verdict = 'deny';
+
+    -- Posture Events (audit trail for agent status transitions)
+    CREATE TABLE IF NOT EXISTS posture_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      old_status TEXT NOT NULL,
+      new_status TEXT NOT NULL,
+      restricted_scopes TEXT,
+      reason TEXT NOT NULL,
+      changed_by TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_posture_events_agent ON posture_events(agent_id);
   `)
+
+  // Add posture columns to agents table (idempotent via try/catch)
+  try { db.exec(`ALTER TABLE agents ADD COLUMN restricted_scopes TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN posture_reason TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN posture_updated_at TEXT`) } catch {}
 }
 
 // ═══════════════════════════════════════

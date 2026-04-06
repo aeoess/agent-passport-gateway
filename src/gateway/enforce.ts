@@ -196,11 +196,45 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
   const db = getDB()
 
-  // Check agent exists and is active
-  const agent = db.prepare(`SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`)
+  // Check agent exists
+  const agent = db.prepare(`SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ?`)
     .get(tenant.id, agent_id) as any
   if (!agent) {
-    return res.status(404).json({ error: `Agent "${agent_id}" not found or inactive` })
+    return res.status(404).json({ error: `Agent "${agent_id}" not found` })
+  }
+
+  // Posture enforcement: suspended → deny all, restricted → deny restricted scopes
+  if (agent.status === 'suspended') {
+    const evalId = randomUUID()
+    const durationMs = Date.now() - start
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Agent suspended', durationMs)
+    mintEvaluationReceipt({
+      tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
+      verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
+      reason: 'agent_suspended', delegationId: null,
+    })
+    return res.json({ evaluation_id: evalId, verdict: 'deny', reason: 'Agent suspended', violations: ['agent_suspended'], duration_ms: durationMs, agent_id, action: { type: action_type, target: action_target, scope_required } })
+  }
+  if (agent.status === 'restricted' && agent.restricted_scopes) {
+    try {
+      const restrictedScopes: string[] = JSON.parse(agent.restricted_scopes)
+      if (restrictedScopes.includes(scope_required) || restrictedScopes.some(rs => scope_required.startsWith(rs + ':'))) {
+        const evalId = randomUUID()
+        const durationMs = Date.now() - start
+        db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Scope "${scope_required}" restricted by posture`, durationMs)
+        mintEvaluationReceipt({
+          tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
+          verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
+          reason: 'scope_restricted', delegationId: null,
+        })
+        return res.json({ evaluation_id: evalId, verdict: 'deny', reason: `Scope "${scope_required}" restricted by posture`, violations: ['scope_restricted'], duration_ms: durationMs, agent_id, action: { type: action_type, target: action_target, scope_required } })
+      }
+    } catch { /* invalid JSON in restricted_scopes — proceed */ }
+  }
+  if (agent.status !== 'active' && agent.status !== 'restricted') {
+    return res.status(404).json({ error: `Agent "${agent_id}" not active (status: ${agent.status})` })
   }
 
   // Check delegation scope
@@ -1412,6 +1446,59 @@ gatewayRouter.get('/receipts/:agentId/denials', (req: any, res) => {
   ).get(tenant.id, agentId) as any).c
 
   res.json({ denials: rows, total, limit, offset })
+})
+
+// ═══════════════════════════════════════
+// Agent Posture Overlay — suspend/restrict with audit trail
+// ═══════════════════════════════════════
+
+// POST /api/v1/agents/:agentId/posture — change agent operational posture
+gatewayRouter.post('/agents/:agentId/posture', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const { agentId } = req.params
+  const { status, reason, restricted_scopes } = req.body
+
+  if (!status || !reason) {
+    return res.status(400).json({ error: 'Required: status, reason' })
+  }
+  if (!['active', 'restricted', 'suspended'].includes(status)) {
+    return res.status(400).json({ error: 'status must be active, restricted, or suspended' })
+  }
+  if (status === 'restricted' && !restricted_scopes) {
+    return res.status(400).json({ error: 'restricted status requires restricted_scopes array' })
+  }
+
+  const db = getDB()
+  const agent = db.prepare(`SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`)
+    .get(tenant.id, agentId) as any
+  if (!agent) return res.status(404).json({ error: 'Agent not found' })
+
+  const oldStatus = agent.status || 'active'
+  const now = new Date().toISOString()
+  const scopesJson = restricted_scopes ? JSON.stringify(restricted_scopes) : null
+
+  // Update agent status
+  db.prepare(`UPDATE agents SET status = ?, restricted_scopes = ?, posture_reason = ?, posture_updated_at = ? WHERE tenant_id = ? AND agent_id = ?`)
+    .run(status, status === 'restricted' ? scopesJson : null, reason, now, tenant.id, agentId)
+
+  // Log posture event
+  db.prepare(`INSERT INTO posture_events (tenant_id, agent_id, old_status, new_status, restricted_scopes, reason, changed_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(tenant.id, agentId, oldStatus, status, scopesJson, reason, tenant.id)
+
+  res.json({ agent_id: agentId, old_status: oldStatus, new_status: status, reason, restricted_scopes: restricted_scopes || null, changed_at: now })
+})
+
+// GET /api/v1/agents/:agentId/posture-history — audit trail
+gatewayRouter.get('/agents/:agentId/posture-history', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const { agentId } = req.params
+  const db = getDB()
+
+  const events = db.prepare(
+    `SELECT * FROM posture_events WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC`
+  ).all(tenant.id, agentId)
+
+  res.json({ agent_id: agentId, events, count: events.length })
 })
 
 // ═══════════════════════════════════════
