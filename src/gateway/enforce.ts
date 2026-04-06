@@ -115,6 +115,31 @@ async function getScopeAuthorizes() {
   return _scopeAuthorizes
 }
 
+// SDK recovery evaluation — consulted on denials
+let _evaluateRecovery: ((opts: any) => any) | null = null
+async function getEvaluateRecovery() {
+  if (!_evaluateRecovery) {
+    try {
+      const sdk: any = await import('agent-passport-system')
+      if (typeof sdk.evaluateRecovery === 'function') {
+        _evaluateRecovery = sdk.evaluateRecovery
+      }
+    } catch { /* SDK version may not have evaluateRecovery yet */ }
+  }
+  return _evaluateRecovery
+}
+
+// Map denial reason to SDK failure type
+function mapFailureType(violations: string[]): string {
+  const joined = violations.join(' ').toLowerCase()
+  if (joined.includes('scope')) return 'scope_denied'
+  if (joined.includes('budget') || joined.includes('spend') || joined.includes('cost')) return 'budget_exceeded'
+  if (joined.includes('suspended')) return 'passport_expired'
+  if (joined.includes('delegation')) return 'delegation_revoked'
+  if (joined.includes('key')) return 'policy_violation'
+  return 'unknown'
+}
+
 export const gatewayRouter = Router()
 
 // ═══════════════════════════════════════
@@ -335,11 +360,43 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
         `Agent "${agent_id}" at ${((delegation.spend_used / delegation.spend_limit) * 100).toFixed(0)}% of spend limit`)
   }
 
+  // Recovery guidance on denial (backward compat: null when no policy)
+  let recovery: any = null
+  if (verdict === 'deny') {
+    try {
+      const policyRow = db.prepare(
+        `SELECT policy_json FROM recovery_policies WHERE tenant_id = ? AND agent_id = ?`
+      ).get(tenant.id, agent_id) as any
+      if (policyRow) {
+        const evaluateRecovery = await getEvaluateRecovery()
+        if (evaluateRecovery) {
+          const policy = JSON.parse(policyRow.policy_json)
+          const failureType = mapFailureType(violations)
+          const result = evaluateRecovery({ policy, failureType })
+          recovery = {
+            strategy: result.strategy,
+            rule: result.rule?.name || null,
+            maxRetries: result.rule?.maxRetries || null,
+            initialBackoffMs: result.rule?.initialBackoffMs || null,
+            hardStop: result.hardStop,
+          }
+          // Store recovery event in audit trail (best-effort)
+          try {
+            db.prepare(
+              `INSERT INTO recovery_events (id, tenant_id, agent_id, delegation_id, evaluation_id, failure_type, strategy_applied, attempt_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(randomUUID(), tenant.id, agent_id, delegation?.id || null, evalId, failureType, result.strategy, 1)
+          } catch { /* best-effort */ }
+        }
+      }
+    } catch { /* recovery lookup is best-effort, never blocks response */ }
+  }
+
   res.json({
     evaluation_id: evalId,
     verdict,
     reason,
     violations: violations.length > 0 ? violations : undefined,
+    recovery,
     duration_ms: durationMs,
     agent_id,
     action: { type: action_type, target: action_target, scope_required },
@@ -2223,6 +2280,89 @@ gatewayRouter.get('/agents/:agentId/health', (req: any, res) => {
     res.json(healthStatus)
   } catch (e) {
     const err = safeError(e, 'agent-health')
+    res.status(500).json(err)
+  }
+})
+
+
+// ═══════════════════════════════════════
+// Recovery Policy CRUD
+// ═══════════════════════════════════════
+
+// POST /api/v1/agents/:agentId/recovery-policy — Configure recovery policy
+gatewayRouter.post('/agents/:agentId/recovery-policy', (req: any, res) => {
+  try {
+    const tenant: Tenant = req.tenant
+    const db = getDB()
+    const { agentId } = req.params
+    const policy = req.body
+
+    if (!policy || !policy.policyId || !policy.rules || !policy.defaultStrategy) {
+      return res.status(400).json({ error: 'Required: policyId, rules, defaultStrategy, maxTotalAttempts' })
+    }
+
+    const agent = db.prepare(
+      `SELECT agent_id FROM agents WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenant.id, agentId) as any
+    if (!agent) {
+      return res.status(404).json({ error: `Agent "${agentId}" not found` })
+    }
+
+    const id = randomUUID()
+    db.prepare(
+      `INSERT INTO recovery_policies (id, tenant_id, agent_id, policy_json)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(tenant_id, agent_id) DO UPDATE SET
+         policy_json = excluded.policy_json,
+         updated_at = datetime('now')`
+    ).run(id, tenant.id, agentId, JSON.stringify(policy))
+
+    res.status(201).json({ policyId: policy.policyId, agentId, status: 'active' })
+  } catch (e) {
+    const err = safeError(e, 'recovery-policy-create')
+    res.status(500).json(err)
+  }
+})
+
+// GET /api/v1/agents/:agentId/recovery-policy — Get recovery policy
+gatewayRouter.get('/agents/:agentId/recovery-policy', (req: any, res) => {
+  try {
+    const tenant: Tenant = req.tenant
+    const db = getDB()
+    const { agentId } = req.params
+
+    const row = db.prepare(
+      `SELECT policy_json FROM recovery_policies WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenant.id, agentId) as any
+    if (!row) {
+      return res.status(404).json({ error: 'No recovery policy configured for this agent' })
+    }
+
+    res.json(JSON.parse(row.policy_json))
+  } catch (e) {
+    const err = safeError(e, 'recovery-policy-get')
+    res.status(500).json(err)
+  }
+})
+
+// DELETE /api/v1/agents/:agentId/recovery-policy — Remove recovery policy
+gatewayRouter.delete('/agents/:agentId/recovery-policy', (req: any, res) => {
+  try {
+    const tenant: Tenant = req.tenant
+    const db = getDB()
+    const { agentId } = req.params
+
+    const result = db.prepare(
+      `DELETE FROM recovery_policies WHERE tenant_id = ? AND agent_id = ?`
+    ).run(tenant.id, agentId)
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'No recovery policy found' })
+    }
+
+    res.json({ agentId, status: 'removed' })
+  } catch (e) {
+    const err = safeError(e, 'recovery-policy-delete')
     res.status(500).json(err)
   }
 })

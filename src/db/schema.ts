@@ -400,6 +400,37 @@ function createTables() {
     );
   `)
 
+  db.exec(`
+    -- Recovery Policies (one per agent, consulted on denial)
+    CREATE TABLE IF NOT EXISTS recovery_policies (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      policy_json TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_recovery_policies_agent ON recovery_policies(tenant_id, agent_id);
+
+    -- Recovery Events (audit trail for recovery actions)
+    CREATE TABLE IF NOT EXISTS recovery_events (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      delegation_id TEXT,
+      evaluation_id TEXT,
+      failure_type TEXT NOT NULL,
+      strategy_applied TEXT NOT NULL,
+      attempt_number INTEGER NOT NULL,
+      recovery_succeeded INTEGER,
+      timestamp TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_recovery_events_agent ON recovery_events(tenant_id, agent_id);
+  `)
+
   // Add columns (idempotent via try/catch)
   try { db.exec(`ALTER TABLE evaluation_receipts ADD COLUMN seal_id TEXT`) } catch {}
 
