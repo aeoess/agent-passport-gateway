@@ -77,7 +77,7 @@ app.use(express.json({ limit: '1mb' }))
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
-  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.3.4' })
+  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.4.0' })
 })
 
 // ═══════════════════════════════════════
@@ -859,7 +859,7 @@ try {
 
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.3.4 (Railway)
+  AEOESS Gateway v0.4.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
   Endpoints: 39 API routes + 2 public (.well-known)
