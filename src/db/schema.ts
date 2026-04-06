@@ -382,7 +382,26 @@ function createTables() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_posture_events_agent ON posture_events(agent_id);
+
+    -- Receipt Window Seals (Merkle-committed batches of evaluation receipts)
+    CREATE TABLE IF NOT EXISTS receipt_window_seals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      seal_id TEXT NOT NULL UNIQUE,
+      seq_start INTEGER NOT NULL,
+      seq_end INTEGER NOT NULL,
+      receipt_count INTEGER NOT NULL,
+      permit_count INTEGER DEFAULT 0,
+      deny_count INTEGER DEFAULT 0,
+      commitment_hash TEXT NOT NULL,
+      leaf_schema TEXT DEFAULT 'gateway_receipt_v1',
+      scope_note TEXT DEFAULT 'gateway-issued evaluation receipts only',
+      gateway_signature TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
   `)
+
+  // Add columns (idempotent via try/catch)
+  try { db.exec(`ALTER TABLE evaluation_receipts ADD COLUMN seal_id TEXT`) } catch {}
 
   // Add posture columns to agents table (idempotent via try/catch)
   try { db.exec(`ALTER TABLE agents ADD COLUMN restricted_scopes TEXT`) } catch {}

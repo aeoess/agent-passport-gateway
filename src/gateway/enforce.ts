@@ -92,6 +92,7 @@ function mintEvaluationReceipt(opts: {
       receiptData.delegation_id, receiptData.policy_hash,
       receiptData.schema_version, receiptHash, gatewaySignature,
     )
+    maybeAutoSeal()
   } catch (e: any) {
     console.error('[receipt-mint] FAILED:', opts.agentId, e.message)
   }
@@ -1446,6 +1447,125 @@ gatewayRouter.get('/receipts/:agentId/denials', (req: any, res) => {
   ).get(tenant.id, agentId) as any).c
 
   res.json({ denials: rows, total, limit, offset })
+})
+
+// ═══════════════════════════════════════
+// Receipt Window Seals — sealed intervals with gateway signatures
+// Sorted-hash commitment (Option A). Upgrade to full Merkle when
+// inclusion proofs are needed.
+// ═══════════════════════════════════════
+
+let _receiptsSinceLastSeal = 0
+
+function sealReceiptWindow() {
+  try {
+    const db = getDB()
+    const unsealed = db.prepare(
+      'SELECT id, receipt_hash FROM evaluation_receipts WHERE seal_id IS NULL ORDER BY id'
+    ).all() as Array<{ id: number; receipt_hash: string }>
+
+    if (unsealed.length < 10) return // minimum batch size
+
+    const seqStart = unsealed[0].id
+    const seqEnd = unsealed[unsealed.length - 1].id
+    const sealId = randomUUID()
+
+    // Option A: sorted-hash commitment (receipts already in ID order)
+    const sortedHashes = unsealed.map(r => r.receipt_hash || '').join('')
+    const commitmentHash = createHash('sha256').update(sortedHashes).digest('hex')
+
+    // Count permits/denials
+    const counts = db.prepare(
+      `SELECT verdict, COUNT(*) as c FROM evaluation_receipts WHERE id >= ? AND id <= ? GROUP BY verdict`
+    ).all(seqStart, seqEnd) as Array<{ verdict: string; c: number }>
+    const permitCount = counts.find(c => c.verdict === 'permit')?.c || 0
+    const denyCount = counts.find(c => c.verdict === 'deny')?.c || 0
+
+    const identity = getGatewayIdentity()
+    const sig = identity.sign({
+      seal_id: sealId, seq_start: seqStart, seq_end: seqEnd,
+      receipt_count: unsealed.length, commitment_hash: commitmentHash,
+    })
+
+    // Atomic: insert seal + update receipts
+    const txn = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO receipt_window_seals (
+          seal_id, seq_start, seq_end, receipt_count, permit_count, deny_count,
+          commitment_hash, gateway_signature
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(sealId, seqStart, seqEnd, unsealed.length, permitCount, denyCount, commitmentHash, sig)
+
+      db.prepare('UPDATE evaluation_receipts SET seal_id = ? WHERE id >= ? AND id <= ?')
+        .run(sealId, seqStart, seqEnd)
+    })
+    txn()
+
+    _receiptsSinceLastSeal = 0
+    console.log(`[seal] Sealed window ${seqStart}-${seqEnd}: ${unsealed.length} receipts, hash=${commitmentHash.slice(0, 16)}`)
+  } catch (e: any) {
+    console.error('[seal] FAILED:', e.message)
+  }
+}
+
+// Seal every hour
+setInterval(sealReceiptWindow, 3600_000)
+// Seal on startup (catch unsealed receipts from before crash)
+setTimeout(sealReceiptWindow, 5000)
+
+function maybeAutoSeal() {
+  _receiptsSinceLastSeal++
+  if (_receiptsSinceLastSeal >= 100) {
+    sealReceiptWindow()
+  }
+}
+
+// GET /api/v1/receipt-seals — list all seals (authenticated)
+gatewayRouter.get('/receipt-seals', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const limit = Math.min(parseInt(req.query.limit || '50'), 100)
+  const offset = parseInt(req.query.offset || '0')
+  const db = getDB()
+
+  const seals = db.prepare(
+    `SELECT seal_id, seq_start, seq_end, receipt_count, permit_count, deny_count,
+            commitment_hash, scope_note, created_at
+     FROM receipt_window_seals ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(limit, offset)
+  const total = (db.prepare('SELECT COUNT(*) as c FROM receipt_window_seals').get() as any).c
+
+  res.json({ seals, total, limit, offset })
+})
+
+// GET /api/v1/receipt-seals/:sealId — seal details + receipt hashes (authenticated)
+gatewayRouter.get('/receipt-seals/:sealId', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const { sealId } = req.params
+  const db = getDB()
+
+  const seal = db.prepare('SELECT * FROM receipt_window_seals WHERE seal_id = ?').get(sealId) as any
+  if (!seal) return res.status(404).json({ error: 'Seal not found' })
+
+  const receipts = db.prepare(
+    'SELECT id, receipt_hash, verdict, agent_id, action_type FROM evaluation_receipts WHERE seal_id = ? ORDER BY id'
+  ).all(sealId)
+
+  // Verification: recompute commitment
+  const recomputedHash = createHash('sha256')
+    .update(receipts.map((r: any) => r.receipt_hash || '').join(''))
+    .digest('hex')
+
+  res.json({
+    seal,
+    receipts,
+    verification: {
+      commitment_matches: recomputedHash === seal.commitment_hash,
+      recomputed_hash: recomputedHash,
+      kid: 'gateway-v1',
+      alg: 'EdDSA',
+      jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
+    },
+  })
 })
 
 // ═══════════════════════════════════════
