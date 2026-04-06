@@ -1413,3 +1413,239 @@ gatewayRouter.get('/receipts/:agentId/denials', (req: any, res) => {
 
   res.json({ denials: rows, total, limit, offset })
 })
+
+// ═══════════════════════════════════════
+// Authorization Audit Packets
+// One receipt → one exportable proof chain. The atom of compliance evidence.
+// decision_record is signed (immutable). current_context is NOT signed (volatile).
+// ═══════════════════════════════════════
+
+gatewayRouter.get('/audit-packet/:receiptId', (req: any, res) => {
+  const tenant = req.tenant as Tenant
+  const receiptId = parseInt(req.params.receiptId)
+  if (!Number.isFinite(receiptId)) {
+    return res.status(400).json({ error: 'Invalid receipt ID' })
+  }
+
+  const db = getDB()
+  const receipt = db.prepare(
+    `SELECT * FROM evaluation_receipts WHERE id = ? AND tenant_id = ?`
+  ).get(receiptId, tenant.id) as any
+
+  if (!receipt) {
+    return res.status(404).json({ error: 'Receipt not found', receipt_id: receiptId })
+  }
+
+  const missing: string[] = []
+  const notes: string[] = []
+
+  // ── decision_record (frozen at decision time, signed) ──
+  let scopeRequested: string[] = []
+  try { scopeRequested = JSON.parse(receipt.scope_requested_json || '[]') } catch { scopeRequested = [] }
+
+  // Look up agent grade at decision time (from dossier nearest to decision timestamp)
+  let agentGradeAtDecision = 0
+  try {
+    const dossier = db.prepare(
+      `SELECT passport_grade FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(tenant.id, receipt.agent_id) as any
+    if (dossier) agentGradeAtDecision = dossier.passport_grade
+  } catch { notes.push('dossier_lookup_failed') }
+
+  // Delegation chain hash (recompute from delegation_id)
+  let delegationChainHash: string | null = null
+  if (receipt.delegation_id) {
+    try {
+      const chain: Array<{ parent: string; child: string; scope: string; spend_limit: number | null }> = []
+      // Find the delegation to get the child agent
+      const del = db.prepare(
+        `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations WHERE id = ? AND tenant_id = ?`
+      ).get(receipt.delegation_id, tenant.id) as any
+      if (del) {
+        let currentChild: string | null = del.child_agent_id
+        const seen = new Set<string>()
+        while (currentChild && !seen.has(currentChild)) {
+          seen.add(currentChild)
+          const row = db.prepare(
+            `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations
+             WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
+             ORDER BY created_at DESC LIMIT 1`
+          ).get(tenant.id, currentChild) as any
+          if (!row) break
+          chain.push({ parent: row.parent_agent_id, child: row.child_agent_id, scope: row.scope, spend_limit: row.spend_limit })
+          currentChild = row.parent_agent_id
+        }
+        chain.reverse()
+        delegationChainHash = createHash('sha256')
+          .update(canonicalJsonStringify(chain))
+          .digest('hex')
+      }
+    } catch { notes.push('delegation_chain_hash_failed') }
+  }
+
+  const decisionRecord: Record<string, unknown> = {
+    receipt_id: receipt.id,
+    event_type: receipt.event_type,
+    action_type: receipt.action_type,
+    scope_requested: scopeRequested,
+    verdict: receipt.verdict,
+    reason_code: receipt.reason_code || null,
+    delegation_id: receipt.delegation_id || null,
+    delegation_chain_hash: delegationChainHash,
+    policy_hash: receipt.policy_hash,
+    decision_timestamp: receipt.created_at,
+    agent_id: receipt.agent_id,
+    agent_grade_at_decision: agentGradeAtDecision,
+  }
+
+  // Sign the decision record (stable: same receipt always produces same signature)
+  let gatewaySignature: string | null = null
+  let kid = 'gateway-v1'
+  try {
+    const identity = getGatewayIdentity()
+    kid = identity.kid
+    gatewaySignature = identity.sign(decisionRecord)
+  } catch { notes.push('signing_failed') }
+
+  // ── current_context (queried now, NOT signed) ──
+  let agentContext: Record<string, unknown> | null = null
+  try {
+    const agent = db.prepare(
+      `SELECT status, created_at FROM agents WHERE tenant_id = ? AND agent_id = ? LIMIT 1`
+    ).get(tenant.id, receipt.agent_id) as any
+    if (agent) {
+      let currentGrade = 0
+      const dossier = db.prepare(
+        `SELECT passport_grade FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get(tenant.id, receipt.agent_id) as any
+      if (dossier) currentGrade = dossier.passport_grade
+
+      agentContext = {
+        status: agent.status,
+        grade: currentGrade,
+        created_at: agent.created_at,
+      }
+    } else {
+      missing.push('agent')
+    }
+  } catch { missing.push('agent') }
+
+  // Delegation chain (current state)
+  let delegationChain: Array<Record<string, unknown>> = []
+  let revocationState: Record<string, unknown> = {
+    agent_revoked: false, delegation_revoked: false, any_ancestor_revoked: false,
+  }
+  try {
+    const agent = db.prepare(
+      `SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ? LIMIT 1`
+    ).get(tenant.id, receipt.agent_id) as any
+    if (agent?.status !== 'active') {
+      revocationState = { ...revocationState, agent_revoked: true }
+    }
+
+    if (receipt.delegation_id) {
+      const del = db.prepare(
+        `SELECT * FROM delegations WHERE id = ? AND tenant_id = ?`
+      ).get(receipt.delegation_id, tenant.id) as any
+      if (del) {
+        if (del.status !== 'active') {
+          revocationState = { ...revocationState, delegation_revoked: true }
+        }
+        // Build chain
+        let currentChild: string | null = del.child_agent_id
+        const seen = new Set<string>()
+        while (currentChild && !seen.has(currentChild)) {
+          seen.add(currentChild)
+          const row = db.prepare(
+            `SELECT parent_agent_id, child_agent_id, scope, status FROM delegations
+             WHERE tenant_id = ? AND child_agent_id = ?
+             ORDER BY created_at DESC LIMIT 1`
+          ).get(tenant.id, currentChild) as any
+          if (!row) break
+          const scopes = row.scope ? row.scope.split(',').map((s: string) => s.trim()) : []
+          delegationChain.push({ parent: row.parent_agent_id, child: row.child_agent_id, scope: scopes, status: row.status })
+          if (row.status !== 'active') {
+            revocationState = { ...revocationState, any_ancestor_revoked: true }
+          }
+          currentChild = row.parent_agent_id
+        }
+        delegationChain.reverse()
+      } else {
+        missing.push('delegation')
+      }
+    }
+  } catch { missing.push('delegation_chain') }
+
+  const completenessLevel = missing.length === 0 ? 'full' : 'partial'
+
+  const packet: Record<string, unknown> = {
+    type: 'authorization_audit_packet',
+    version: '1.0.0',
+    decision_record: { ...decisionRecord, gateway_signature: gatewaySignature },
+    current_context: {
+      _note: 'Queried NOW. Not part of the signed proof. May change.',
+      generated_at: new Date().toISOString(),
+      agent: agentContext,
+      delegation_chain: delegationChain,
+      revocation_state: revocationState,
+    },
+    completeness: {
+      level: completenessLevel,
+      missing_sections: missing,
+      notes,
+    },
+    verification: {
+      kid,
+      alg: 'EdDSA',
+      jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
+    },
+  }
+
+  // Markdown format option
+  if (req.query.format === 'markdown') {
+    const dr = decisionRecord
+    const md = `# Authorization Audit Packet
+
+## Decision Record (frozen at decision time, signed)
+
+| Field | Value |
+|---|---|
+| Receipt ID | ${dr.receipt_id} |
+| Event Type | ${dr.event_type} |
+| Action Type | ${dr.action_type} |
+| Scope Requested | ${(dr.scope_requested as string[]).join(', ')} |
+| Verdict | **${dr.verdict}** |
+| Reason Code | ${dr.reason_code || 'n/a'} |
+| Delegation ID | ${dr.delegation_id || 'none'} |
+| Delegation Chain Hash | \`${dr.delegation_chain_hash || 'none'}\` |
+| Policy Hash | \`${dr.policy_hash}\` |
+| Decision Timestamp | ${dr.decision_timestamp} |
+| Agent ID | ${dr.agent_id} |
+| Agent Grade at Decision | ${dr.agent_grade_at_decision} |
+
+## Current Context (queried now, not signed)
+
+**Agent:** ${agentContext ? `status=${(agentContext as any).status}, grade=${(agentContext as any).grade}` : 'not found'}
+
+**Delegation Chain:** ${delegationChain.length > 0 ? delegationChain.map((d: any) => `${d.parent} → ${d.child} [${d.scope.join(',')}] (${d.status})`).join(' → ') : 'none'}
+
+**Revocation State:** agent_revoked=${(revocationState as any).agent_revoked}, delegation_revoked=${(revocationState as any).delegation_revoked}, any_ancestor_revoked=${(revocationState as any).any_ancestor_revoked}
+
+## Completeness
+
+Level: **${completenessLevel}**${missing.length > 0 ? `\nMissing: ${missing.join(', ')}` : ''}
+
+## Verification
+
+- **kid:** ${kid}
+- **alg:** EdDSA
+- **JWKS:** https://gateway.aeoess.com/.well-known/jwks.json
+- **Decision Record Hash:** \`${createHash('sha256').update(canonicalJsonStringify(decisionRecord)).digest('hex')}\`
+- **Gateway Signature:** \`${gatewaySignature ? gatewaySignature.slice(0, 40) + '...' : 'none'}\`
+`
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8')
+    return res.send(md)
+  }
+
+  res.json(packet)
+})
