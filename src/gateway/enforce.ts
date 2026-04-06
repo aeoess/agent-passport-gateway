@@ -2108,3 +2108,121 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
     res.status(500).json({ error: 'Export generation failed' })
   }
 })
+
+
+// ═══════════════════════════════════════
+// GET /api/v1/agents/:agentId/health — Agent Health Status
+// Enterprise monitoring integration (Datadog, Grafana).
+// Matches AgentHealthStatus shape from agent-passport-system SDK.
+// ═══════════════════════════════════════
+
+gatewayRouter.get('/agents/:agentId/health', (req: any, res) => {
+  try {
+    const tenant: Tenant = req.tenant
+    const db = getDB()
+    const { agentId } = req.params
+
+    // 1. Look up agent
+    const agent = db.prepare(
+      `SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenant.id, agentId) as any
+    if (!agent) {
+      return res.status(404).json({ error: `Agent "${agentId}" not found` })
+    }
+
+    // 2. Passport validity
+    const passportValid = agent.status === 'active' || agent.status === 'restricted'
+
+    // 3. Delegation
+    const delegation = db.prepare(
+      `SELECT * FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+    ).get(tenant.id, agentId) as any
+    const delegationActive = !!delegation
+    const spendUtilization = delegation && delegation.spend_limit
+      ? (delegation.spend_used || 0) / delegation.spend_limit
+      : 0
+
+    // 4. Passport grade (from dossier or heuristic)
+    const dossier = db.prepare(
+      `SELECT passport_grade FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(tenant.id, agentId) as any
+    let grade = 0
+    if (dossier) {
+      grade = dossier.passport_grade
+    } else {
+      if (agent.status === 'active') grade = 1
+      if (delegation) grade = 2
+    }
+
+    // 5. Behavioral signals
+    const lastAction = db.prepare(
+      `SELECT MAX(created_at) as last_ts FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenant.id, agentId) as any
+    const actionsLast24h = db.prepare(
+      `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND created_at > datetime('now', '-1 day')`
+    ).get(tenant.id, agentId) as any
+    const recentDenials = db.prepare(
+      `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny' AND created_at > datetime('now', '-1 hour')`
+    ).get(tenant.id, agentId) as any
+
+    // 6. Recovery events (from evaluation_receipts with event_type pattern)
+    const recentRecoveries = db.prepare(
+      `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny' AND created_at > datetime('now', '-1 hour')`
+    ).get(tenant.id, agentId) as any
+
+    // 7. Recovery policy (if table exists)
+    let activeRecoveryPolicy: string | null = null
+    let currentStrategy: string | null = null
+    try {
+      const policy = db.prepare(
+        `SELECT id FROM recovery_policies WHERE tenant_id = ? AND agent_id = ?`
+      ).get(tenant.id, agentId) as any
+      if (policy) activeRecoveryPolicy = policy.id
+    } catch { /* table may not exist yet */ }
+
+    // 8. Derive status
+    let status: 'healthy' | 'degraded' | 'suspended' | 'expired'
+    if (!passportValid) status = 'expired'
+    else if (agent.status === 'suspended') status = 'suspended'
+    else if ((recentRecoveries?.c || 0) > 2 || spendUtilization > 0.9) status = 'degraded'
+    else status = 'healthy'
+
+    // Compute expiry (agents table doesn't have expires_at, use delegation or default)
+    const expiresAt = delegation?.created_at
+      ? new Date(new Date(delegation.created_at).getTime() + 90 * 24 * 60 * 60 * 1000).toISOString()
+      : new Date(new Date(agent.created_at).getTime() + 365 * 24 * 60 * 60 * 1000).toISOString()
+
+    const healthStatus = {
+      agentId,
+      timestamp: new Date().toISOString(),
+      passport: {
+        valid: passportValid,
+        expiresAt,
+        grade,
+      },
+      delegation: {
+        active: delegationActive,
+        scopeCount: delegation ? delegation.scope.split(',').map((s: string) => s.trim()).filter(Boolean).length : 0,
+        spendUtilization: Math.round(spendUtilization * 10000) / 10000,
+        expiresAt: delegation?.revoked_at || null,
+      },
+      behavioral: {
+        continuityScore: 0, // TODO: wire to context_continuity when implemented
+        lastActionTimestamp: lastAction?.last_ts || null,
+        actionsInWindow: actionsLast24h?.c || 0,
+        driftDetected: false,
+      },
+      recovery: {
+        activeRecoveryPolicy,
+        recentRecoveryEvents: recentRecoveries?.c || 0,
+        currentStrategy,
+      },
+      status,
+    }
+
+    res.json(healthStatus)
+  } catch (e) {
+    const err = safeError(e, 'agent-health')
+    res.status(500).json(err)
+  }
+})
