@@ -437,6 +437,32 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   const lastActivityAt = lastEval ? lastEval.created_at : agent.created_at
   const gradeComputedAt = dossier ? dossier.created_at : agent.created_at
 
+  // Key rotation: check if agent has pending/active rotations
+  const latestRotation = db.prepare(
+    `SELECT * FROM key_rotations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1`
+  ).get(tenantId, agentId) as any
+
+  // If a planned rotation's activation_time has passed, auto-transition to activated
+  if (latestRotation && latestRotation.state === 'announced' && latestRotation.mode === 'planned') {
+    const activationTime = new Date(latestRotation.activation_time)
+    if (new Date() >= activationTime) {
+      db.prepare(`UPDATE key_rotations SET state = 'activated', completed_at = datetime('now') WHERE id = ?`)
+        .run(latestRotation.id)
+      db.prepare(`UPDATE agents SET public_key = ? WHERE tenant_id = ? AND agent_id = ?`)
+        .run(latestRotation.new_key, tenantId, agentId)
+      latestRotation.state = 'activated'
+    }
+  }
+
+  const keyRotation = latestRotation ? {
+    mode: latestRotation.mode,
+    state: latestRotation.state,
+    old_key: latestRotation.old_key,
+    new_key: latestRotation.new_key,
+    activation_time: latestRotation.activation_time,
+    retired_keys: latestRotation.state === 'activated' ? [latestRotation.old_key] : [],
+  } : null
+
   const profile = {
     agent_id: agentId,
     grade,
@@ -446,6 +472,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     risk_level: riskLevel,
     has_delegation: !!delegation,
     has_wallet: !!wallet,
+    key_rotation: keyRotation,
     active_constraints: delegation ? {
       scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
       spend_limit: delegation.spend_limit || null,
@@ -557,6 +584,63 @@ app.get('/api/v1/public/trust/:agentId/attestation', async (req, res) => {
     signed: profile,
     jws,
   })
+})
+
+// ═══════════════════════════════════════
+// Key Rotation Enforcement
+// POST /api/v1/key-rotation — register a rotation (authenticated)
+// ═══════════════════════════════════════
+
+app.post('/api/v1/key-rotation', authMiddleware, (req: any, res) => {
+  try {
+    const b = req.body || {}
+    const tenantId = req.tenant?.id
+    if (!tenantId) return res.status(401).json({ error: 'Authentication required' })
+
+    const required = ['agent_id', 'old_key', 'new_key', 'mode', 'activation_time', 'rotation_signature']
+    for (const f of required) {
+      if (!b[f]) return res.status(400).json({ error: `${f} required` })
+    }
+    if (b.mode !== 'planned' && b.mode !== 'emergency') {
+      return res.status(400).json({ error: 'mode must be planned or emergency' })
+    }
+
+    const db = getDB()
+    const announcedAt = new Date().toISOString()
+    const state = b.mode === 'emergency' ? 'activated' : 'announced'
+    const completedAt = b.mode === 'emergency' ? announcedAt : null
+
+    const info = db.prepare(`
+      INSERT INTO key_rotations (
+        tenant_id, agent_id, old_key, new_key, mode,
+        announced_at, activation_time, state, completed_at, rotation_signature
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      tenantId, b.agent_id, b.old_key, b.new_key, b.mode,
+      announcedAt, b.activation_time, state, completedAt, b.rotation_signature,
+    )
+
+    // For emergency mode: update agent's public_key in agents table
+    if (b.mode === 'emergency') {
+      db.prepare(
+        `UPDATE agents SET public_key = ? WHERE tenant_id = ? AND agent_id = ?`
+      ).run(b.new_key, tenantId, b.agent_id)
+    }
+
+    // Invalidate trust profile cache for this agent
+    trustProfileCache.delete(b.agent_id)
+
+    res.json({
+      ok: true,
+      rotation_id: info.lastInsertRowid,
+      state,
+      mode: b.mode,
+      announced_at: announcedAt,
+      activation_time: b.activation_time,
+    })
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to register rotation' })
+  }
 })
 
 // ═══════════════════════════════════════

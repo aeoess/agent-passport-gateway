@@ -326,6 +326,24 @@ function createTables() {
 
     CREATE INDEX IF NOT EXISTS idx_mcp_stats_session ON mcp_stats_snapshots(session_id, snapshot_at);
     CREATE INDEX IF NOT EXISTS idx_mcp_stats_time ON mcp_stats_snapshots(snapshot_at);
+
+    -- Key Rotations (identity continuity enforcement)
+    CREATE TABLE IF NOT EXISTS key_rotations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      old_key TEXT NOT NULL,
+      new_key TEXT NOT NULL,
+      mode TEXT NOT NULL CHECK(mode IN ('planned', 'emergency')),
+      announced_at TEXT NOT NULL,
+      activation_time TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('announced', 'revocation_in_progress', 'revocation_complete', 'activated')),
+      completed_at TEXT,
+      rotation_signature TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_rotations_agent ON key_rotations(tenant_id, agent_id);
   `)
 }
 
