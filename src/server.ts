@@ -64,6 +64,7 @@ import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/iden
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
+import { finopsRouter } from './gateway/finops.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -802,6 +803,7 @@ app.use('/api/v1', authMiddleware, gatewayRouter)
 app.use('/api/v1', authMiddleware, paymentRouter)
 app.use('/api/v1', authMiddleware, walletRouter)
 app.use('/api/v1', authMiddleware, rekorRouter)
+app.use('/api/v1', authMiddleware, finopsRouter)
 
 // 404
 app.use((_req, res) => {
