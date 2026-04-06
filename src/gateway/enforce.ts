@@ -238,6 +238,35 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     return res.status(404).json({ error: `Agent "${agent_id}" not active (status: ${agent.status})` })
   }
 
+  // Key rotation enforcement: if request includes signing_key, check against retired keys.
+  // A compromised old key MUST NOT authorize actions after rotation completes.
+  const signingKey = req.body.signing_key as string | undefined
+  if (signingKey) {
+    const rotation = db.prepare(
+      `SELECT old_key, new_key, state FROM key_rotations
+       WHERE tenant_id = ? AND agent_id = ? AND state = 'activated'
+       ORDER BY created_at DESC LIMIT 1`
+    ).get(tenant.id, agent_id) as any
+    if (rotation && rotation.old_key === signingKey) {
+      const evalId = randomUUID()
+      const durationMs = Date.now() - start
+      db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Key retired via rotation', durationMs)
+      mintEvaluationReceipt({
+        tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
+        verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
+        reason: 'key_retired', delegationId: null,
+      })
+      return res.json({
+        evaluation_id: evalId, verdict: 'deny',
+        reason: 'Key retired via rotation. Use the current key.',
+        violations: ['key_retired'],
+        duration_ms: durationMs, agent_id,
+        action: { type: action_type, target: action_target, scope_required },
+      })
+    }
+  }
+
   // Check delegation scope
   const delegation = db.prepare(`
     SELECT * FROM delegations 
