@@ -502,15 +502,22 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
       context_break: continuity.context_break,
       signals: continuity.signals,
     },
+    // DID binding status
+    did_binding: agent.public_key && /^[0-9a-fA-F]{64}$/.test(agent.public_key) ? 'bound'
+      : agent.public_key ? 'unverified' : 'none',
+    did_method: agent.did ? (agent.did.split(':')[1] || null) : null,
+    trust_reliability: agent.public_key && /^[0-9a-fA-F]{64}$/.test(agent.public_key) ? 'high' : 'low',
     found: true,
     queried_at: new Date().toISOString(),
   }
 
   // Per-task-class trust breakdown (public — no sensitive details)
   try {
+    const windowDays = parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0')
+    const timeFilter = windowDays > 0 ? ` AND created_at > datetime('now', '-${windowDays} days')` : ''
     const classRows = db.prepare(
       `SELECT task_class, COUNT(*) as evals, SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits
-       FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != '' GROUP BY task_class`
+       FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != ''${timeFilter} GROUP BY task_class`
     ).all(tenantId, agentId) as any[]
     if (classRows.length > 0) {
       (profile as any).trust_by_task_class = Object.fromEntries(

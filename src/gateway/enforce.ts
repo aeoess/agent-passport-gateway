@@ -881,12 +881,16 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
   const agent = db.prepare(`SELECT agent_id FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agentId) as any
   if (!agent) return res.status(404).json({ error: `Agent "${agentId}" not found` })
 
+  // Temporal windowing: ?window_days=30 limits to last 30 days
+  const windowDays = parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0')
+  const timeFilter = windowDays > 0 ? ` AND created_at > datetime('now', '-${windowDays} days')` : ''
+
   // Overall stats
   const overall = db.prepare(
     `SELECT COUNT(*) as evaluations,
             SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits,
             SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denials
-     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?${timeFilter}`
   ).get(tenant.id, agentId) as any
 
   const overallEvals = overall?.evaluations || 0
@@ -899,7 +903,7 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
             COUNT(*) as evaluations,
             SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits,
             SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denials
-     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != ''
+     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != ''${timeFilter}
      GROUP BY task_class ORDER BY evaluations DESC`
   ).all(tenant.id, agentId) as any[]
 
@@ -916,6 +920,7 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
 
   res.json({
     agent_id: agentId,
+    window_days: windowDays || 'all',
     overall: {
       evaluations: overallEvals,
       permits: overallPermits,
