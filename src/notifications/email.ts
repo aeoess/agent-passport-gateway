@@ -3,9 +3,8 @@
  * Email Notification Infrastructure
  *
  * Queue-first design: all emails are appended to /data/email-queue.jsonl.
- * If SMTP env vars are set, also attempts immediate delivery via nodemailer.
- * No new dependencies — SMTP is optional and only activates if nodemailer
- * is installed AND env vars are present.
+ * Send order: Resend API (if RESEND_API_KEY set) → SMTP (if SMTP_HOST set) → queue-only.
+ * No new dependencies — Resend uses native fetch, SMTP uses optional nodemailer.
  *
  * Hook into POST /api/v1/signup in server.ts:
  *   sendEmail(signupWelcomeEmail(name, email, apiKey))
@@ -76,11 +75,38 @@ export async function sendEmail(opts: EmailOptions): Promise<{ sent: boolean; qu
   // Always queue first (crash-safe)
   queueEmail(opts)
 
+  // Try Resend API first (no dependency needed)
+  const resendKey = process.env.RESEND_API_KEY
+  if (resendKey) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: process.env.EMAIL_FROM || 'AEOESS <no-reply@aeoess.com>',
+          to: [opts.to],
+          subject: opts.subject,
+          text: opts.textBody,
+          html: opts.htmlBody || undefined,
+        }),
+      })
+      if (res.ok) {
+        console.log(`[email] to=${opts.to} subject="${opts.subject}" sent via Resend`)
+        return { sent: true, queued: true }
+      }
+      const err = await res.text()
+      console.error(`[email] Resend error ${res.status}: ${err}`)
+    } catch (e: any) {
+      console.error(`[email] Resend failed: ${e.message}`)
+    }
+  }
+
+  // Fall back to SMTP
   const transport = await getSmtpTransport()
   if (transport) {
     try {
       await transport.sendMail({
-        from: process.env.SMTP_FROM || 'AEOESS <no-reply@aeoess.com>',
+        from: process.env.SMTP_FROM || process.env.EMAIL_FROM || 'AEOESS <no-reply@aeoess.com>',
         to: opts.to,
         subject: opts.subject,
         text: opts.textBody,
