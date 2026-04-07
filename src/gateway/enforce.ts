@@ -122,6 +122,73 @@ async function getScopeAuthorizes() {
   return _scopeAuthorizes
 }
 
+// ── Task class derivation (first segment of action_type) ──
+function deriveTaskClass(actionType: string): string {
+  return (actionType || '').split(':')[0] || ''
+}
+
+// ── Argument-pattern scope matching (Feature: broad-capability tool scoping) ──
+
+function globMatch(pattern: string, value: string): boolean {
+  // Convert glob to regex: ** = any path depth, * = one segment
+  const parts = pattern.split('/')
+  let regex = '^'
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) regex += '\\/'
+    if (parts[i] === '**') { regex += '.*'; break }
+    else if (parts[i] === '*') regex += '[^/]+'
+    else regex += parts[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+  regex += '$'
+  try { return new RegExp(regex).test(value) } catch { return false }
+}
+
+function scopeMatchesWithArguments(
+  delegationScope: string[],
+  actionType: string,
+  actionArgs: Record<string, unknown>,
+  fallbackAuth: (scopes: string[], required: string) => boolean,
+): boolean {
+  // Global wildcard
+  if (delegationScope.includes('*')) return true
+
+  for (const scope of delegationScope) {
+    const parts = scope.split(':')
+
+    // Simple scope (1-2 segments): delegate to SDK scopeAuthorizes
+    if (parts.length <= 2) {
+      if (fallbackAuth([scope], actionType)) return true
+      continue
+    }
+
+    // Hierarchical scope (3+ segments): tool:name:capability[:targetPattern]
+    const scopeCategory = parts[0]
+    const scopeName = parts[1]
+    const scopeCapability = parts[2]
+    const scopeTarget = parts.length > 3 ? parts.slice(3).join(':') : null
+
+    // Match action_type against category:name:capability
+    const actionParts = actionType.split(':')
+    const actionCategory = actionParts[0] || ''
+    const actionName = actionParts[1] || ''
+    const actionCapability = actionParts[2] || (actionArgs.capability as string) || ''
+
+    if (scopeCategory !== actionCategory) continue
+    if (scopeName !== actionName && scopeName !== '*') continue
+    if (scopeCapability !== actionCapability && scopeCapability !== '*') continue
+
+    // If no target pattern, the capability match is sufficient
+    if (!scopeTarget) return true
+
+    // Target pattern matching against action args
+    const targetValue = (actionArgs.path || actionArgs.target || actionArgs.resource || actionArgs.url || '') as string
+    if (!targetValue) continue
+    if (globMatch(scopeTarget, targetValue)) return true
+  }
+
+  return false
+}
+
 // Agent type constraints (Primitive #12)
 const AGENT_TYPE_CONSTRAINTS: Record<string, { blocked_scopes: string[]; max_evaluations_per_hour?: number }> = {
   explorer: { blocked_scopes: ['admin:delete', 'admin:write', 'commerce:send'], max_evaluations_per_hour: 100 },
@@ -238,10 +305,11 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     return res.status(429).json({ error: usageCheck.reason })
   }
 
-  const { agent_id, action_type, action_target, scope_required, estimated_cost } = req.body
+  const { agent_id, action_type, action_target, scope_required, estimated_cost, action_args } = req.body
   if (!agent_id || !action_type || !scope_required) {
     return res.status(400).json({ error: 'Required: agent_id, action_type, scope_required' })
   }
+  const parsedArgs: Record<string, unknown> = (action_args && typeof action_args === 'object') ? action_args : {}
 
   const db = getDB()
 
@@ -256,8 +324,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   if (agent.status === 'suspended') {
     const evalId = randomUUID()
     const durationMs = Date.now() - start
-    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Agent suspended', durationMs)
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Agent suspended', durationMs, deriveTaskClass(action_type))
     mintEvaluationReceipt({
       tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
       verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
@@ -271,8 +339,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       if (restrictedScopes.includes(scope_required) || restrictedScopes.some(rs => scope_required.startsWith(rs + ':'))) {
         const evalId = randomUUID()
         const durationMs = Date.now() - start
-        db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Scope "${scope_required}" restricted by posture`, durationMs)
+        db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Scope "${scope_required}" restricted by posture`, durationMs, deriveTaskClass(action_type))
         mintEvaluationReceipt({
           tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
           verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
@@ -298,8 +366,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     if (rotation && rotation.old_key === signingKey) {
       const evalId = randomUUID()
       const durationMs = Date.now() - start
-      db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Key retired via rotation', durationMs)
+      db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', 'Key retired via rotation', durationMs, deriveTaskClass(action_type))
       mintEvaluationReceipt({
         tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
         verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
@@ -334,7 +402,9 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       violations.push('No active delegation for agent')
     } else {
       const allowedScopes = delegation.scope.split(',').map((s: string) => s.trim())
-      if (!scopeAuth(allowedScopes, scope_required)) {
+      // Use argument-pattern matching for broad-capability tools, fall back to simple scope
+      const scopeMatched = scopeMatchesWithArguments(allowedScopes, scope_required, parsedArgs, scopeAuth)
+      if (!scopeMatched) {
         verdict = 'deny'
         violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
       }
@@ -366,8 +436,8 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       : `Denied: ${violations.join('; ')}`
     const durationMs = Date.now() - start
 
-    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs)
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs, deriveTaskClass(action_type))
 
     if (verdict === 'permit' && estimated_cost && delegation) {
       db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
@@ -797,6 +867,62 @@ gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
       dossier_created_at: dossier.created_at,
     } : { grade_source: 'heuristic' },
     queried_at: new Date().toISOString(),
+  })
+})
+
+// ═══════════════════════════════════════
+// GET /api/v1/trust/:agentId/profile — Per-task-class trust breakdown
+// ═══════════════════════════════════════
+gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const { agentId } = req.params
+
+  const agent = db.prepare(`SELECT agent_id FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agentId) as any
+  if (!agent) return res.status(404).json({ error: `Agent "${agentId}" not found` })
+
+  // Overall stats
+  const overall = db.prepare(
+    `SELECT COUNT(*) as evaluations,
+            SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits,
+            SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denials
+     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenant.id, agentId) as any
+
+  const overallEvals = overall?.evaluations || 0
+  const overallPermits = overall?.permits || 0
+  const overallDenials = overall?.denials || 0
+
+  // Per-task-class breakdown
+  const classRows = db.prepare(
+    `SELECT task_class,
+            COUNT(*) as evaluations,
+            SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits,
+            SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denials
+     FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != ''
+     GROUP BY task_class ORDER BY evaluations DESC`
+  ).all(tenant.id, agentId) as any[]
+
+  const byTaskClass: Record<string, { evaluations: number; permits: number; denials: number; trust_score: number }> = {}
+  for (const row of classRows) {
+    const evals = row.evaluations || 0
+    byTaskClass[row.task_class] = {
+      evaluations: evals,
+      permits: row.permits || 0,
+      denials: row.denials || 0,
+      trust_score: evals > 0 ? Math.round(((row.permits || 0) / evals) * 100) / 100 : 0,
+    }
+  }
+
+  res.json({
+    agent_id: agentId,
+    overall: {
+      evaluations: overallEvals,
+      permits: overallPermits,
+      denials: overallDenials,
+      trust_score: overallEvals > 0 ? Math.round((overallPermits / overallEvals) * 100) / 100 : 0,
+    },
+    by_task_class: byTaskClass,
   })
 })
 
@@ -2543,3 +2669,18 @@ gatewayRouter.delete('/agents/:agentId/recovery-policy', (req: any, res) => {
     res.status(500).json(err)
   }
 })
+
+// ── Inline tests for argument-pattern scoping ──
+if (process.env.NODE_ENV === 'test') {
+  const id = (s: string[], r: string) => s.includes(r) || s.some(x => r.startsWith(x.replace(/:?\*$/, '') + ':'))
+  console.assert(scopeMatchesWithArguments(['tool:web_search'], 'tool:web_search', {}, id) === true, 'simple match')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_read'], 'tool:python_interpreter:file_read', {}, id) === true, 'capability match')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_read'], 'tool:python_interpreter:file_write', {}, id) === false, 'capability mismatch')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_read:/workspace/**'], 'tool:python_interpreter:file_read', { path: '/workspace/data/file.csv' }, id) === true, 'glob ** match')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_read:/workspace/**'], 'tool:python_interpreter:file_read', { path: '/etc/passwd' }, id) === false, 'glob ** reject')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_write:/workspace/output/*'], 'tool:python_interpreter:file_write', { path: '/workspace/output/result.json' }, id) === true, 'glob * match')
+  console.assert(scopeMatchesWithArguments(['tool:python_interpreter:file_write:/workspace/output/*'], 'tool:python_interpreter:file_write', { path: '/workspace/output/sub/deep.json' }, id) === false, 'glob * no depth')
+  console.assert(scopeMatchesWithArguments([], 'anything', {}, id) === false, 'empty scope')
+  console.assert(scopeMatchesWithArguments(['*'], 'anything', {}, id) === true, 'global wildcard')
+  console.log('[scope-args] All inline tests passed')
+}

@@ -506,6 +506,19 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     queried_at: new Date().toISOString(),
   }
 
+  // Per-task-class trust breakdown (public — no sensitive details)
+  try {
+    const classRows = db.prepare(
+      `SELECT task_class, COUNT(*) as evals, SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits
+       FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != '' GROUP BY task_class`
+    ).all(tenantId, agentId) as any[]
+    if (classRows.length > 0) {
+      (profile as any).trust_by_task_class = Object.fromEntries(
+        classRows.map((r: any) => [r.task_class, { evaluations: r.evals, trust_score: r.evals > 0 ? Math.round((r.permits / r.evals) * 100) / 100 : 0 }])
+      )
+    }
+  } catch { /* task_class column may not exist yet */ }
+
   // Cache
   trustProfileCache.set(agentId, { data: profile, expires: Date.now() + TRUST_CACHE_TTL })
 
