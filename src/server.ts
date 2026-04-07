@@ -887,6 +887,7 @@ app.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
 
   db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
     .run(randomUUID(), tenant.id, keyHash, keyPrefix, 'rotated')
+  try { getEventBus().emit(tenant.id, { type: 'key_rotated', data: { key_prefix: keyPrefix } }) } catch {}
 
   res.json({
     message: 'API key rotated. Save this key — it will not be shown again.',

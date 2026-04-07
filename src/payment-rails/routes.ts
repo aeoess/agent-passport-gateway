@@ -14,6 +14,7 @@ import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
 import { getNanoRail, rawToXno, xnoToRaw } from './nano.js'
 import { getDB } from '../db/schema.js'
+import { getEventBus } from '../gateway/events.js'
 import type { Tenant } from '../auth/api-keys.js'
 
 export const paymentRouter = Router()
@@ -46,6 +47,7 @@ paymentRouter.post('/pay/nano/invoice', async (req: any, res) => {
       VALUES (?, ?, ?, 'nano', 'inbound', ?, 'XNO', ?, 'pending', ?)`)
       .run(invoice.invoiceId, tenant.id, settlement_id || null,
         amount, invoice.destination, JSON.stringify(invoice))
+    try { getEventBus().emit(tenant.id, { type: 'payment_created', data: { transaction_id: invoice.invoiceId, amount, direction: 'inbound', status: 'pending' } }) } catch {}
 
     res.status(201).json({
       invoice_id: invoice.invoiceId,
@@ -148,6 +150,7 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
           VALUES (?, ?, ?, 'nano', 'outbound', ?, 'XNO', ?, ?, 'confirmed', datetime('now'))`)
           .run(randomUUID(), tenant.id, settlement.id,
             item.amount, destination, confirmation.txProof)
+        try { getEventBus().emit(tenant.id, { type: 'payment_created', data: { settlement_id: settlement.id, amount: item.amount, direction: 'outbound', status: 'confirmed' } }) } catch {}
 
         totalPaid += item.amount
         results.push({

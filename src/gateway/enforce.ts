@@ -355,6 +355,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   if (verdict === 'permit' && estimated_cost && delegation) {
     db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
       .run(estimated_cost, delegation.id)
+    try { getEventBus().emit(tenant.id, { type: 'spend_update', agentId: agent_id, data: { delegation_id: delegation.id, spend_used: (delegation.spend_used || 0) + estimated_cost, spend_limit: delegation.spend_limit } }) } catch {}
   }
 
   // Check for spend alerts (80% threshold)
@@ -362,6 +363,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), tenant.id, 'spend_threshold', 'warning',
         `Agent "${agent_id}" at ${((delegation.spend_used / delegation.spend_limit) * 100).toFixed(0)}% of spend limit`)
+    try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'spend_threshold', severity: 'warning' } }) } catch {}
   }
 
   // Recovery guidance on denial (backward compat: null when no policy)
@@ -389,6 +391,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
             db.prepare(
               `INSERT INTO recovery_events (id, tenant_id, agent_id, delegation_id, evaluation_id, failure_type, strategy_applied, attempt_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
             ).run(randomUUID(), tenant.id, agent_id, delegation?.id || null, evalId, failureType, result.strategy, 1)
+            try { getEventBus().emit(tenant.id, { type: 'recovery_event', agentId: agent_id, data: { failure_type: failureType, strategy: result.strategy } }) } catch {}
           } catch { /* best-effort */ }
         }
       }
@@ -481,6 +484,7 @@ gatewayRouter.post('/revoke', (req: any, res) => {
   db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
     .run(randomUUID(), tenant.id, 'revocation', 'critical',
       `${target_type} "${target_id}" revoked. ${cascadeCount} downstream items affected.`)
+  try { getEventBus().emit(tenant.id, { type: 'alert', data: { alert_type: 'revocation', severity: 'critical', target_type, target_id } }) } catch {}
 
   try { getEventBus().emit(tenant.id, { type: 'revocation', data: { revocationId, target_type, target_id, cascade_count: cascadeCount, revoked_by: revoked_by || 'api' } }) } catch {}
 
@@ -516,6 +520,7 @@ gatewayRouter.post('/agents', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name) VALUES (?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, agent_id, public_key, did || null, name || null)
+  try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
 })
 
@@ -579,6 +584,7 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
         VALUES (?, ?, ?, ?, ?)`)
         .run(randomUUID(), tenant.id, 'issuance_velocity', 'warning',
           `pubkey ${public_key_hash.slice(0, 12)}... has ${velocityCheck.c} dossiers. Possible re-issuance.`)
+      try { getEventBus().emit(tenant.id, { type: 'alert', data: { alert_type: 'issuance_velocity', severity: 'warning', public_key_hash } }) } catch {}
     }
 
     // Compute lineage links and cluster risk
@@ -745,6 +751,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spend_limit || null, max_depth || 3)
+  try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
   res.status(201).json({ id, status: 'active' })
 })
 
@@ -872,6 +879,7 @@ gatewayRouter.post('/data-sources', (req: any, res) => {
   try {
     db.prepare(`INSERT INTO data_sources (id, tenant_id, source_id, source_name, source_url, data_terms, owner_agent_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(id, tenant.id, source_id, source_name, source_url || null, JSON.stringify(data_terms || {}), owner_agent_id || null)
+    try { getEventBus().emit(tenant.id, { type: 'data_source_registered', data: { source_id, source_name, owner_agent_id } }) } catch {}
     res.status(201).json({ id, source_id, status: 'active' })
   } catch (e: any) {
     if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Source already registered' })
@@ -904,6 +912,7 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO access_receipts (id, tenant_id, source_id, agent_id, purpose, terms_snapshot, signature) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, source_id, agent_id, purpose || 'read', src.data_terms, signature || null)
+  try { getEventBus().emit(tenant.id, { type: 'access_receipt', agentId: agent_id, data: { source_id, purpose: purpose || 'read' } }) } catch {}
 
   // Upsert contribution ledger (purpose-weighted)
   const terms = JSON.parse(src.data_terms || '{}')
@@ -929,12 +938,14 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
       db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
         .run(randomUUID(), tenant.id, 'high_access_rate', 'warning',
           `Agent "${agent_id}" made ${recentCount.c} data accesses in the last hour`)
+      try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'high_access_rate', severity: 'warning', count: recentCount.c } }) } catch {}
     }
     // Alert: training/fine-tune purpose (always notify — high-value event)
     if (purpose === 'training' || purpose === 'fine_tune') {
       db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
         .run(randomUUID(), tenant.id, 'training_access', 'info',
           `Agent "${agent_id}" accessed "${source_id}" for ${purpose} (${weight}x rate)`)
+      try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'training_access', severity: 'info', source_id, purpose } }) } catch {}
     }
     // Alert: new agent first seen
     const agentHistory = db.prepare(
@@ -944,6 +955,7 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
       db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
         .run(randomUUID(), tenant.id, 'new_consumer', 'info',
           `New agent "${agent_id}" first accessed your data (source: "${source_id}", purpose: ${purpose || 'read'})`)
+      try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'new_consumer', severity: 'info', source_id } }) } catch {}
     }
   } catch (_) { /* alerts are non-critical */ }
 
@@ -1034,6 +1046,7 @@ gatewayRouter.post('/settlements', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO settlements (id, tenant_id, period_start, period_end, total_amount, line_items) VALUES (?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, period_start, period_end, total, JSON.stringify(lineItems))
+  try { getEventBus().emit(tenant.id, { type: 'settlement_created', data: { settlement_id: id, period_start, period_end, total_amount: total, line_items_count: lineItems.length } }) } catch {}
   res.status(201).json({ settlement_id: id, period_start, period_end, total_amount: Math.round(total * 10000) / 10000, line_items: lineItems.length })
 })
 
@@ -1117,9 +1130,11 @@ gatewayRouter.post('/derivations', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO derivations (id, tenant_id, agent_id, source_ids, output_description, output_url, access_receipt_ids, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, agent_id, JSON.stringify(source_ids), output_description || null, output_url || null, JSON.stringify(receipts.map((r: any) => r.id)), signature || null)
+  try { getEventBus().emit(tenant.id, { type: 'derivation_created', agentId: agent_id, data: { derivation_id: id, source_count: source_ids.length } }) } catch {}
   db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
     .run(randomUUID(), tenant.id, 'derivation_declared', 'info',
       `Agent "${agent_id}" declared usage of ${source_ids.length} source(s) for "${output_description || output_url || 'undescribed'}"`)
+  try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'derivation_declared', severity: 'info' } }) } catch {}
   res.status(201).json({
     derivation_id: id, agent_id,
     sources_declared: source_ids.length,
@@ -1285,12 +1300,15 @@ gatewayRouter.post('/verify-declaration', (req: any, res) => {
   // 5. Store the verified declaration as a derivation
   db.prepare(`INSERT INTO derivations (id, tenant_id, agent_id, source_ids, output_description, output_url, access_receipt_ids, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, agent_id, JSON.stringify(declared_sources), 'verified-declaration', output_url || null, JSON.stringify([]), 'gateway-verified')
+  try { getEventBus().emit(tenant.id, { type: 'derivation_created', agentId: agent_id, data: { derivation_id: id, verified: true, source_count: declared_sources.length } }) } catch {}
 
   // 6. Fire alerts for anomalies
   if (flags.length > 0) {
+    const anomalySeverity = flags.some(f => f.includes('untracked')) ? 'warning' : 'info'
     db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
-      .run(randomUUID(), tenant.id, 'declaration_anomaly', flags.some(f => f.includes('untracked')) ? 'warning' : 'info',
+      .run(randomUUID(), tenant.id, 'declaration_anomaly', anomalySeverity,
         `Declaration from "${agent_id}": ${flags.join('; ')}`)
+    try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'declaration_anomaly', severity: anomalySeverity, flags } }) } catch {}
   }
 
   // 7. Coverage scope
@@ -1698,6 +1716,7 @@ gatewayRouter.post('/agents/:agentId/posture', (req: any, res) => {
   // Log posture event
   db.prepare(`INSERT INTO posture_events (tenant_id, agent_id, old_status, new_status, restricted_scopes, reason, changed_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(tenant.id, agentId, oldStatus, status, scopesJson, reason, tenant.id)
+  try { getEventBus().emit(tenant.id, { type: 'posture_update', agentId, data: { old_status: oldStatus, new_status: status, reason, restricted_scopes: restricted_scopes || null } }) } catch {}
 
   res.json({ agent_id: agentId, old_status: oldStatus, new_status: status, reason, restricted_scopes: restricted_scopes || null, changed_at: now })
 })

@@ -19,6 +19,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { getEventBus } from '../gateway/events.js'
 
 // ── Types ──
 
@@ -124,6 +125,7 @@ export class AgentWalletService {
           VALUES (?, ?, ?, ?, ?)`)
           .run(randomUUID(), tenantId, 'sybil_key_reuse', 'critical',
             `publicKey dedup: "${agentId}" shares key with "${keyDupe.agent_id}"`)
+        try { getEventBus().emit(tenantId, { type: 'alert', agentId, data: { alert_type: 'sybil_key_reuse', severity: 'critical' } }) } catch {}
         throw new Error(`Sybil gate: this public key already has a wallet under agent "${keyDupe.agent_id}".`)
       }
     }
@@ -140,6 +142,7 @@ export class AgentWalletService {
         VALUES (?, ?, ?, ?, ?)`)
         .run(randomUUID(), tenantId, 'sybil_mass_provision', 'critical',
           `Principal "${principalId}" provisioned ${recentProvisions.c} wallets in 1hr. Possible farming.`)
+      try { getEventBus().emit(tenantId, { type: 'alert', agentId, data: { alert_type: 'sybil_mass_provision', severity: 'critical' } }) } catch {}
       throw new Error(`Sybil gate: principal "${principalId}" has provisioned too many wallets recently. Max 5 per hour.`)
     }
 
@@ -170,7 +173,9 @@ export class AgentWalletService {
       } as AgentWallet
     })
 
-    return createWallet()
+    const wallet = createWallet()
+    try { getEventBus().emit(tenantId, { type: 'wallet_provisioned', agentId, data: { wallet_id: wallet.id, nano_address: wallet.nano_address } }) } catch {}
+    return wallet
   }
 
   /**
@@ -307,6 +312,7 @@ export class AgentWalletService {
           opts.toAgentId || null, opts.toAddress,
           amountRaw, String(opts.amountXno), result.blockHash,
           delegation.id, 'commerce:send')
+      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'confirmed' } }) } catch {}
 
       return tx
 
@@ -318,6 +324,7 @@ export class AgentWalletService {
         .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
           amountRaw, String(opts.amountXno), delegation.id,
           'commerce:send', e.message)
+      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'failed' } }) } catch {}
 
       return {
         id: txId, tenant_id: opts.tenantId,
@@ -344,12 +351,14 @@ export class AgentWalletService {
       VALUES (?, ?, ?, ?, ?, ?, 'denied', ?)`)
       .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
         amountRaw, String(opts.amountXno), reason)
+    try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'denied', reason } }) } catch {}
 
     // Fire alert
     db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
       VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), opts.tenantId, 'wallet_denied', 'warning',
         `Wallet send DENIED for "${opts.fromAgentId}": ${reason}`)
+    try { getEventBus().emit(opts.tenantId, { type: 'alert', agentId: opts.fromAgentId, data: { alert_type: 'wallet_denied', severity: 'warning', reason } }) } catch {}
 
     return {
       id: txId, tenant_id: opts.tenantId,
@@ -399,6 +408,8 @@ export class AgentWalletService {
       VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), tenantId, 'wallet_frozen', 'critical',
         `Wallet for agent "${agentId}" has been frozen`)
+    try { getEventBus().emit(tenantId, { type: 'wallet_frozen', agentId, data: {} }) } catch {}
+    try { getEventBus().emit(tenantId, { type: 'alert', agentId, data: { alert_type: 'wallet_frozen', severity: 'critical' } }) } catch {}
   }
 
   /** Revoke a wallet permanently */
