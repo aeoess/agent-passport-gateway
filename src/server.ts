@@ -68,6 +68,7 @@ import { finopsRouter } from './gateway/finops.js'
 import { eventsRouter, getEventBus } from './gateway/events.js'
 import { sessionsRouter } from './gateway/sessions.js'
 import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
+import { coordinationRouter } from './gateway/coordination.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -909,6 +910,7 @@ app.use('/api/v1', authMiddleware, finopsRouter)
 app.use('/api/v1', authMiddleware, eventsRouter)
 app.use('/api/v1', authMiddleware, sessionsRouter)
 app.use('/api/v1', authMiddleware, billingRouter)
+app.use('/api/v1', authMiddleware, coordinationRouter)
 
 // 404
 app.use((_req, res) => {

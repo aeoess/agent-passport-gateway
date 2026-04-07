@@ -443,6 +443,39 @@ function createTables() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON agent_sessions(tenant_id, agent_id);
+
+    -- Coordination (Nate Primitive #4: Workflow State)
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'draft',
+      created_by TEXT NOT NULL,
+      assigned_to TEXT,
+      scope TEXT,
+      acceptance_criteria TEXT,
+      deliverable TEXT,
+      evidence TEXT,
+      review_verdict TEXT,
+      review_notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(tenant_id, assigned_to);
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      event_type TEXT NOT NULL,
+      agent_id TEXT,
+      data TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_events ON task_events(tenant_id, task_id);
   `)
 
   // Add columns (idempotent via try/catch)
