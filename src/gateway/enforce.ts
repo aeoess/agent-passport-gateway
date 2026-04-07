@@ -17,6 +17,10 @@ import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 import { getEventBus } from './events.js'
+import { sendEmail, spendAlertEmail } from '../notifications/email.js'
+
+// Spend alert dedup: track which delegation+threshold combos have been alerted
+const spendAlertsSent = new Set<string>()
 import { checkAgentLimit, checkEvaluationLimit } from '../billing/limits.js'
 
 function safeError(e: any, context: string): { error: string; ref: string } {
@@ -467,6 +471,23 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       .run(randomUUID(), tenant.id, 'spend_threshold', 'warning',
         `Agent "${agent_id}" at ${(((delegation.spend_used || 0) / delegation.spend_limit) * 100).toFixed(0)}% of spend limit`)
     try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'spend_threshold', severity: 'warning' } }) } catch {}
+  }
+
+  // Spend alert emails (80% and 95% thresholds, deduplicated)
+  if (verdict === 'permit' && delegation?.spend_limit && estimated_cost) {
+    const newSpent = (delegation.spend_used || 0) + estimated_cost
+    const pct = (newSpent / delegation.spend_limit) * 100
+    for (const threshold of [80, 95]) {
+      if (pct >= threshold) {
+        const key = `${delegation.id}:${threshold}`
+        if (!spendAlertsSent.has(key)) {
+          spendAlertsSent.add(key)
+          const email = spendAlertEmail(tenant.name || 'Tenant', agent_id, Math.round(pct))
+          email.to = tenant.email
+          sendEmail(email).catch(() => {})
+        }
+      }
+    }
   }
 
   // Recovery guidance on denial (backward compat: null when no policy)

@@ -69,7 +69,7 @@ import { eventsRouter, getEventBus } from './gateway/events.js'
 import { sessionsRouter } from './gateway/sessions.js'
 import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
 import { coordinationRouter } from './gateway/coordination.js'
-import { sendEmail, signupWelcomeEmail } from './notifications/email.js'
+import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -944,6 +944,82 @@ app.use('/api/v1', authMiddleware, eventsRouter)
 app.use('/api/v1', authMiddleware, sessionsRouter)
 app.use('/api/v1', authMiddleware, billingRouter)
 app.use('/api/v1', authMiddleware, coordinationRouter)
+
+// ═══════════════════════════════════════
+// Admin endpoints (enterprise plan only)
+// ═══════════════════════════════════════
+
+app.get('/api/v1/admin/tenants', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  if (tenant.plan !== 'enterprise') {
+    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
+  }
+  const db = getDB()
+  const tenants = db.prepare(`
+    SELECT t.id as tenant_id, t.name, t.email, t.plan, t.status, t.created_at,
+           (SELECT COUNT(*) FROM agents a WHERE a.tenant_id = t.id AND a.status = 'active') as agent_count,
+           (SELECT COUNT(*) FROM policy_evaluations e WHERE e.tenant_id = t.id) as evaluation_count
+    FROM tenants t WHERE t.status != 'deleted' ORDER BY t.created_at DESC
+  `).all()
+  res.json({ tenants, count: tenants.length })
+})
+
+app.delete('/api/v1/admin/tenants/:tenantId', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  if (tenant.plan !== 'enterprise') {
+    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
+  }
+  const { tenantId } = req.params
+  if (tenantId === tenant.id) {
+    return res.status(400).json({ error: 'Cannot delete your own tenant' })
+  }
+  const db = getDB()
+  const target = db.prepare(`SELECT id, name, status FROM tenants WHERE id = ?`).get(tenantId) as any
+  if (!target) return res.status(404).json({ error: 'Tenant not found' })
+  if (target.status === 'deleted') return res.status(409).json({ error: 'Tenant already deleted' })
+
+  db.prepare(`UPDATE tenants SET status = 'deleted' WHERE id = ?`).run(tenantId)
+  console.log(`[admin] Tenant "${target.name}" (${tenantId}) soft-deleted by ${tenant.id}`)
+  res.json({ tenant_id: tenantId, status: 'deleted' })
+})
+
+app.post('/api/v1/admin/send-digest', authMiddleware, async (req: any, res) => {
+  const tenant = req.tenant
+  if (tenant.plan !== 'enterprise') {
+    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
+  }
+  const db = getDB()
+  const period = new Date().toISOString().slice(0, 7)
+  const tenants = db.prepare(`SELECT id, name, email, plan FROM tenants WHERE status = 'active'`).all() as any[]
+
+  let sent = 0, failed = 0
+  for (const t of tenants) {
+    try {
+      const stats = db.prepare(`
+        SELECT COUNT(*) as evaluations,
+               SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits,
+               SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denials
+        FROM policy_evaluations WHERE tenant_id = ? AND created_at >= ?
+      `).get(t.id, period + '-01') as any
+      const agents = (db.prepare(`SELECT COUNT(*) as c FROM agents WHERE tenant_id = ? AND status = 'active'`).get(t.id) as any).c
+
+      const email = weeklyDigestEmail(t.name, {
+        evaluations: stats?.evaluations || 0,
+        permits: stats?.permits || 0,
+        denials: stats?.denials || 0,
+        agents,
+        period,
+      })
+      email.to = t.email
+      await sendEmail(email)
+      sent++
+    } catch (e) {
+      console.error(`[digest] Failed for ${t.email}:`, (e as Error).message)
+      failed++
+    }
+  }
+  res.json({ sent, failed, total: tenants.length })
+})
 
 // 404
 app.use((_req, res) => {
