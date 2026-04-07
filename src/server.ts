@@ -381,17 +381,29 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' })
   }
 
-  const { agentId } = req.params
+  let { agentId } = req.params
 
-  // CDN caching: serve stale responses during deploys
+  // Wallet resolution: ?wallet=nano_...&chain=nano
+  const walletParam = req.query.wallet as string | undefined
+  const chainParam = (req.query.chain as string) || 'nano'
+
+  if (walletParam) {
+    const wdb = getDB()
+    const walletRow = wdb.prepare(
+      `SELECT agent_id FROM agent_wallets WHERE nano_address = ? AND status = 'active' LIMIT 1`
+    ).get(walletParam) as any
+    if (!walletRow) {
+      return res.json({ found: false, wallet: walletParam, chain: chainParam, reason: 'no_agent_mapping' })
+    }
+    agentId = walletRow.agent_id
+  }
+
+  // CDN caching
   res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
   res.setHeader('CDN-Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
 
-  // Cache check — cached entries serve the default passport_grade shape only.
-  // For ?signal= projections, fall through and recompute so the signed envelope
-  // carries a fresh evaluation_timestamp and delegation_chain_hash.
   const cached = trustProfileCache.get(agentId)
-  if (cached && cached.expires > Date.now() && !req.query.signal) {
+  if (cached && cached.expires > Date.now() && !req.query.signal && !walletParam) {
     return res.json(cached.data)
   }
 
@@ -530,6 +542,8 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
       : agent.public_key ? 'unverified' : 'none',
     did_method: agent.did ? (agent.did.split(':')[1] || null) : null,
     trust_reliability: agent.public_key && /^[0-9a-fA-F]{64}$/.test(agent.public_key) ? 'high' : 'low',
+    wallet_address: walletParam || null,
+    wallet_chain: walletParam ? chainParam : null,
     found: true,
     queried_at: new Date().toISOString(),
   }
