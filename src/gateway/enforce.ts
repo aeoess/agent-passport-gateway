@@ -430,7 +430,7 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   db.prepare(`INSERT INTO receipts (id, tenant_id, evaluation_id, agent_id, action_type, verdict, execution_result, signature, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(receiptId, tenant.id, evaluation_id || null, agent_id, action_type || '', verdict || '', execution_result || '', signature, typeof payload === 'string' ? payload : JSON.stringify(payload))
 
-  try { getEventBus().emit(tenant.id, { type: 'receipt', agentId: agent_id, data: { receiptId, evaluationId: evaluation_id, action_type, verdict } }) } catch {}
+  try { getEventBus().emit(tenant.id, { type: 'receipt_stored', agentId: agent_id, data: { receiptId, evaluationId: evaluation_id, action_type, verdict } }) } catch {}
 
   res.status(201).json({ receipt_id: receiptId, stored: true })
 })
