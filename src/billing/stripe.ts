@@ -18,6 +18,7 @@
 import { Router } from 'express'
 import Stripe from 'stripe'
 import { getDB } from '../db/schema.js'
+import { sendEmail, paymentReceiptEmail } from '../notifications/email.js'
 
 // Price IDs — set these after creating products in Stripe Dashboard
 const PRICE_IDS: Record<string, string> = {
@@ -200,6 +201,17 @@ export async function handleStripeWebhook(req: any, res: any) {
         db.prepare(`UPDATE tenants SET plan = ?, stripe_customer_id = ? WHERE id = ?`)
           .run(plan, session.customer as string, tenantId)
         console.log(`Tenant ${tenantId} upgraded to ${plan}`)
+
+        // Send payment receipt email (best-effort, never blocks webhook)
+        try {
+          const tenant = db.prepare(`SELECT name, email FROM tenants WHERE id = ?`).get(tenantId) as any
+          if (tenant?.email) {
+            const amount = session.amount_total ? (session.amount_total / 100).toFixed(2) : '0.00'
+            const email = paymentReceiptEmail(tenant.name || 'there', plan, amount)
+            email.to = tenant.email
+            sendEmail(email).catch(() => {})
+          }
+        } catch { /* email is best-effort */ }
       } else if (plan && !validPlans.includes(plan)) {
         console.error(`[SECURITY] Invalid plan "${plan}" in webhook metadata for tenant ${tenantId}`)
       }

@@ -69,6 +69,7 @@ import { eventsRouter, getEventBus } from './gateway/events.js'
 import { sessionsRouter } from './gateway/sessions.js'
 import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
 import { coordinationRouter } from './gateway/coordination.js'
+import { sendEmail, signupWelcomeEmail } from './notifications/email.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -218,6 +219,8 @@ app.post('/api/v1/signup', async (req, res) => {
       plan: tenant.plan,
       api_key: apiKey,
     })
+    // Welcome email (best-effort, never blocks signup)
+    try { sendEmail({ ...signupWelcomeEmail(name, email, apiKey), to: email }).catch(() => {}) } catch {}
   } catch (e: any) {
     if (e.message?.includes('UNIQUE')) {
       return res.status(409).json({ error: 'Email already registered' })
@@ -861,8 +864,11 @@ app.get('/api/v1/account', authMiddleware, (req: any, res) => {
      WHERE tenant_id = ? AND created_at >= ?`
   ).get(tenant.id, monthStart.toISOString()) as { c: number }
 
-  // Receipts stored
-  const receiptCount = db.prepare(
+  // Receipts stored (evaluation_receipts = gateway auto-minted, receipts = agent-submitted)
+  const evalReceiptCount = db.prepare(
+    `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ?`
+  ).get(tenant.id) as { c: number }
+  const agentReceiptCount = db.prepare(
     `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ?`
   ).get(tenant.id) as { c: number }
 
@@ -885,7 +891,7 @@ app.get('/api/v1/account', authMiddleware, (req: any, res) => {
       agents: agentCount.c,
       delegations: delegationCount.c,
       evaluations_this_month: evalsThisMonth.c,
-      receipts: receiptCount.c,
+      receipts: evalReceiptCount.c + agentReceiptCount.c,
     },
     limits: {
       max_agents: limits.maxAgents,

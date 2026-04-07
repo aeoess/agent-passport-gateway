@@ -996,7 +996,7 @@ gatewayRouter.get('/dashboard', (req: any, res) => {
   const agents = db.prepare(`SELECT COUNT(*) as c FROM agents WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
   const delegations = db.prepare(`SELECT COUNT(*) as c FROM delegations WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
   const usage = db.prepare(`SELECT evaluations FROM usage WHERE tenant_id = ? AND period = ?`).get(tenant.id, period) as any
-  const receipts = db.prepare(`SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ?`).get(tenant.id) as any
+  const receipts = db.prepare(`SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ?`).get(tenant.id) as any
   const alerts = db.prepare(`SELECT * FROM alerts WHERE tenant_id = ? AND acknowledged_at IS NULL ORDER BY created_at DESC LIMIT 10`).all(tenant.id)
   const limit = PLAN_LIMITS[tenant.plan as keyof typeof PLAN_LIMITS]
 
