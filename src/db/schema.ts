@@ -429,6 +429,20 @@ function createTables() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_recovery_events_agent ON recovery_events(tenant_id, agent_id);
+
+    -- Agent Sessions (crash-recovery checkpoint — Primitive #3)
+    CREATE TABLE IF NOT EXISTS agent_sessions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      agent_id TEXT NOT NULL,
+      session_data TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT,
+      UNIQUE(tenant_id, agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_agent ON agent_sessions(tenant_id, agent_id);
   `)
 
   // Add columns (idempotent via try/catch)
