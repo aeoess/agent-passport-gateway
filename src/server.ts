@@ -94,6 +94,26 @@ app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.4.0' })
 })
 
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', version: '0.4.0', uptime_seconds: Math.floor(process.uptime()), timestamp: new Date().toISOString() })
+})
+
+app.get('/api/v1/status', (_req, res) => {
+  let dbWritable = false
+  try { getDB().prepare('SELECT 1').get(); dbWritable = true } catch {}
+  res.json({
+    gateway: 'operational',
+    version: '0.4.0',
+    uptime_seconds: Math.floor(process.uptime()),
+    database: dbWritable ? 'connected' : 'error',
+    timestamp: new Date().toISOString(),
+    checks: {
+      db_writable: dbWritable,
+      issuer_key_loaded: !!process.env.AEOESS_ISSUER_PRIVATE_KEY,
+    },
+  })
+})
+
 // ═══════════════════════════════════════
 // Receipt Resolution (WG interop, no auth)
 // GET /.well-known/receipts/:id
@@ -529,6 +549,26 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     }
   } catch { /* task_class column may not exist yet */ }
 
+  // Optional: enrich with RNWY behavioral trust signal
+  if (process.env.RNWY_TRUST_ENABLED === 'true') {
+    try {
+      const rnwyRes = await fetch(`https://rnwy.com/api/trust-check?agentId=${encodeURIComponent(agentId)}&chain=base`, {
+        signal: AbortSignal.timeout(2000)
+      })
+      if (rnwyRes.ok) {
+        const rnwy = await rnwyRes.json() as any
+        ;(profile as any).behavioral_trust = {
+          source: 'rnwy',
+          score: rnwy.signed?.score ?? null,
+          tier: rnwy.signed?.tier ?? null,
+          sybil_severity: rnwy.signed?.sybilSeverity ?? null,
+          badges: rnwy.signed?.badges ?? [],
+          fetched_at: new Date().toISOString(),
+        }
+      }
+    } catch { /* RNWY unavailable — profile still works without it */ }
+  }
+
   // Cache
   trustProfileCache.set(agentId, { data: profile, expires: Date.now() + TRUST_CACHE_TTL })
 
@@ -931,6 +971,38 @@ app.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
   res.json({
     message: 'API key rotated. Save this key — it will not be shown again.',
     api_key: rawKey,
+  })
+})
+
+// POST /api/v1/account/regenerate-key — generate new key, invalidate old, email notification
+app.post('/api/v1/account/regenerate-key', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  const db = getDB()
+
+  // Revoke all existing keys
+  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now') WHERE tenant_id = ? AND revoked_at IS NULL`)
+    .run(tenant.id)
+
+  // Generate new key
+  const rawKey = `aps_live_${randomBytes(32).toString('hex')}`
+  const keyHash = createHash('sha256').update(rawKey).digest('hex')
+  const keyPrefix = rawKey.slice(0, 12)
+
+  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
+    .run(randomUUID(), tenant.id, keyHash, keyPrefix, 'regenerated')
+  try { getEventBus().emit(tenant.id, { type: 'key_rotated', data: { key_prefix: keyPrefix } }) } catch {}
+
+  // Email notification
+  sendEmail({
+    to: tenant.email,
+    subject: 'AEOESS — API Key Regenerated',
+    textBody: `Your API key was regenerated at ${new Date().toISOString()}. If you did not do this, contact signal@aeoess.com immediately.`,
+    htmlBody: `<p>Your AEOESS API key was regenerated at ${new Date().toISOString()}.</p><p>If you did not do this, contact <a href="mailto:signal@aeoess.com">signal@aeoess.com</a> immediately.</p>`,
+  }).catch(() => {})
+
+  res.json({
+    api_key: rawKey,
+    message: 'New API key generated. Save it now — the old key is invalidated.',
   })
 })
 
