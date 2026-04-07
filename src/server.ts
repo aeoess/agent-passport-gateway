@@ -65,6 +65,7 @@ import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
+import { eventsRouter, getEventBus } from './gateway/events.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -201,6 +202,7 @@ app.post('/api/v1/signup', async (req, res) => {
   const validPlan = plan === 'free' || !plan ? 'free' : 'free'
   try {
     const { tenant, apiKey } = createTenant({ name, email, plan: validPlan })
+    try { getEventBus().emit(tenant.id, { type: 'tenant_created', data: { plan: tenant.plan, name } }) } catch {}
     res.status(201).json({
       message: 'Account created. Save your API key — it will not be shown again.',
       tenant_id: tenant.id,
@@ -898,6 +900,7 @@ app.use('/api/v1', authMiddleware, paymentRouter)
 app.use('/api/v1', authMiddleware, walletRouter)
 app.use('/api/v1', authMiddleware, rekorRouter)
 app.use('/api/v1', authMiddleware, finopsRouter)
+app.use('/api/v1', authMiddleware, eventsRouter)
 
 // 404
 app.use((_req, res) => {

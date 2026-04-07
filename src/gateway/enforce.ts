@@ -16,6 +16,7 @@ import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
+import { getEventBus } from './events.js'
 
 function safeError(e: any, context: string): { error: string; ref: string } {
   const ref = randomUUID().slice(0, 8)
@@ -338,6 +339,9 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs)
 
+  // Emit SSE event
+  try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs } }) } catch {}
+
   // Auto-mint evaluation receipt (non-blocking)
   mintEvaluationReceipt({
     tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
@@ -426,6 +430,8 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   db.prepare(`INSERT INTO receipts (id, tenant_id, evaluation_id, agent_id, action_type, verdict, execution_result, signature, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(receiptId, tenant.id, evaluation_id || null, agent_id, action_type || '', verdict || '', execution_result || '', signature, typeof payload === 'string' ? payload : JSON.stringify(payload))
 
+  try { getEventBus().emit(tenant.id, { type: 'receipt', agentId: agent_id, data: { receiptId, evaluationId: evaluation_id, action_type, verdict } }) } catch {}
+
   res.status(201).json({ receipt_id: receiptId, stored: true })
 })
 
@@ -475,6 +481,8 @@ gatewayRouter.post('/revoke', (req: any, res) => {
   db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
     .run(randomUUID(), tenant.id, 'revocation', 'critical',
       `${target_type} "${target_id}" revoked. ${cascadeCount} downstream items affected.`)
+
+  try { getEventBus().emit(tenant.id, { type: 'revocation', data: { revocationId, target_type, target_id, cascade_count: cascadeCount, revoked_by: revoked_by || 'api' } }) } catch {}
 
   res.json({ revocation_id: revocationId, target_type, target_id, cascade_count: cascadeCount })
 })
