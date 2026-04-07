@@ -2268,7 +2268,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
     const evalWhere = agentFilter ? 'AND agent_id = ?' : ''
     const evalParams = agentFilter ? [tenant.id, since, until, agentFilter] : [tenant.id, since, until]
     const evalRows = db.prepare(
-      `SELECT id, agent_id, action_type, verdict, reason, duration_ms, created_at FROM policy_evaluations WHERE tenant_id = ? AND created_at >= ? AND created_at <= ? ${evalWhere} ORDER BY created_at`
+      `SELECT id, agent_id, action_type, verdict, reason, duration_ms, task_class, created_at FROM policy_evaluations WHERE tenant_id = ? AND created_at >= ? AND created_at <= ? ${evalWhere} ORDER BY created_at`
     ).all(...evalParams) as any[]
 
     const permits3 = evalRows.filter((e: any) => (e.verdict || '').toLowerCase() === 'permit').length
@@ -2318,7 +2318,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
       const csvHeader = 'table_name,col_1,col_2,col_3,col_4,col_5,col_6,col_7,col_8,col_9'
 
       // 1. policy_evaluations
-      const evalCols = ['evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'timestamp', 'receipt_hash']
+      const evalCols = ['evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'task_class', 'timestamp', 'receipt_hash']
       const csvEvalHeader = ['table_name', ...evalCols].join(',')
       const csvEvals = evalRows.map((e: any) => {
         const rcpt = rcptRows.find((r: any) => r.agent_id === e.agent_id && r.created_at === e.created_at)
@@ -2326,6 +2326,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
           evaluation_id: e.id, agent_id: e.agent_id, action_type: e.action_type,
           scope_checked: e.reason || '', verdict: e.verdict,
           delegation_id: '', spend_at_evaluation: '',
+          task_class: e.task_class || '',
           timestamp: e.created_at, receipt_hash: rcpt?.receipt_hash || '',
         }
       })
@@ -2357,7 +2358,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
       // Combined: proper header per table, table_name discriminator
       const sections: string[] = []
       // Emit header once, then all rows
-      const header = ['table_name', 'evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'timestamp', 'receipt_hash'].join(',')
+      const header = ['table_name', 'evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'task_class', 'timestamp', 'receipt_hash'].join(',')
       sections.push(header)
       sections.push(toCsvSection('policy_evaluations', evalCols, csvEvals))
       sections.push(toCsvSection('revocation_events', revCols, csvRevocations))
