@@ -44,7 +44,7 @@
 import express from 'express'
 import { mkdirSync, existsSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
 // Ensure DB directory exists (Railway Volumes mount at /data)
 const dbPath = process.env.DB_PATH || './gateway.db'
@@ -56,7 +56,7 @@ if (dbDir !== '.' && !existsSync(dbDir)) {
 import cors from 'cors'
 import helmet from 'helmet'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
-import { initDB, getDB } from './db/schema.js'
+import { initDB, getDB, PLAN_LIMITS } from './db/schema.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
@@ -796,6 +796,100 @@ app.post('/api/v1/mcp-stats', authMiddleware, (req: any, res) => {
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to record snapshot' })
   }
+})
+
+
+// ═══════════════════════════════════════
+// Self-service Account (authenticated)
+// ═══════════════════════════════════════
+
+app.get('/api/v1/account', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  const db = getDB()
+
+  // Agent count
+  const agentCount = db.prepare(
+    `SELECT COUNT(*) as c FROM agents WHERE tenant_id = ? AND status = 'active'`
+  ).get(tenant.id) as { c: number }
+
+  // Delegation count
+  const delegationCount = db.prepare(
+    `SELECT COUNT(*) as c FROM delegations WHERE tenant_id = ? AND status = 'active'`
+  ).get(tenant.id) as { c: number }
+
+  // Evaluations this month
+  const monthStart = new Date()
+  monthStart.setDate(1)
+  monthStart.setHours(0, 0, 0, 0)
+  const evalsThisMonth = db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations
+     WHERE tenant_id = ? AND created_at >= ?`
+  ).get(tenant.id, monthStart.toISOString()) as { c: number }
+
+  // Receipts stored
+  const receiptCount = db.prepare(
+    `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ?`
+  ).get(tenant.id) as { c: number }
+
+  // API keys (prefix only, no hashes)
+  const keys = db.prepare(
+    `SELECT id, key_prefix, name, created_at, last_used_at, revoked_at
+     FROM api_keys WHERE tenant_id = ?`
+  ).all(tenant.id) as any[]
+
+  // Plan limits
+  const limits = PLAN_LIMITS[tenant.plan as keyof typeof PLAN_LIMITS] || PLAN_LIMITS.free
+
+  res.json({
+    tenant_id: tenant.id,
+    name: tenant.name,
+    email: tenant.email,
+    plan: tenant.plan,
+    status: tenant.status,
+    usage: {
+      agents: agentCount.c,
+      delegations: delegationCount.c,
+      evaluations_this_month: evalsThisMonth.c,
+      receipts: receiptCount.c,
+    },
+    limits: {
+      max_agents: limits.maxAgents,
+      evaluations_per_month: limits.evaluationsPerMonth,
+      compliance_reports: limits.complianceReports,
+      sla: limits.sla,
+    },
+    api_keys: keys.map((k: any) => ({
+      id: k.id,
+      prefix: k.key_prefix,
+      name: k.name,
+      created_at: k.created_at,
+      last_used_at: k.last_used_at,
+      active: !k.revoked_at,
+    })),
+  })
+})
+
+// Rotate API key — revokes current, issues new
+app.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  const db = getDB()
+
+  // Revoke all existing keys
+  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now') WHERE tenant_id = ? AND revoked_at IS NULL`)
+    .run(tenant.id)
+
+  // Create new key
+  const rawKey = `aps_live_${randomBytes(32).toString('hex')}`
+  const keyHash = createHash('sha256').update(rawKey).digest('hex')
+  const keyPrefix = rawKey.slice(0, 12)
+
+  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
+    .run(randomUUID(), tenant.id, keyHash, keyPrefix, 'rotated')
+
+  res.json({
+    message: 'API key rotated. Save this key — it will not be shown again.',
+    api_key: rawKey,
+  })
 })
 
 // Authenticated routes
