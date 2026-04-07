@@ -947,7 +947,7 @@ app.use('/api/v1', authMiddleware, coordinationRouter)
 
 // 404
 app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found. See docs at aeoess.com/docs' })
+  res.status(404).json({ error: 'Not found. See docs at aeoess.com/docs.html' })
 })
 
 // Init and start
