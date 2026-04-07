@@ -261,25 +261,32 @@ export class AgentWalletService {
         `Agent lacks commerce:send scope. Has: [${delegation.scope}]`)
     }
 
-    // ── Gate 3: Spend limit check (rounded to avoid float drift) ──
-    if (delegation.spend_limit) {
-      const remaining = Math.round((delegation.spend_limit - (delegation.spend_used || 0)) * 1e6) / 1e6
-      const amount = Math.round(opts.amountXno * 1e6) / 1e6
-      if (amount > remaining) {
-        return this.recordDenied(txId, opts, amountRaw,
-          `Amount ${amount} XNO exceeds remaining budget ${remaining} XNO`)
+    // ── Gate 3: Atomic spend limit check + optimistic debit (C3: prevents TOCTOU) ──
+    const spendCheckPassed = db.transaction(() => {
+      const freshDel = db.prepare(`SELECT spend_limit, spend_used FROM delegations WHERE id = ? AND tenant_id = ?`).get(delegation.id, opts.tenantId) as any
+      if (freshDel?.spend_limit) {
+        const remaining = Math.round((freshDel.spend_limit - (freshDel.spend_used || 0)) * 1e6) / 1e6
+        const amount = Math.round(opts.amountXno * 1e6) / 1e6
+        if (amount > remaining) return false
       }
+      db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
+        .run(opts.amountXno, delegation.id)
+      return true
+    }).immediate()
+
+    if (!spendCheckPassed) {
+      const remaining = Math.round((delegation.spend_limit - (delegation.spend_used || 0)) * 1e6) / 1e6
+      return this.recordDenied(txId, opts, amountRaw,
+        `Amount ${Math.round(opts.amountXno * 1e6) / 1e6} XNO exceeds remaining budget ${remaining} XNO`)
     }
 
-    // ── Gate 4: Execute on-chain send (local signing, public RPC publish) ──
+    // ── Gate 4: Execute on-chain send ──
     try {
       const result = await this.localWallet.send(
         wallet.wallet_index, opts.toAddress, amountRaw
       )
 
-      // Update delegation spend tracking
-      db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
-        .run(opts.amountXno, delegation.id)
+      // Spend already debited atomically above
 
       // Update wallet totals
       const newSent = (BigInt(wallet.total_sent_raw) + BigInt(amountRaw)).toString()
@@ -317,6 +324,10 @@ export class AgentWalletService {
       return tx
 
     } catch (e: any) {
+      // Reverse the optimistic debit since on-chain send failed
+      db.prepare(`UPDATE delegations SET spend_used = spend_used - ? WHERE id = ?`)
+        .run(opts.amountXno, delegation.id)
+
       db.prepare(`INSERT INTO wallet_transactions
         (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,
          delegation_id, scope_used, status, denial_reason)

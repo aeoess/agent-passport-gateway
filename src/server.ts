@@ -74,10 +74,15 @@ const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
 
 const app = express()
+app.set('trust proxy', 1) // Trust first proxy (Railway) for correct req.ip
 
 // Security
 app.use(helmet())
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }))
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://aeoess.com,https://gateway.aeoess.com').split(',').map(s => s.trim())
+app.use(cors({ origin: (origin, callback) => {
+  if (!origin || allowedOrigins.includes(origin)) callback(null, true)
+  else callback(null, false)
+} }))
 // Stripe webhook needs raw body (must be before express.json)
 app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook)
 
@@ -139,9 +144,8 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
         if (payloadField && row[payloadField]) {
           try { body = JSON.parse(row[payloadField]) } catch { body = row[payloadField] }
         } else {
-          // Reconstruct body from row fields (strip internal fields)
-          const { tenant_id, ...publicFields } = row
-          body = publicFields
+          // Public proof fields only — strip tenant IDs, spend, delegation details
+          body = { id: row.id, event_type: row.event_type || row.action_type || null, verdict: row.verdict || null, created_at: row.created_at, schema_version: row.schema_version || null, receipt_hash: row.receipt_hash || null }
         }
 
         const result = {
@@ -149,7 +153,6 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
           proofType: type,
           issuer: 'https://gateway.aeoess.com',
           issuedAt: row.created_at,
-          agentId: row.agent_id,
           signature: row[signatureField] || null,
           body,
           jwksUrl: 'https://gateway.aeoess.com/.well-known/jwks.json',
@@ -371,10 +374,14 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   const db = getDB()
 
-  // Search across ALL tenants — this is the public lookup
-  const agent = db.prepare(
-    `SELECT * FROM agents WHERE agent_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1`
-  ).get(agentId) as any
+  // Search across ALL tenants — warn on ambiguity
+  const allMatches = db.prepare(
+    `SELECT * FROM agents WHERE agent_id = ? AND status = 'active' ORDER BY created_at ASC`
+  ).all(agentId) as any[]
+  const agent = allMatches[0]
+  if (allMatches.length > 1) {
+    res.setHeader('X-APS-Warning', `Ambiguous: ${allMatches.length} tenants have agent "${agentId}". Showing oldest.`)
+  }
 
   if (!agent) {
     if (req.query.signal === 'governance_attestation') {

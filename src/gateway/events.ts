@@ -87,11 +87,17 @@ export const eventsRouter = Router()
 
 eventsRouter.get('/events/stream', (req: any, res) => {
   const tenant: Tenant = req.tenant
+
+  // M10: per-tenant connection limit
+  const bus = getEventBus()
+  if (bus.subscriberCount(tenant.id) >= 5) {
+    return res.status(429).json({ error: 'Too many SSE connections (max 5 per tenant)' })
+  }
+
   const typeFilter = req.query.types
     ? (req.query.types as string).split(',').map((t: string) => t.trim()).filter(Boolean)
     : null
 
-  // SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -99,11 +105,8 @@ eventsRouter.get('/events/stream', (req: any, res) => {
     'X-Accel-Buffering': 'no',
   })
 
-  // Initial connection event
   res.write(`data: ${JSON.stringify({ type: 'connected', tenantId: tenant.id, timestamp: new Date().toISOString() })}\n\n`)
 
-  // Subscribe to events
-  const bus = getEventBus()
   const callback: EventCallback = (event) => {
     if (typeFilter && !typeFilter.includes(event.type)) return
     res.write(`id: ${event.id}\n`)
@@ -113,14 +116,21 @@ eventsRouter.get('/events/stream', (req: any, res) => {
 
   bus.subscribe(tenant.id, callback)
 
-  // Heartbeat every 30s
+  // P2-14: heartbeat with dead socket detection
   const heartbeat = setInterval(() => {
-    res.write(`: heartbeat ${new Date().toISOString()}\n\n`)
+    const ok = res.write(`: heartbeat ${new Date().toISOString()}\n\n`)
+    if (!ok) cleanup()
   }, 30000)
 
-  // Cleanup on close
-  req.on('close', () => {
+  // P2-14: max 30 min connection duration
+  const maxDuration = setTimeout(() => cleanup(), 30 * 60 * 1000)
+
+  function cleanup() {
     clearInterval(heartbeat)
+    clearTimeout(maxDuration)
     bus.unsubscribe(tenant.id, callback)
-  })
+    try { res.end() } catch {}
+  }
+
+  req.on('close', cleanup)
 })

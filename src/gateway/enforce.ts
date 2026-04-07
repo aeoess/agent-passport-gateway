@@ -29,12 +29,18 @@ function safeError(e: any, context: string): { error: string; ref: string } {
 // Non-blocking: logs failures but never blocks the evaluation response.
 // Denials are signed (proof of restraint). Permits are unsigned (routine).
 
-function canonicalJsonStringify(v: unknown): string {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v)
-  if (Array.isArray(v)) return '[' + v.map(canonicalJsonStringify).join(',') + ']'
+// H9: aligned with SDK canonicalize() — strips null/undefined, cycle-safe
+function canonicalJsonStringify(v: unknown, seen = new WeakSet<object>()): string {
+  if (v === null || v === undefined) return 'null'
+  if (typeof v !== 'object') return JSON.stringify(v)
+  if (v instanceof Date) return JSON.stringify(v)
+  if (seen.has(v as object)) return '"[circular]"'
+  seen.add(v as object)
+  if (Array.isArray(v)) return '[' + v.map(i => canonicalJsonStringify(i, seen)).join(',') + ']'
   const keys = Object.keys(v as Record<string, unknown>).sort()
+    .filter(k => { const val = (v as Record<string, unknown>)[k]; return val !== null && val !== undefined })
   return '{' + keys.map(k =>
-    JSON.stringify(k) + ':' + canonicalJsonStringify((v as Record<string, unknown>)[k])
+    JSON.stringify(k) + ':' + canonicalJsonStringify((v as Record<string, unknown>)[k], seen)
   ).join(',') + '}'
 }
 
@@ -107,11 +113,10 @@ async function getScopeAuthorizes() {
     try {
       const sdk = await import('agent-passport-system')
       _scopeAuthorizes = sdk.scopeAuthorizes
-    } catch {
-      // Fallback if SDK not available — manual match
-      _scopeAuthorizes = (scopes: string[], required: string) =>
-        scopes.some(s => s === required || s === '*' ||
-          (s.endsWith(':*') && required.startsWith(s.slice(0, -1))))
+    } catch (e) {
+      // FAIL CLOSED: deny all scope checks when SDK unavailable
+      console.error('[SECURITY] Failed to load scopeAuthorizes — all checks DENY:', (e as Error).message)
+      _scopeAuthorizes = () => false
     }
   }
   return _scopeAuthorizes
@@ -310,70 +315,72 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     }
   }
 
-  // Check delegation scope
-  const delegation = db.prepare(`
-    SELECT * FROM delegations 
-    WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-    ORDER BY created_at DESC LIMIT 1
-  `).get(tenant.id, agent_id) as any
+  // C2: Atomic delegation check + spend update (prevents TOCTOU double-spend)
+  const scopeAuth = await getScopeAuthorizes()
+  const evalId = randomUUID()
 
-  let verdict = 'permit'
-  let reason = ''
-  const violations: string[] = []
+  const evalResult = db.transaction(() => {
+    const delegation = db.prepare(`
+      SELECT * FROM delegations
+      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(tenant.id, agent_id) as any
 
-  if (!delegation) {
-    verdict = 'deny'
-    violations.push('No active delegation for agent')
-  } else {
-    // Scope check — uses SDK scopeAuthorizes() for monotonic narrowing
-    const allowedScopes = delegation.scope.split(',').map((s: string) => s.trim())
-    const scopeAuth = await getScopeAuthorizes()
-    const scopeMatch = scopeAuth(allowedScopes, scope_required)
-    if (!scopeMatch) {
+    let verdict = 'permit'
+    const violations: string[] = []
+
+    if (!delegation) {
       verdict = 'deny'
-      violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
-    }
-
-
-    // Spend limit check
-    if (estimated_cost && delegation?.spend_limit) {
-      const remaining = delegation.spend_limit - (delegation.spend_used || 0)
-      if (estimated_cost > remaining) {
+      violations.push('No active delegation for agent')
+    } else {
+      const allowedScopes = delegation.scope.split(',').map((s: string) => s.trim())
+      if (!scopeAuth(allowedScopes, scope_required)) {
         verdict = 'deny'
-        violations.push(`Cost $${estimated_cost} exceeds remaining budget $${remaining.toFixed(2)}`)
+        violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
       }
-    }
-  }
-
-  // Agent type enforcement (Primitive #12)
-  if (verdict === 'permit' && agent.agent_type && agent.agent_type !== 'general') {
-    const typeConstraints = AGENT_TYPE_CONSTRAINTS[agent.agent_type as string]
-    if (typeConstraints) {
-      for (const blocked of typeConstraints.blocked_scopes) {
-        if (scope_required === blocked || scope_required.startsWith(blocked + ':')) {
+      if (estimated_cost && delegation.spend_limit) {
+        const remaining = delegation.spend_limit - (delegation.spend_used || 0)
+        if (estimated_cost > remaining) {
           verdict = 'deny'
-          violations.push(`Agent type "${agent.agent_type}" is not permitted scope "${scope_required}"`)
-          break
+          violations.push(`Cost $${estimated_cost} exceeds remaining budget $${remaining.toFixed(2)}`)
         }
       }
     }
-  }
 
-  reason = verdict === 'permit'
-    ? `Permitted: scope "${scope_required}" authorized`
-    : `Denied: ${violations.join('; ')}`
+    // Agent type enforcement
+    if (verdict === 'permit' && agent.agent_type && agent.agent_type !== 'general') {
+      const typeConstraints = AGENT_TYPE_CONSTRAINTS[agent.agent_type as string]
+      if (typeConstraints) {
+        for (const blocked of typeConstraints.blocked_scopes) {
+          if (scope_required === blocked || scope_required.startsWith(blocked + ':')) {
+            verdict = 'deny'
+            violations.push(`Agent type "${agent.agent_type}" is not permitted scope "${scope_required}"`)
+            break
+          }
+        }
+      }
+    }
 
-  const durationMs = Date.now() - start
-  const evalId = randomUUID()
+    const reason = verdict === 'permit'
+      ? `Permitted: scope "${scope_required}" authorized`
+      : `Denied: ${violations.join('; ')}`
+    const durationMs = Date.now() - start
 
-  // Record evaluation
-  db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs)
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs)
 
-  // Emit SSE event
+    if (verdict === 'permit' && estimated_cost && delegation) {
+      db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
+        .run(estimated_cost, delegation.id)
+    }
+
+    return { verdict, reason, violations, durationMs, delegation }
+  }).immediate()
+
+  const { verdict, reason, violations, durationMs, delegation } = evalResult
+
   try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs } }) } catch {}
 
-  // Auto-mint evaluation receipt (non-blocking)
   mintEvaluationReceipt({
     tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
     verdict, actionType: action_type, scopeRequired: scope_required,
@@ -382,18 +389,13 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
   incrementUsage(tenant.id)
 
-  // Update spend if permitted
   if (verdict === 'permit' && estimated_cost && delegation) {
-    db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
-      .run(estimated_cost, delegation.id)
     try { getEventBus().emit(tenant.id, { type: 'spend_update', agentId: agent_id, data: { delegation_id: delegation.id, spend_used: (delegation.spend_used || 0) + estimated_cost, spend_limit: delegation.spend_limit } }) } catch {}
   }
-
-  // Check for spend alerts (80% threshold)
-  if (delegation?.spend_limit && delegation.spend_used > delegation.spend_limit * 0.8) {
+  if (delegation?.spend_limit && (delegation.spend_used || 0) > delegation.spend_limit * 0.8) {
     db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), tenant.id, 'spend_threshold', 'warning',
-        `Agent "${agent_id}" at ${((delegation.spend_used / delegation.spend_limit) * 100).toFixed(0)}% of spend limit`)
+        `Agent "${agent_id}" at ${(((delegation.spend_used || 0) / delegation.spend_limit) * 100).toFixed(0)}% of spend limit`)
     try { getEventBus().emit(tenant.id, { type: 'alert', agentId: agent_id, data: { alert_type: 'spend_threshold', severity: 'warning' } }) } catch {}
   }
 
@@ -623,6 +625,28 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
       try { getEventBus().emit(tenant.id, { type: 'alert', data: { alert_type: 'issuance_velocity', severity: 'warning', public_key_hash } }) } catch {}
     }
 
+    // Sybil gate: strict velocity (5+ passports/hr from same key = critical)
+    const recentFromKey = db.prepare(
+      `SELECT COUNT(*) as c FROM issuance_dossiers WHERE tenant_id = ? AND public_key_hash = ? AND created_at > datetime('now', '-1 hour')`
+    ).get(tenant.id, public_key_hash) as any
+    if (recentFromKey.c >= 5) {
+      db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+        .run(randomUUID(), tenant.id, 'sybil_issuance_velocity', 'critical',
+          `Key ${public_key_hash.slice(0, 16)}... issued ${recentFromKey.c} passports in 1hr`)
+    }
+
+    // Sybil gate: fingerprint clustering (10+ distinct keys with same request fingerprint in 24h)
+    if (obs.requestPayloadFingerprint) {
+      const fpCluster = db.prepare(
+        `SELECT COUNT(DISTINCT public_key_hash) as c FROM issuance_dossiers WHERE tenant_id = ? AND request_payload_fingerprint = ? AND created_at > datetime('now', '-24 hours')`
+      ).get(tenant.id, obs.requestPayloadFingerprint) as any
+      if (fpCluster.c >= 10) {
+        db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
+          .run(randomUUID(), tenant.id, 'sybil_fingerprint_cluster', 'critical',
+            `Payload fingerprint ${(obs.requestPayloadFingerprint as string).slice(0, 16)}... seen from ${fpCluster.c} distinct keys in 24h`)
+      }
+    }
+
     // Compute lineage links and cluster risk
     const dossierRow = db.prepare(
       `SELECT * FROM issuance_dossiers WHERE id = ?`
@@ -784,6 +808,9 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   if (!parent_agent_id || !child_agent_id || !scope) {
     return res.status(400).json({ error: 'Required: parent_agent_id, child_agent_id, scope' })
   }
+  // P3-6: verify agent exists (prevent phantom delegations)
+  const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
+  if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
   const id = randomUUID()
   db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spend_limit || null, max_depth || 3)
@@ -1477,12 +1504,10 @@ gatewayRouter.get('/provenance-dossier', (req: any, res) => {
 })
 
 
-// ═══════════════════════════════════════
-// POST /api/v1/issuance-dossier
-// Receives IssuanceContext from MCP server after every passport issuance.
-// Fire-and-forget from MCP side — this endpoint stores the full evidence dossier.
-// ═══════════════════════════════════════
-gatewayRouter.post('/issuance-dossier', (req: any, res) => {
+// [REMOVED: Duplicate issuance-dossier handler deleted. Sybil logic merged into first handler at line 568.]
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _removed_duplicate_issuance_handler = ((req: any, res: any) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
   const {
@@ -1579,7 +1604,7 @@ gatewayRouter.post('/issuance-dossier', (req: any, res) => {
     }
     res.status(500).json(safeError(e, 'behavioral-sequence'))
   }
-})
+}) // end of removed duplicate handler
 
 // ═══════════════════════════════════════
 // Evaluation Receipts — authenticated endpoints
@@ -1632,49 +1657,35 @@ let _receiptsSinceLastSeal = 0
 function sealReceiptWindow() {
   try {
     const db = getDB()
-    const unsealed = db.prepare(
-      'SELECT id, receipt_hash FROM evaluation_receipts WHERE seal_id IS NULL ORDER BY id'
-    ).all() as Array<{ id: number; receipt_hash: string }>
-
-    if (unsealed.length < 10) return // minimum batch size
-
-    const seqStart = unsealed[0].id
-    const seqEnd = unsealed[unsealed.length - 1].id
-    const sealId = randomUUID()
-
-    // Option A: sorted-hash commitment (receipts already in ID order)
-    const sortedHashes = unsealed.map(r => r.receipt_hash || '').join('')
-    const commitmentHash = createHash('sha256').update(sortedHashes).digest('hex')
-
-    // Count permits/denials
-    const counts = db.prepare(
-      `SELECT verdict, COUNT(*) as c FROM evaluation_receipts WHERE id >= ? AND id <= ? GROUP BY verdict`
-    ).all(seqStart, seqEnd) as Array<{ verdict: string; c: number }>
-    const permitCount = counts.find(c => c.verdict === 'permit')?.c || 0
-    const denyCount = counts.find(c => c.verdict === 'deny')?.c || 0
-
-    const identity = getGatewayIdentity()
-    const sig = identity.sign({
-      seal_id: sealId, seq_start: seqStart, seq_end: seqEnd,
-      receipt_count: unsealed.length, commitment_hash: commitmentHash,
-    })
-
-    // Atomic: insert seal + update receipts
-    const txn = db.transaction(() => {
-      db.prepare(`
-        INSERT INTO receipt_window_seals (
-          seal_id, seq_start, seq_end, receipt_count, permit_count, deny_count,
-          commitment_hash, gateway_signature
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(sealId, seqStart, seqEnd, unsealed.length, permitCount, denyCount, commitmentHash, sig)
-
-      db.prepare('UPDATE evaluation_receipts SET seal_id = ? WHERE id >= ? AND id <= ?')
-        .run(sealId, seqStart, seqEnd)
-    })
-    txn()
-
+    // P3-1: seal per-tenant
+    const tenants = db.prepare('SELECT DISTINCT tenant_id FROM evaluation_receipts WHERE seal_id IS NULL').all() as Array<{ tenant_id: string }>
+    for (const { tenant_id } of tenants) {
+      const unsealed = db.prepare(
+        'SELECT id, receipt_hash FROM evaluation_receipts WHERE seal_id IS NULL AND tenant_id = ? ORDER BY id'
+      ).all(tenant_id) as Array<{ id: number; receipt_hash: string }>
+      if (unsealed.length < 10) continue
+      const seqStart = unsealed[0].id
+      const seqEnd = unsealed[unsealed.length - 1].id
+      const sealId = randomUUID()
+      const sortedHashes = unsealed.map(r => r.receipt_hash || '').join('')
+      const commitmentHash = createHash('sha256').update(sortedHashes).digest('hex')
+      const counts = db.prepare(
+        `SELECT verdict, COUNT(*) as c FROM evaluation_receipts WHERE id >= ? AND id <= ? AND tenant_id = ? GROUP BY verdict`
+      ).all(seqStart, seqEnd, tenant_id) as Array<{ verdict: string; c: number }>
+      const permitCount = counts.find(c => c.verdict === 'permit')?.c || 0
+      const denyCount = counts.find(c => c.verdict === 'deny')?.c || 0
+      const identity = getGatewayIdentity()
+      const sig = identity.sign({ seal_id: sealId, seq_start: seqStart, seq_end: seqEnd, receipt_count: unsealed.length, commitment_hash: commitmentHash, tenant_id })
+      const txn = db.transaction(() => {
+        db.prepare(`INSERT INTO receipt_window_seals (seal_id, seq_start, seq_end, receipt_count, permit_count, deny_count, commitment_hash, gateway_signature, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(sealId, seqStart, seqEnd, unsealed.length, permitCount, denyCount, commitmentHash, sig, tenant_id)
+        db.prepare('UPDATE evaluation_receipts SET seal_id = ? WHERE id >= ? AND id <= ? AND tenant_id = ?')
+          .run(sealId, seqStart, seqEnd, tenant_id)
+      })
+      txn()
+      console.log(`[seal] ${tenant_id.slice(0,8)}: ${unsealed.length} receipts, hash=${commitmentHash.slice(0, 16)}`)
+    }
     _receiptsSinceLastSeal = 0
-    console.log(`[seal] Sealed window ${seqStart}-${seqEnd}: ${unsealed.length} receipts, hash=${commitmentHash.slice(0, 16)}`)
   } catch (e: any) {
     console.error('[seal] FAILED:', e.message)
   }
@@ -1702,9 +1713,9 @@ gatewayRouter.get('/receipt-seals', (req: any, res) => {
   const seals = db.prepare(
     `SELECT seal_id, seq_start, seq_end, receipt_count, permit_count, deny_count,
             commitment_hash, scope_note, created_at
-     FROM receipt_window_seals ORDER BY created_at DESC LIMIT ? OFFSET ?`
-  ).all(limit, offset)
-  const total = (db.prepare('SELECT COUNT(*) as c FROM receipt_window_seals').get() as any).c
+     FROM receipt_window_seals WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(tenant.id, limit, offset)
+  const total = (db.prepare('SELECT COUNT(*) as c FROM receipt_window_seals WHERE tenant_id = ?').get(tenant.id) as any).c
 
   res.json({ seals, total, limit, offset })
 })
@@ -1715,12 +1726,12 @@ gatewayRouter.get('/receipt-seals/:sealId', (req: any, res) => {
   const { sealId } = req.params
   const db = getDB()
 
-  const seal = db.prepare('SELECT * FROM receipt_window_seals WHERE seal_id = ?').get(sealId) as any
+  const seal = db.prepare('SELECT * FROM receipt_window_seals WHERE seal_id = ? AND tenant_id = ?').get(sealId, tenant.id) as any
   if (!seal) return res.status(404).json({ error: 'Seal not found' })
 
   const receipts = db.prepare(
-    'SELECT id, receipt_hash, verdict, agent_id, action_type FROM evaluation_receipts WHERE seal_id = ? ORDER BY id'
-  ).all(sealId)
+    'SELECT id, receipt_hash, verdict, agent_id, action_type FROM evaluation_receipts WHERE seal_id = ? AND tenant_id = ? ORDER BY id'
+  ).all(sealId, tenant.id)
 
   // Verification: recompute commitment
   const recomputedHash = createHash('sha256')
@@ -2031,9 +2042,30 @@ Level: **${completenessLevel}**${missing.length > 0 ? `\nMissing: ${missing.join
 })
 
 // ═══════════════════════════════════════
+// CSV helper — pandas-friendly, UTF-8, ISO 8601
+// ═══════════════════════════════════════
+
+function escapeCsvField(val: unknown): string {
+  if (val === null || val === undefined) return ''
+  const s = String(val)
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+    return '"' + s.replace(/"/g, '""') + '"'
+  }
+  return s
+}
+
+function toCsvSection(tableName: string, columns: string[], rows: Record<string, unknown>[]): string {
+  const lines = rows.map(row =>
+    [tableName, ...columns.map(c => escapeCsvField(row[c]))].join(',')
+  )
+  return lines.join('\n')
+}
+
+// ═══════════════════════════════════════
 // Full Governance Evidence Export — 9 sections, single signed artifact
 // NOT a compliance report (no GDPR/EU AI Act article mapping).
 // Proves what was AUTHORIZED and what constraints applied.
+// ?format=csv returns a pandas-friendly CSV with table_name discriminator.
 // ═══════════════════════════════════════
 
 gatewayRouter.get('/governance/export', (req: any, res) => {
@@ -2044,6 +2076,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
     const since = (req.query.since as string) || '2020-01-01T00:00:00Z'
     const until = (req.query.until as string) || now
     const agentFilter = req.query.agent_id as string | undefined
+    const format = (req.query.format as string)?.toLowerCase()
 
     // ── 1: Agent Registry (snapshot) ──
     const agentRows = db.prepare(
@@ -2127,6 +2160,63 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
     // ── 9: Governance Attestations (synthetic — count of attestation queries) ──
     // The gateway doesn't log individual attestation serves yet.
     // Section present with total: 0 — honest, not broken.
+
+    // ── CSV format: 4 tables in a single file with table_name discriminator ──
+    if (format === 'csv') {
+      const csvHeader = 'table_name,col_1,col_2,col_3,col_4,col_5,col_6,col_7,col_8,col_9'
+
+      // 1. policy_evaluations
+      const evalCols = ['evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'timestamp', 'receipt_hash']
+      const csvEvalHeader = ['table_name', ...evalCols].join(',')
+      const csvEvals = evalRows.map((e: any) => {
+        const rcpt = rcptRows.find((r: any) => r.agent_id === e.agent_id && r.created_at === e.created_at)
+        return {
+          evaluation_id: e.id, agent_id: e.agent_id, action_type: e.action_type,
+          scope_checked: e.reason || '', verdict: e.verdict,
+          delegation_id: '', spend_at_evaluation: '',
+          timestamp: e.created_at, receipt_hash: rcpt?.receipt_hash || '',
+        }
+      })
+
+      // 2. revocation_events
+      const revCols = ['revocation_id', 'delegation_id', 'revoked_at', 'cascade_parent_id', 'depth_in_chain']
+      const revokedDels = delRows.filter((d: any) => d.revoked_at)
+      const csvRevocations = revokedDels.map((d: any) => ({
+        revocation_id: d.id, delegation_id: d.id,
+        revoked_at: d.revoked_at, cascade_parent_id: '',
+        depth_in_chain: 0,
+      }))
+
+      // 3. posture_events
+      const postureCols = ['agent_id', 'posture_score', 'continuity_delta', 'timestamp']
+      const csvPosture = postureRows.map((p: any) => ({
+        agent_id: p.agent_id,
+        posture_score: p.new_status === 'active' ? 100 : p.new_status === 'restricted' ? 50 : 0,
+        continuity_delta: '', timestamp: p.created_at,
+      }))
+
+      // 4. receipt_window_seals
+      const sealCols = ['seal_id', 'receipt_count', 'merkle_root', 'sealed_at']
+      const csvSeals = sealRows.map((s: any) => ({
+        seal_id: s.seal_id, receipt_count: s.receipt_count,
+        merkle_root: s.commitment_hash, sealed_at: s.created_at,
+      }))
+
+      // Combined: proper header per table, table_name discriminator
+      const sections: string[] = []
+      // Emit header once, then all rows
+      const header = ['table_name', 'evaluation_id', 'agent_id', 'action_type', 'scope_checked', 'verdict', 'delegation_id', 'spend_at_evaluation', 'timestamp', 'receipt_hash'].join(',')
+      sections.push(header)
+      sections.push(toCsvSection('policy_evaluations', evalCols, csvEvals))
+      sections.push(toCsvSection('revocation_events', revCols, csvRevocations))
+      sections.push(toCsvSection('posture_events', postureCols, csvPosture))
+      sections.push(toCsvSection('receipt_window_seals', sealCols, csvSeals))
+
+      const body = sections.filter(s => s.length > 0).join('\n')
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+      res.setHeader('Content-Disposition', 'attachment; filename="governance-export.csv"')
+      return res.send(body)
+    }
 
     // ── Assemble ──
     const exportData: Record<string, unknown> = {

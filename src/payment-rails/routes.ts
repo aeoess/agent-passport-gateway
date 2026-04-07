@@ -77,8 +77,8 @@ paymentRouter.get('/pay/nano/status/:id', async (req: any, res) => {
         SET status = 'confirmed',
             tx_proof = ?,
             confirmed_at = datetime('now')
-        WHERE id = ?`)
-        .run(invoice.metadata.blockHash as string, invoice.invoiceId)
+        WHERE id = ? AND tenant_id = ?`)
+        .run(invoice.metadata.blockHash as string, invoice.invoiceId, req.tenant.id)
     }
 
     res.json({

@@ -54,7 +54,7 @@ rekorRouter.post('/anchor', async (req, res) => {
   const { receipt_id } = req.body
   if (!receipt_id) return res.status(400).json({ error: 'Required: receipt_id' })
 
-  const tenantId = (req as any).tenantId
+  const tenantId = (req as any).tenant?.id
   const db = getDB()
 
   // Find the receipt across tables
@@ -130,7 +130,7 @@ rekorRouter.post('/anchor', async (req, res) => {
  * List anchor records for this tenant.
  */
 rekorRouter.get('/anchors', (req, res) => {
-  const tenantId = (req as any).tenantId
+  const tenantId = (req as any).tenant?.id
   const db = getDB()
   const anchors = db.prepare(
     'SELECT * FROM rekor_anchors WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100'

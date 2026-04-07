@@ -13,6 +13,7 @@ export function initDB(path: string = './gateway.db'): Database.Database {
   db = new Database(path)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  db.pragma('busy_timeout = 5000')
   createTables()
   return db
 }
@@ -486,6 +487,8 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN posture_reason TEXT`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN posture_updated_at TEXT`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN agent_type TEXT DEFAULT 'general'`) } catch {}
+  try { db.exec(`ALTER TABLE receipt_window_seals ADD COLUMN tenant_id TEXT`) } catch {}
+  db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 }
 
 // ═══════════════════════════════════════

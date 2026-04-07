@@ -184,15 +184,24 @@ export async function handleStripeWebhook(req: any, res: any) {
 
   const db = getDB()
 
+  // H4 + P2-11: Idempotency — reject replayed events (table created at startup in schema.ts)
+  const existing = db.prepare(`SELECT event_id FROM stripe_events WHERE event_id = ?`).get(event.id) as any
+  if (existing) return res.json({ received: true, duplicate: true })
+
+  const validPlans = ['free', 'pro', 'enterprise']
+
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object as Stripe.Checkout.Session
       const tenantId = session.metadata?.tenant_id
       const plan = session.metadata?.plan
-      if (tenantId && plan) {
+      // H3: validate plan against allowlist
+      if (tenantId && plan && validPlans.includes(plan)) {
         db.prepare(`UPDATE tenants SET plan = ?, stripe_customer_id = ? WHERE id = ?`)
           .run(plan, session.customer as string, tenantId)
         console.log(`Tenant ${tenantId} upgraded to ${plan}`)
+      } else if (plan && !validPlans.includes(plan)) {
+        console.error(`[SECURITY] Invalid plan "${plan}" in webhook metadata for tenant ${tenantId}`)
       }
       break
     }
@@ -201,9 +210,13 @@ export async function handleStripeWebhook(req: any, res: any) {
       const sub = event.data.object as Stripe.Subscription
       const tenantId = sub.metadata?.tenant_id
       if (tenantId && sub.status === 'active') {
-        // Plan might have changed via Stripe portal
-        const plan = sub.metadata?.plan || 'pro'
-        db.prepare(`UPDATE tenants SET plan = ? WHERE id = ?`).run(plan, tenantId)
+        // P2-7: validate plan, do NOT default to 'pro'
+        const plan = sub.metadata?.plan
+        if (plan && validPlans.includes(plan)) {
+          db.prepare(`UPDATE tenants SET plan = ? WHERE id = ?`).run(plan, tenantId)
+        } else if (plan) {
+          console.error(`[SECURITY] Invalid plan "${plan}" in subscription.updated for tenant ${tenantId}`)
+        }
       }
       break
     }
@@ -219,9 +232,10 @@ export async function handleStripeWebhook(req: any, res: any) {
     }
 
     default:
-      // Unhandled event type — ignore
       break
   }
 
+  // P2-11: Mark event processed AFTER successful handling (crash-safe)
+  db.prepare(`INSERT INTO stripe_events (event_id) VALUES (?)`).run(event.id)
   res.json({ received: true })
 }
