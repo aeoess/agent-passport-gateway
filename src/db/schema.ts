@@ -485,6 +485,7 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN restricted_scopes TEXT`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN posture_reason TEXT`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN posture_updated_at TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN agent_type TEXT DEFAULT 'general'`) } catch {}
 }
 
 // ═══════════════════════════════════════

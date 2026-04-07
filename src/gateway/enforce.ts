@@ -117,6 +117,16 @@ async function getScopeAuthorizes() {
   return _scopeAuthorizes
 }
 
+// Agent type constraints (Primitive #12)
+const AGENT_TYPE_CONSTRAINTS: Record<string, { blocked_scopes: string[]; max_evaluations_per_hour?: number }> = {
+  explorer: { blocked_scopes: ['admin:delete', 'admin:write', 'commerce:send'], max_evaluations_per_hour: 100 },
+  planner: { blocked_scopes: ['admin:delete', 'commerce:send'] },
+  reviewer: { blocked_scopes: ['admin:delete', 'admin:write'] },
+  monitor: { blocked_scopes: ['admin:delete', 'admin:write', 'commerce:send', 'data:write'], max_evaluations_per_hour: 500 },
+  executor: { blocked_scopes: [] },
+  general: { blocked_scopes: [] },
+}
+
 // SDK recovery evaluation — consulted on denials
 let _evaluateRecovery: ((opts: any) => any) | null = null
 async function getEvaluateRecovery() {
@@ -335,6 +345,20 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     }
   }
 
+  // Agent type enforcement (Primitive #12)
+  if (verdict === 'permit' && agent.agent_type && agent.agent_type !== 'general') {
+    const typeConstraints = AGENT_TYPE_CONSTRAINTS[agent.agent_type as string]
+    if (typeConstraints) {
+      for (const blocked of typeConstraints.blocked_scopes) {
+        if (scope_required === blocked || scope_required.startsWith(blocked + ':')) {
+          verdict = 'deny'
+          violations.push(`Agent type "${agent.agent_type}" is not permitted scope "${scope_required}"`)
+          break
+        }
+      }
+    }
+  }
+
   reason = verdict === 'permit'
     ? `Permitted: scope "${scope_required}" authorized`
     : `Denied: ${violations.join('; ')}`
@@ -505,26 +529,34 @@ gatewayRouter.post('/revoke', (req: any, res) => {
 gatewayRouter.get('/agents', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const agents = db.prepare(`SELECT agent_id, public_key, did, name, status, created_at FROM agents WHERE tenant_id = ?`).all(tenant.id)
-  res.json({ agents, count: agents.length })
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
+  const offset = parseInt(req.query.offset as string) || 0
+  const [sortCol, sortDir] = ((req.query.sort as string) || 'created_at:desc').split(':')
+  const safeCol = ['created_at', 'agent_id', 'status', 'name'].includes(sortCol) ? sortCol : 'created_at'
+  const safeDir = sortDir === 'asc' ? 'ASC' : 'DESC'
+  const items = db.prepare(`SELECT agent_id, public_key, did, name, status, agent_type, created_at FROM agents WHERE tenant_id = ? ORDER BY ${safeCol} ${safeDir} LIMIT ? OFFSET ?`).all(tenant.id, limit, offset)
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM agents WHERE tenant_id = ?`).get(tenant.id) as any).c
+  res.json({ agents: items, total, limit, offset, has_more: offset + items.length < total })
 })
 
 // POST /api/v1/agents — Register Agent
 gatewayRouter.post('/agents', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const { agent_id, public_key, did, name } = req.body
+  const { agent_id, public_key, did, name, agent_type } = req.body
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
+  const validTypes = ['general', 'explorer', 'planner', 'executor', 'reviewer', 'monitor']
+  const safeType = validTypes.includes(agent_type) ? agent_type : 'general'
   const limitCheck = checkAgentLimit(tenant.id, tenant.plan)
   if (!limitCheck.allowed) {
     return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
-  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, agent_id, public_key, did || null, name || null)
-  try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did } }) } catch {}
+  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType)
+  try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
 })
 
@@ -763,27 +795,38 @@ gatewayRouter.post('/delegations', (req: any, res) => {
 gatewayRouter.get('/delegations', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const delegations = db.prepare(`SELECT * FROM delegations WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
-  res.json({ delegations, count: delegations.length })
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
+  const offset = parseInt(req.query.offset as string) || 0
+  const [sortCol, sortDir] = ((req.query.sort as string) || 'created_at:desc').split(':')
+  const safeCol = ['created_at', 'child_agent_id', 'parent_agent_id', 'status'].includes(sortCol) ? sortCol : 'created_at'
+  const safeDir = sortDir === 'asc' ? 'ASC' : 'DESC'
+  const items = db.prepare(`SELECT * FROM delegations WHERE tenant_id = ? ORDER BY ${safeCol} ${safeDir} LIMIT ? OFFSET ?`).all(tenant.id, limit, offset)
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM delegations WHERE tenant_id = ?`).get(tenant.id) as any).c
+  res.json({ delegations: items, total, limit, offset, has_more: offset + items.length < total })
 })
 
 // GET /api/v1/audit — Audit Trail
 gatewayRouter.get('/audit', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const limit = parseInt(req.query.limit as string) || 100
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
   const offset = parseInt(req.query.offset as string) || 0
-  const agent = req.query.agent_id as string
+  const [sortCol, sortDir] = ((req.query.sort as string) || 'created_at:desc').split(':')
+  const safeCol = ['created_at', 'agent_id', 'verdict', 'action_type', 'scope_required'].includes(sortCol) ? sortCol : 'created_at'
+  const safeDir = sortDir === 'asc' ? 'ASC' : 'DESC'
 
-  let query = `SELECT e.*, r.signature, r.execution_result FROM policy_evaluations e LEFT JOIN receipts r ON r.evaluation_id = e.id WHERE e.tenant_id = ?`
+  const where: string[] = ['e.tenant_id = ?']
   const params: any[] = [tenant.id]
-  if (agent) { query += ` AND e.agent_id = ?`; params.push(agent) }
-  query += ` ORDER BY e.created_at DESC LIMIT ? OFFSET ?`
-  params.push(limit, offset)
+  if (req.query.agent_id) { where.push('e.agent_id = ?'); params.push(req.query.agent_id) }
+  if (req.query.verdict) { where.push('e.verdict = ?'); params.push(req.query.verdict) }
+  if (req.query.action_type) { where.push('e.action_type = ?'); params.push(req.query.action_type) }
+  if (req.query.from) { where.push('e.created_at >= ?'); params.push(req.query.from) }
+  if (req.query.to) { where.push('e.created_at <= ?'); params.push(req.query.to) }
 
-  const entries = db.prepare(query).all(...params)
-  const total = db.prepare(`SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ?`).get(tenant.id) as any
-  res.json({ entries, total: total.c, limit, offset })
+  const whereClause = where.join(' AND ')
+  const entries = db.prepare(`SELECT e.*, r.signature, r.execution_result FROM policy_evaluations e LEFT JOIN receipts r ON r.evaluation_id = e.id WHERE ${whereClause} ORDER BY e.${safeCol} ${safeDir} LIMIT ? OFFSET ?`).all(...params, limit, offset)
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM policy_evaluations e WHERE ${whereClause}`).get(...params) as any).c
+  res.json({ entries, total, limit, offset, has_more: offset + entries.length < total })
 })
 
 // GET /api/v1/dashboard — Dashboard Summary
@@ -895,8 +938,11 @@ gatewayRouter.post('/data-sources', (req: any, res) => {
 gatewayRouter.get('/data-sources', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const sources = db.prepare(`SELECT * FROM data_sources WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
-  res.json({ sources, count: sources.length })
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
+  const offset = parseInt(req.query.offset as string) || 0
+  const items = db.prepare(`SELECT * FROM data_sources WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(tenant.id, limit, offset)
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM data_sources WHERE tenant_id = ?`).get(tenant.id) as any).c
+  res.json({ sources: items, total, limit, offset, has_more: offset + items.length < total })
 })
 
 // POST /api/v1/access-receipts — Record Data Access
@@ -1058,8 +1104,11 @@ gatewayRouter.post('/settlements', (req: any, res) => {
 gatewayRouter.get('/settlements', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const settlements = db.prepare(`SELECT id, period_start, period_end, total_amount, created_at FROM settlements WHERE tenant_id = ? ORDER BY created_at DESC`).all(tenant.id)
-  res.json({ settlements, count: settlements.length })
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
+  const offset = parseInt(req.query.offset as string) || 0
+  const items = db.prepare(`SELECT id, period_start, period_end, total_amount, created_at FROM settlements WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(tenant.id, limit, offset)
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM settlements WHERE tenant_id = ?`).get(tenant.id) as any).c
+  res.json({ settlements: items, total, limit, offset, has_more: offset + items.length < total })
 })
 
 // ═══════════════════════════════════════
@@ -1151,15 +1200,22 @@ gatewayRouter.post('/derivations', (req: any, res) => {
 gatewayRouter.get('/derivations', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100)
+  const offset = parseInt(req.query.offset as string) || 0
   const agent = req.query.agent_id as string
   let query = `SELECT * FROM derivations WHERE tenant_id = ?`
+  const countQuery = `SELECT COUNT(*) as c FROM derivations WHERE tenant_id = ?`
   const params: any[] = [tenant.id]
-  if (agent) { query += ` AND agent_id = ?`; params.push(agent) }
-  query += ` ORDER BY created_at DESC LIMIT 50`
+  const countParams: any[] = [tenant.id]
+  if (agent) { query += ` AND agent_id = ?`; countQuery; params.push(agent); countParams.push(agent) }
+  query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  params.push(limit, offset)
   const rows = db.prepare(query).all(...params)
-  res.json({ derivations: (rows as any[]).map((d: any) => ({
+  const total = (db.prepare(agent ? `SELECT COUNT(*) as c FROM derivations WHERE tenant_id = ? AND agent_id = ?` : countQuery).get(...countParams) as any).c
+  const items = (rows as any[]).map((d: any) => ({
     ...d, source_ids: JSON.parse(d.source_ids || '[]'), access_receipt_ids: JSON.parse(d.access_receipt_ids || '[]'),
-  })), count: rows.length })
+  }))
+  res.json({ derivations: items, total, limit, offset, has_more: offset + items.length < total })
 })
 
 
@@ -1544,7 +1600,7 @@ gatewayRouter.get('/receipts/:agentId', (req: any, res) => {
     `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ?`
   ).get(tenant.id, agentId) as any).c
 
-  res.json({ receipts: rows, total, limit, offset })
+  res.json({ receipts: rows, total, limit, offset, has_more: offset + rows.length < total })
 })
 
 // GET /api/v1/receipts/:agentId/denials — denial receipts only (proof of restraint)
@@ -1562,7 +1618,7 @@ gatewayRouter.get('/receipts/:agentId/denials', (req: any, res) => {
     `SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny'`
   ).get(tenant.id, agentId) as any).c
 
-  res.json({ denials: rows, total, limit, offset })
+  res.json({ denials: rows, total, limit, offset, has_more: offset + rows.length < total })
 })
 
 // ═══════════════════════════════════════
