@@ -17,6 +17,7 @@ import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 import { getEventBus } from './events.js'
+import { checkAgentLimit, checkEvaluationLimit } from '../billing/limits.js'
 
 function safeError(e: any, context: string): { error: string; ref: string } {
   const ref = randomUUID().slice(0, 8)
@@ -209,6 +210,12 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   try {
   const tenant: Tenant = req.tenant
   const start = Date.now()
+
+  // Billing limit check
+  const evalLimit = checkEvaluationLimit(tenant.id, tenant.plan)
+  if (!evalLimit.allowed) {
+    return res.status(429).json({ error: evalLimit.reason, current: evalLimit.current, limit: evalLimit.limit })
+  }
 
   // Usage check
   const usageCheck = checkUsageLimit(tenant)
@@ -510,12 +517,9 @@ gatewayRouter.post('/agents', (req: any, res) => {
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
-  const limit = PLAN_LIMITS[tenant.plan as keyof typeof PLAN_LIMITS].maxAgents
-  if (limit > 0) {
-    const count = db.prepare(`SELECT COUNT(*) as c FROM agents WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
-    if (count.c >= limit) {
-      return res.status(429).json({ error: `Agent limit reached: ${count.c}/${limit}. Upgrade at aeoess.com/pricing` })
-    }
+  const limitCheck = checkAgentLimit(tenant.id, tenant.plan)
+  if (!limitCheck.allowed) {
+    return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
   db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name) VALUES (?, ?, ?, ?, ?, ?)`)

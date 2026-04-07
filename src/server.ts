@@ -66,6 +66,7 @@ import { walletRouter } from './payment-rails/wallet-routes.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
 import { eventsRouter, getEventBus } from './gateway/events.js'
+import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -75,6 +76,9 @@ const app = express()
 // Security
 app.use(helmet())
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }))
+// Stripe webhook needs raw body (must be before express.json)
+app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook)
+
 app.use(express.json({ limit: '1mb' }))
 
 // Health check (no auth)
@@ -902,6 +906,7 @@ app.use('/api/v1', authMiddleware, walletRouter)
 app.use('/api/v1', authMiddleware, rekorRouter)
 app.use('/api/v1', authMiddleware, finopsRouter)
 app.use('/api/v1', authMiddleware, eventsRouter)
+app.use('/api/v1', authMiddleware, billingRouter)
 
 // 404
 app.use((_req, res) => {
