@@ -933,8 +933,8 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
   const agent = db.prepare(`SELECT agent_id FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agentId) as any
   if (!agent) return res.status(404).json({ error: `Agent "${agentId}" not found` })
 
-  // Temporal windowing: ?window_days=30 limits to last 30 days
-  const windowDays = parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0')
+  // Temporal decay window: ?window_days=30, env TRUST_DECAY_WINDOW_DAYS (default 7)
+  const windowDays = parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_DECAY_WINDOW_DAYS || '7')
   const timeFilter = windowDays > 0 ? ` AND created_at > datetime('now', '-${windowDays} days')` : ''
 
   // Overall stats
