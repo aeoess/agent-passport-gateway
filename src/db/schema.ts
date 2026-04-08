@@ -445,6 +445,31 @@ function createTables() {
 
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON agent_sessions(tenant_id, agent_id);
 
+    -- Behavioral Memory Objects (BMO — Bring Your Own Memory)
+    CREATE TABLE IF NOT EXISTS behavioral_memory_objects (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      principal_id TEXT NOT NULL,
+      issuer_id TEXT NOT NULL,
+      pattern_category TEXT NOT NULL,
+      pattern_description TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      observation_count INTEGER NOT NULL DEFAULT 1,
+      observation_window_start TEXT NOT NULL,
+      observation_window_end TEXT NOT NULL,
+      derivation_source TEXT NOT NULL,
+      retention_ttl INTEGER,
+      expires_at TEXT,
+      relational_entities TEXT NOT NULL DEFAULT '[]',
+      portable INTEGER NOT NULL DEFAULT 0,
+      issuer_signature TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bmo_principal ON behavioral_memory_objects(tenant_id, principal_id);
+    CREATE INDEX IF NOT EXISTS idx_bmo_issuer ON behavioral_memory_objects(tenant_id, issuer_id);
+    CREATE INDEX IF NOT EXISTS idx_bmo_expires ON behavioral_memory_objects(expires_at);
+
     -- Coordination (Nate Primitive #4: Workflow State)
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,

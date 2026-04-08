@@ -69,6 +69,7 @@ import { eventsRouter, getEventBus } from './gateway/events.js'
 import { sessionsRouter } from './gateway/sessions.js'
 import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
 import { coordinationRouter } from './gateway/coordination.js'
+import { bmoRouter } from './gateway/bmo.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
@@ -1036,6 +1037,7 @@ app.use('/api/v1', authMiddleware, eventsRouter)
 app.use('/api/v1', authMiddleware, sessionsRouter)
 app.use('/api/v1', authMiddleware, billingRouter)
 app.use('/api/v1', authMiddleware, coordinationRouter)
+app.use('/api/v1', authMiddleware, bmoRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
