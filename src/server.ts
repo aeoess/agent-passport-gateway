@@ -566,18 +566,24 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   // Optional: enrich with RNWY behavioral trust signal
   if (process.env.RNWY_TRUST_ENABLED === 'true') {
     try {
-      const rnwyRes = await fetch(`https://rnwy.com/api/trust-check?agentId=${encodeURIComponent(agentId)}&chain=base`, {
-        signal: AbortSignal.timeout(2000)
-      })
-      if (rnwyRes.ok) {
-        const rnwy = await rnwyRes.json() as any
-        ;(profile as any).behavioral_trust = {
-          source: 'rnwy',
-          score: rnwy.signed?.score ?? null,
-          tier: rnwy.signed?.tier ?? null,
-          sybil_severity: rnwy.signed?.sybilSeverity ?? null,
-          badges: rnwy.signed?.badges ?? [],
-          fetched_at: new Date().toISOString(),
+      // RNWY uses numeric IDs — check if agent has rnwy_id in metadata
+      const rnwyMeta = db.prepare(`SELECT metadata FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenantId, agentId) as any
+      const meta = rnwyMeta?.metadata ? JSON.parse(rnwyMeta.metadata) : {}
+      const rnwyId = meta?.rnwy_id
+      if (rnwyId) {
+        const rnwyRes = await fetch(`https://rnwy.com/api/trust-check?id=${encodeURIComponent(rnwyId)}&chain=base`, {
+          signal: AbortSignal.timeout(2000)
+        })
+        if (rnwyRes.ok) {
+          const rnwy = await rnwyRes.json() as any
+          ;(profile as any).behavioral_trust = {
+            source: 'rnwy',
+            score: rnwy.score ?? null,
+            tier: rnwy.tier ?? null,
+            sybil_severity: rnwy.sybilSeverity ?? null,
+            badges: rnwy.badges?.earned ?? [],
+            fetched_at: new Date().toISOString(),
+          }
         }
       }
     } catch { /* RNWY unavailable — profile still works without it */ }
