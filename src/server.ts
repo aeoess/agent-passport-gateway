@@ -70,6 +70,8 @@ import { sessionsRouter } from './gateway/sessions.js'
 import { billingRouter, handleStripeWebhook } from './billing/stripe.js'
 import { coordinationRouter } from './gateway/coordination.js'
 import { bmoRouter } from './gateway/bmo.js'
+import { providerAttestationRouter } from './gateway/provider-attestation.js'
+import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
@@ -1038,6 +1040,8 @@ app.use('/api/v1', authMiddleware, sessionsRouter)
 app.use('/api/v1', authMiddleware, billingRouter)
 app.use('/api/v1', authMiddleware, coordinationRouter)
 app.use('/api/v1', authMiddleware, bmoRouter)
+app.use('/api/v1', authMiddleware, providerAttestationRouter)
+app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
