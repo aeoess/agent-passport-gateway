@@ -6,7 +6,8 @@
   "scripts": {
     "build": "npx tsc",
     "start": "node dist/server.js",
-    "dev": "npx tsx src/server.ts"
+    "dev": "npx tsx src/server.ts",
+    "test": "npx tsx --test test/**/*.test.ts"
   },
   "keywords": [],
   "author": "Tymofii Pidlisnyi",
