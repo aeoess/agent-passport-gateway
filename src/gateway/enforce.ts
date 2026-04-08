@@ -358,6 +358,37 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     return res.status(404).json({ error: `Agent "${agent_id}" not active (status: ${agent.status})` })
   }
 
+  // Entity binding check (vessenes integration — A2A#1575)
+  if (agent.entity_id && agent.entity_verification_endpoint) {
+    try {
+      const entityRes = await fetch(agent.entity_verification_endpoint, {
+        signal: AbortSignal.timeout(3000)
+      })
+      if (entityRes.ok) {
+        const entity = await entityRes.json() as any
+        if (entity.status !== 'active') {
+          const evalId = randomUUID()
+          const durationMs = Date.now() - start
+          db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Entity "${agent.entity_id}" is ${entity.status}`, durationMs, deriveTaskClass(action_type))
+          return res.json({ evaluation_id: evalId, verdict: 'deny', reason: `Entity binding: entity "${agent.entity_id}" status is "${entity.status}"`, violations: ['entity_binding_violation'], duration_ms: durationMs, agent_id, action: { type: action_type, scope_required } })
+        }
+        if (entity.authority_ceiling && Array.isArray(entity.authority_ceiling)) {
+          const scopeRoot = scope_required.split(':')[0]
+          if (!entity.authority_ceiling.includes(scopeRoot) && !entity.authority_ceiling.includes(scope_required)) {
+            const evalId = randomUUID()
+            const durationMs = Date.now() - start
+            db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+              .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Scope "${scope_required}" exceeds entity ceiling [${entity.authority_ceiling.join(', ')}]`, durationMs, deriveTaskClass(action_type))
+            return res.json({ evaluation_id: evalId, verdict: 'deny', reason: `Entity binding: scope "${scope_required}" exceeds entity authority ceiling`, violations: ['entity_ceiling_exceeded'], duration_ms: durationMs, agent_id, action: { type: action_type, scope_required } })
+          }
+        }
+      }
+    } catch {
+      console.warn(`[entity-binding] Failed to reach ${agent.entity_verification_endpoint} for agent ${agent_id}`)
+    }
+  }
+
   // Key rotation enforcement: if request includes signing_key, check against retired keys.
   // A compromised old key MUST NOT authorize actions after rotation completes.
   const signingKey = req.body.signing_key as string | undefined
@@ -636,7 +667,7 @@ gatewayRouter.get('/agents', (req: any, res) => {
 gatewayRouter.post('/agents', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const { agent_id, public_key, did, name, agent_type } = req.body
+  const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata } = req.body
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
@@ -647,9 +678,9 @@ gatewayRouter.post('/agents', (req: any, res) => {
     return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
-  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType)
-  try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType } }) } catch {}
+  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null)
+  try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType, entity_id } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
 })
 

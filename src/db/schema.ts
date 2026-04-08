@@ -489,6 +489,9 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN agent_type TEXT DEFAULT 'general'`) } catch {}
   try { db.exec(`ALTER TABLE receipt_window_seals ADD COLUMN tenant_id TEXT`) } catch {}
   try { db.exec(`ALTER TABLE policy_evaluations ADD COLUMN task_class TEXT DEFAULT ''`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN entity_id TEXT DEFAULT NULL`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN entity_verification_endpoint TEXT DEFAULT NULL`) } catch {}
+  try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 }
 
