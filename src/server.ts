@@ -517,6 +517,30 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     retired_keys: latestRotation.state === 'activated' ? [latestRotation.old_key] : [],
   } : null
 
+  // wallet_ref: agent-native (structural) wallet binding from the SDK's
+  // BoundWallet primitive. Composes with issuer-attested (behavioral)
+  // wallet binding from the insumer-examples ecosystem. Source of truth
+  // is the agent passport's bound_wallets field, projected through the
+  // agent's stored metadata.bound_wallets when available. Empty array
+  // when no structural binding has been registered with this gateway.
+  let walletRef: Array<{ chain: string; address: string; bound_at: string; binding_sig: string }> = []
+  try {
+    if (agent.metadata) {
+      const meta = typeof agent.metadata === 'string' ? JSON.parse(agent.metadata) : agent.metadata
+      const bw = meta?.bound_wallets
+      if (Array.isArray(bw)) {
+        walletRef = bw
+          .filter((w: any) => w && typeof w.chain === 'string' && typeof w.address === 'string')
+          .map((w: any) => ({
+            chain: w.chain,
+            address: w.address,
+            bound_at: w.bound_at || '',
+            binding_sig: w.binding_signature || w.binding_sig || '',
+          }))
+      }
+    }
+  } catch { /* metadata parse failure — leave walletRef empty */ }
+
   const profile = {
     agent_id: agentId,
     grade,
@@ -526,6 +550,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     risk_level: riskLevel,
     has_delegation: !!delegation,
     has_wallet: !!wallet,
+    wallet_ref: walletRef,
     key_rotation: keyRotation,
     active_constraints: delegation ? {
       scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
