@@ -57,6 +57,8 @@ import cors from 'cors'
 import helmet from 'helmet'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { initDB, getDB, PLAN_LIMITS } from './db/schema.js'
+import { lookupByAddress, rebuildFromDb as rebuildWalletReverseIndex } from './gateway/wallet-reverse-index.js'
+import { buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
 import { authMiddleware, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
@@ -421,7 +423,27 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     res.setHeader('X-APS-Warning', `Ambiguous: ${allMatches.length} tenants have agent "${agentId}". Showing oldest.`)
   }
 
-  if (!agent) {
+  // Path-form fall-through for SkyeProfile and similar wallet-first
+  // orchestrators: if :agentId looks like an EVM address and no agent
+  // matches, try the wallet → agent reverse index. Promised to
+  // douglasborthwick-crypto on insumer-examples#1.
+  let resolvedAgent: any = agent
+  let matchedWalletEntryForFallthrough: { chain: string; address: string; bound_at: string; binding_sig: string } | undefined
+  if (!resolvedAgent && /^0x[a-fA-F0-9]{40}$/.test(agentId)) {
+    const hit = lookupByAddress(agentId)
+    if (hit) {
+      const fetched = db.prepare(
+        `SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ? AND status = 'active' LIMIT 1`
+      ).get(hit.tenant_id, hit.agent_id) as any
+      if (fetched) {
+        resolvedAgent = fetched
+        agentId = hit.agent_id
+        matchedWalletEntryForFallthrough = hit.entry
+      }
+    }
+  }
+
+  if (!resolvedAgent) {
     if (req.query.signal === 'governance_attestation') {
       return res.status(404).json({
         error: 'Agent not found',
@@ -433,163 +455,20 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     return res.json(notFound)
   }
 
-  const tenantId = agent.tenant_id
+  const tenantId = resolvedAgent.tenant_id
 
-  // Delegation
-  const delegation = db.prepare(
-    `SELECT scope, spend_limit, spend_used FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
-  ).get(tenantId, agentId) as any
-
-  // Wallet
-  const wallet = db.prepare(
-    `SELECT status FROM agent_wallets WHERE tenant_id = ? AND agent_id = ? LIMIT 1`
-  ).get(tenantId, agentId) as any
-
-  // Dossier grade (if exists)
-  const dossier = db.prepare(
-    `SELECT passport_grade FROM issuance_dossiers WHERE tenant_id = ? AND passport_id = ? ORDER BY created_at DESC LIMIT 1`
-  ).get(tenantId, agentId) as any
-
-  // Grade: dossier if exists, else heuristic
-  let grade = 0
-  if (dossier) {
-    grade = dossier.passport_grade
-  } else {
-    const evalCount = (db.prepare(
-      `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
-    ).get(tenantId, agentId) as any).c
-    const receiptCount = (db.prepare(
-      `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ? AND agent_id = ?`
-    ).get(tenantId, agentId) as any).c
-    if (agent.status === 'active') grade = 1
-    if (delegation) grade = 2
-    if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3
-  }
-
-  const gradeLabels: Record<number, string> = { 0: 'unknown', 1: 'registered', 2: 'endorsed', 3: 'established' }
-  const trustLabels: Record<number, string> = { 0: 'unknown', 1: 'registered', 2: 'endorsed', 3: 'established' }
-
-  // Risk — simple denial rate only (no internal metrics)
-  const deniedCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'DENY'`
-  ).get(tenantId, agentId) as any).c
-  const evalTotal = (db.prepare(
-    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`
-  ).get(tenantId, agentId) as any).c
-  const denialRate = evalTotal > 0 ? Math.round((deniedCount / evalTotal) * 100) / 100 : 0
-  const riskLevel = denialRate > 0.3 ? 'high' : denialRate > 0.1 ? 'medium' : 'low'
-
-  const ageDays = Math.floor((Date.now() - new Date(agent.created_at).getTime()) / (1000 * 60 * 60 * 24))
-
-  // Context continuity scoring
-  const continuity = computeContinuityScore(db, tenantId, agentId, ageDays)
-
-  // Freshness signals (from 0xbrainkid on NVIDIA/OpenShell#682)
-  const lastEval = db.prepare(
-    `SELECT created_at FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1`
-  ).get(tenantId, agentId) as any
-  const lastActivityAt = lastEval ? lastEval.created_at : agent.created_at
-  const gradeComputedAt = dossier ? dossier.created_at : agent.created_at
-
-  // Key rotation: check if agent has pending/active rotations
-  const latestRotation = db.prepare(
-    `SELECT * FROM key_rotations WHERE tenant_id = ? AND agent_id = ? ORDER BY created_at DESC LIMIT 1`
-  ).get(tenantId, agentId) as any
-
-  // If a planned rotation's activation_time has passed, auto-transition to activated
-  if (latestRotation && latestRotation.state === 'announced' && latestRotation.mode === 'planned') {
-    const activationTime = new Date(latestRotation.activation_time)
-    if (new Date() >= activationTime) {
-      db.prepare(`UPDATE key_rotations SET state = 'activated', completed_at = datetime('now') WHERE id = ?`)
-        .run(latestRotation.id)
-      db.prepare(`UPDATE agents SET public_key = ? WHERE tenant_id = ? AND agent_id = ?`)
-        .run(latestRotation.new_key, tenantId, agentId)
-      latestRotation.state = 'activated'
-    }
-  }
-
-  const keyRotation = latestRotation ? {
-    mode: latestRotation.mode,
-    state: latestRotation.state,
-    old_key: latestRotation.old_key,
-    new_key: latestRotation.new_key,
-    activation_time: latestRotation.activation_time,
-    retired_keys: latestRotation.state === 'activated' ? [latestRotation.old_key] : [],
-  } : null
-
-  // wallet_ref: agent-native (structural) wallet binding from the SDK's
-  // BoundWallet primitive. Composes with issuer-attested (behavioral)
-  // wallet binding from the insumer-examples ecosystem. Source of truth
-  // is the agent passport's bound_wallets field, projected through the
-  // agent's stored metadata.bound_wallets when available. Empty array
-  // when no structural binding has been registered with this gateway.
-  let walletRef: Array<{ chain: string; address: string; bound_at: string; binding_sig: string }> = []
-  try {
-    if (agent.metadata) {
-      const meta = typeof agent.metadata === 'string' ? JSON.parse(agent.metadata) : agent.metadata
-      const bw = meta?.bound_wallets
-      if (Array.isArray(bw)) {
-        walletRef = bw
-          .filter((w: any) => w && typeof w.chain === 'string' && typeof w.address === 'string')
-          .map((w: any) => ({
-            chain: w.chain,
-            address: w.address,
-            bound_at: w.bound_at || '',
-            binding_sig: w.binding_signature || w.binding_sig || '',
-          }))
-      }
-    }
-  } catch { /* metadata parse failure — leave walletRef empty */ }
-
-  const profile = {
-    agent_id: agentId,
-    grade,
-    grade_label: gradeLabels[grade] || 'unknown',
-    trust: trustLabels[grade] || 'unknown',
-    age_days: ageDays,
-    risk_level: riskLevel,
-    has_delegation: !!delegation,
-    has_wallet: !!wallet,
-    wallet_ref: walletRef,
-    key_rotation: keyRotation,
-    active_constraints: delegation ? {
-      scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
-      spend_limit: delegation.spend_limit || null,
-      spend_used: delegation.spend_used || 0,
-    } : null,
-    grade_computed_at: gradeComputedAt,
-    last_activity_at: lastActivityAt,
-    attestation_bundle_hash: dossier ? dossier.attestation_bundle_hash : null,
-    context_continuity: {
-      score: continuity.score,
-      context_break: continuity.context_break,
-      signals: continuity.signals,
-    },
-    // DID binding status
-    did_binding: agent.public_key && /^[0-9a-fA-F]{64}$/.test(agent.public_key) ? 'bound'
-      : agent.public_key ? 'unverified' : 'none',
-    did_method: agent.did ? (agent.did.split(':')[1] || null) : null,
-    trust_reliability: agent.public_key && /^[0-9a-fA-F]{64}$/.test(agent.public_key) ? 'high' : 'low',
-    wallet_address: walletParam || null,
-    wallet_chain: walletParam ? chainParam : null,
-    found: true,
-    queried_at: new Date().toISOString(),
-  }
-
-  // Per-task-class trust breakdown (public — no sensitive details)
-  try {
-    const windowDays = parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0')
-    const timeFilter = windowDays > 0 ? ` AND created_at > datetime('now', '-${windowDays} days')` : ''
-    const classRows = db.prepare(
-      `SELECT task_class, COUNT(*) as evals, SUM(CASE WHEN verdict = 'permit' THEN 1 ELSE 0 END) as permits
-       FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND task_class != ''${timeFilter} GROUP BY task_class`
-    ).all(tenantId, agentId) as any[]
-    if (classRows.length > 0) {
-      (profile as any).trust_by_task_class = Object.fromEntries(
-        classRows.map((r: any) => [r.task_class, { evaluations: r.evals, trust_score: r.evals > 0 ? Math.round((r.permits / r.evals) * 100) / 100 : 0 }])
-      )
-    }
-  } catch { /* task_class column may not exist yet */ }
+  const profile: TrustProfile = buildAgentTrustProfile({
+    db,
+    agent: resolvedAgent,
+    agentId,
+    walletParam,
+    chainParam,
+    matchedWalletEntry: matchedWalletEntryForFallthrough,
+    windowDays: parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0'),
+    computeContinuityScore,
+  })
+  const grade = profile._grade_for_signal!
+  const delegation = profile._delegation_for_signal
 
   // Optional: enrich with RNWY behavioral trust signal
   if (process.env.RNWY_TRUST_ENABLED === 'true') {
@@ -617,8 +496,9 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     } catch { /* RNWY unavailable — profile still works without it */ }
   }
 
-  // Cache
-  trustProfileCache.set(agentId, { data: profile, expires: Date.now() + TRUST_CACHE_TTL })
+  // Cache (strip internal _-prefixed fields before storing)
+  const publicProfile = publicizeProfile(profile)
+  trustProfileCache.set(agentId, { data: publicProfile, expires: Date.now() + TRUST_CACHE_TTL })
 
   // Signal projection: ?signal=governance_attestation returns a signed
   // governance_attestation envelope per
@@ -661,7 +541,74 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     })
   }
 
-  res.json(profile)
+  res.json(publicProfile)
+})
+
+// ──────────────────────────────────────────────────────────────────
+// GET /api/v1/public/trust/by-wallet/:address
+// ──────────────────────────────────────────────────────────────────
+// Wallet → agent reverse lookup. Public, no auth, same rate as the
+// agent_id endpoint. Promised to douglasborthwick-crypto on
+// insumer-examples#1 for SkyeProfile orchestrator integration.
+// ──────────────────────────────────────────────────────────────────
+app.get('/api/v1/public/trust/by-wallet/:address', async (req, res) => {
+  try {
+    await publicTrustLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' })
+  }
+
+  const rawAddress = (req.params.address || '').trim()
+
+  // Strict 0x address validation. Refuse early before scanning.
+  if (!/^0x[a-fA-F0-9]{40}$/.test(rawAddress)) {
+    return res.status(400).json({
+      error: 'Invalid address format',
+      hint: 'Expected 0x followed by 40 hex characters',
+    })
+  }
+
+  res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
+  res.setHeader('CDN-Cache-Control', 'public, max-age=60, stale-while-revalidate=300, stale-if-error=600')
+
+  const hit = lookupByAddress(rawAddress)
+  if (!hit) {
+    // Uniform shape regardless of whether the address is unknown or
+    // simply not bound. Don't leak existence of agents the caller does
+    // not already know about.
+    return res.json({
+      found: false,
+      reason: 'no_wallet_binding',
+      queried_address: rawAddress,
+      queried_at: new Date().toISOString(),
+    })
+  }
+
+  const db = getDB()
+  const agent = db.prepare(
+    `SELECT * FROM agents WHERE tenant_id = ? AND agent_id = ? AND status = 'active' LIMIT 1`
+  ).get(hit.tenant_id, hit.agent_id) as any
+
+  if (!agent) {
+    // Index pointed at a row that no longer exists. Treat as not bound.
+    return res.json({
+      found: false,
+      reason: 'no_wallet_binding',
+      queried_address: rawAddress,
+      queried_at: new Date().toISOString(),
+    })
+  }
+
+  const profile = buildAgentTrustProfile({
+    db,
+    agent,
+    agentId: hit.agent_id,
+    matchedWalletEntry: hit.entry,
+    windowDays: parseInt(req.query.window_days as string) || parseInt(process.env.TRUST_WINDOW_DEFAULT || '0'),
+    computeContinuityScore,
+  })
+
+  return res.json(publicizeProfile(profile))
 })
 
 // Signed trust attestation — JWS compact format for multi-attestation verifiers
@@ -1154,6 +1101,16 @@ const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
+
+// Rebuild the wallet → agent reverse index from persisted bound_wallets
+// metadata so /public/trust/by-wallet/:address resolves immediately on
+// boot. Cheap (in-memory map keyed on lowercased address).
+try {
+  const stats = rebuildWalletReverseIndex(db)
+  console.log(`[wallet-reverse-index] rebuilt: ${stats.addressesIndexed} address(es) across ${stats.agentsScanned} agent(s)`)
+} catch (e: any) {
+  console.warn(`[wallet-reverse-index] rebuild failed (will populate lazily): ${e?.message || e}`)
+}
 
 // Backfill evaluation receipts from existing evaluations (one-time on first deploy)
 try {

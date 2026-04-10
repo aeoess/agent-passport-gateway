@@ -17,6 +17,7 @@ import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 import { getEventBus } from './events.js'
+import { recordBoundWallets } from './wallet-reverse-index.js'
 import { sendEmail, spendAlertEmail } from '../notifications/email.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
@@ -680,6 +681,18 @@ gatewayRouter.post('/agents', (req: any, res) => {
   const id = randomUUID()
   db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null)
+  // Wallet → agent reverse index: pick up bound_wallets at enrollment time
+  // so /public/trust/by-wallet/:address resolves immediately without a
+  // boot rebuild. Promised to douglasborthwick-crypto on insumer-examples#1.
+  try {
+    if (metadata && Array.isArray((metadata as any).bound_wallets)) {
+      recordBoundWallets({
+        tenant_id: tenant.id,
+        agent_id,
+        bound_wallets: (metadata as any).bound_wallets,
+      })
+    }
+  } catch { /* index hygiene must not block enrollment */ }
   try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType, entity_id } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
 })
