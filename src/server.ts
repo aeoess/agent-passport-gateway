@@ -1102,6 +1102,37 @@ initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
 
+// One-shot bound-demo placeholder→fixture migration. Replaces
+// DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo
+// agent with canonical Ed25519 binding_signature values from the SDK fixture
+// (tests/fixtures/wallet-binding/aeoess-bound-demo.json, commit cc1028a).
+// Idempotent: noop if no placeholders present. Promised to
+// douglasborthwick-crypto on insumer-examples#1.
+try {
+  const FIXTURE_PUBKEY = 'c7cdce4d15b0c175a3fec538202e1ba9f6e351e4fbb16998bb42265a1542d5bb'
+  const FIXTURE_BW = [
+    { chain: 'ethereum', address: '0x742d35Cc6634C0532925a3b844Bc9e7595f7E2c1', bound_at: '2026-04-10T12:00:00.000Z', binding_signature: '67859cc44214504a8a08557a84b5f94884ec8e832b0a9d9a00488a340f1d81531f470cbc9f60bc7f1002373aaebf496cc34297237224b227a9aadaa1f03ad907' },
+    { chain: 'base',     address: '0x742d35Cc6634C0532925a3b844Bc9e7595f7E2c1', bound_at: '2026-04-10T12:00:00.000Z', binding_signature: '699232d9419987f63a520213249e8f79a716c2307a172ff0464319cfc5606d51dd8b2c2a992c8d907935ebe1f93f706d44d914c64cd75a82542bdf4fc493d802' },
+  ]
+  const rows = db.prepare(`SELECT id, metadata FROM agents WHERE agent_id = 'aeoess-bound-demo'`).all() as any[]
+  let migrated = 0
+  for (const row of rows) {
+    let meta: any = {}
+    try { meta = row.metadata ? JSON.parse(row.metadata) : {} } catch { meta = {} }
+    const bw = Array.isArray(meta?.bound_wallets) ? meta.bound_wallets : []
+    const hasPlaceholder = bw.some((w: any) => typeof w?.binding_signature === 'string' && w.binding_signature.includes('DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID'))
+    if (!hasPlaceholder) continue
+    meta.bound_wallets = FIXTURE_BW
+    meta.fixture_public_key = FIXTURE_PUBKEY
+    db.prepare(`UPDATE agents SET metadata = ? WHERE id = ?`).run(JSON.stringify(meta), row.id)
+    migrated++
+  }
+  if (migrated > 0) console.log(`[bound-demo-migration] replaced placeholder sigs on ${migrated} agent row(s)`)
+  else console.log(`[bound-demo-migration] no placeholders found (already migrated)`)
+} catch (e: any) {
+  console.warn(`[bound-demo-migration] failed (will retry next boot): ${e?.message || e}`)
+}
+
 // Rebuild the wallet → agent reverse index from persisted bound_wallets
 // metadata so /public/trust/by-wallet/:address resolves immediately on
 // boot. Cheap (in-memory map keyed on lowercased address).
