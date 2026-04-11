@@ -46,11 +46,13 @@ function verifyDerivationNarrowing(parent: DerivationRights, child: DerivationRi
 }
 
 async function resolveMolTrustDID(did: string): Promise<{ resolved: boolean; status?: string; error?: string }> {
+  // MolTrust /identity/resolve is GET-with-DID-in-path, not POST.
+  // Behavior confirmed with the vendor — POST returns 405.
   try {
-    const res = await fetch('https://api.moltrust.ch/identity/resolve', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ did }),
+    const url = `https://api.moltrust.ch/identity/resolve/${encodeURIComponent(did)}`
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
       signal: AbortSignal.timeout(5000),
     })
     if (!res.ok) return { resolved: false, error: `HTTP ${res.status}` }
