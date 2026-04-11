@@ -91,8 +91,43 @@ async function resolveAgentNexus(
 /**
  * Extract public key hex from the AgentID verify response.
  * Looks for common key field patterns in the response JSON.
+ *
+ * Security triage 2026-04-11 fix 5: add data.public_key.publicKeyHex
+ * as the first-checked shape. A live probe of
+ * POST https://getagentid.dev/api/v1/agents/verify on 2026-04-11
+ * (HTTP 200) confirmed the response has this shape:
+ *
+ *   {
+ *     "verified": true,
+ *     "did": "did:agentnexus:z6Mk...",
+ *     "public_key": {
+ *       "type": "Ed25519VerificationKey2020",
+ *       "publicKeyHex": "1ef065d8..."
+ *     },
+ *     ...
+ *   }
+ *
+ * None of the previous patterns (data.publicKeyHex, data.verificationMethod,
+ * data.agent.publicKeyHex) matched this shape, so the endpoint branch
+ * was silently returning null and the local multibase fallback was
+ * doing all the work. The endpoint resolution was never actually being
+ * used in production. Cross-protocol tests papered over it because
+ * resolveAgentNexusLocal always returns a key from multibase decoding.
+ *
+ * The POST verb is correct (verified with curl GET → 405, POST → 200);
+ * this commit does not change the verb.
+ * Reference: CODE-AUDIT-2026-04-11.md §2.10.
  */
 function extractKeyFromAgentIdResponse(data: Record<string, any>): string | null {
+  // Nested public_key object (AgentID real response shape, 2026-04-11).
+  if (data.public_key?.publicKeyHex && typeof data.public_key.publicKeyHex === 'string') {
+    return data.public_key.publicKeyHex
+  }
+  if (data.public_key?.publicKeyMultibase && typeof data.public_key.publicKeyMultibase === 'string') {
+    try {
+      return multibaseToHex(data.public_key.publicKeyMultibase)
+    } catch { return null }
+  }
   // Direct hex key field
   if (data.publicKeyHex && typeof data.publicKeyHex === 'string') {
     return data.publicKeyHex

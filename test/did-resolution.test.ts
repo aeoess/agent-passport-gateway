@@ -100,4 +100,74 @@ describe('did:agentnexus resolution', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  // Security triage 2026-04-11 fix 5: regression guard.
+  // Before this fix, the AgentID extract function looked for
+  // data.publicKeyHex, data.publicKeyMultibase,
+  // data.verificationMethod[0], and data.agent.publicKeyHex. None of
+  // those matched the real response shape at
+  // POST https://getagentid.dev/api/v1/agents/verify which is
+  // { public_key: { publicKeyHex: "..." } }. The endpoint branch
+  // therefore silently returned null and the local fallback was
+  // doing all the work. This test asserts the extractor now
+  // recognizes the real shape AND reports resolvedVia as
+  // 'agentid-endpoint' (not 'local-multibase'), so the test will
+  // regress if the extractor is broken again.
+  it('(fix 5 regression guard) uses the endpoint path on the real AgentID response shape', async () => {
+    const originalFetch = globalThis.fetch
+    // This is the verbatim shape returned by
+    // POST https://getagentid.dev/api/v1/agents/verify on 2026-04-11,
+    // reduced to the fields that matter for extraction.
+    const realShape = {
+      verified: true,
+      identity_gate: 'passed',
+      did: TEST_DID,
+      resolution_source: 'external',
+      resolution_method: 'did:agentnexus',
+      resolved_at: '2026-04-11T19:50:01.955Z',
+      public_key: {
+        type: 'Ed25519VerificationKey2020',
+        publicKeyHex: TEST_PUBLIC_KEY_HEX,
+      },
+    }
+    globalThis.fetch = mock.fn(() => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve(realShape),
+    })) as any
+
+    try {
+      const result = await resolveDID(TEST_DID)
+      assert(!('error' in result), `Expected success but got error: ${'error' in result ? result.error : ''}`)
+      assert('publicKeyHex' in result)
+      assert.equal(result.publicKeyHex, TEST_PUBLIC_KEY_HEX)
+      // The critical assertion: the resolvedVia must be 'agentid-endpoint',
+      // NOT 'local-multibase'. If the extractor stops recognizing the
+      // public_key.publicKeyHex shape, this test fails instead of
+      // silently passing via the fallback.
+      assert.equal(result.resolvedVia, 'agentid-endpoint')
+      assert.equal(result.method, 'agentnexus')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('(fix 5) extracts from public_key.publicKeyMultibase as a secondary shape', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock.fn(() => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        public_key: { publicKeyMultibase: TEST_MULTIBASE },
+      }),
+    })) as any
+
+    try {
+      const result = await resolveDID(TEST_DID)
+      assert(!('error' in result))
+      assert('publicKeyHex' in result)
+      assert.equal(result.publicKeyHex, TEST_PUBLIC_KEY_HEX)
+      assert.equal(result.resolvedVia, 'agentid-endpoint')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
 })
