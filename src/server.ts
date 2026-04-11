@@ -74,6 +74,7 @@ import { coordinationRouter } from './gateway/coordination.js'
 import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
+import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
@@ -166,13 +167,32 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
     try {
       const row = db.prepare(`SELECT * FROM ${table} WHERE id = ? LIMIT 1`).get(receiptId) as any
       if (row) {
-        let body: any
+        // Security triage 2026-04-11 fix 2: project the body to a
+        // whitelist of public-safe fields per receipt type. Before this
+        // fix, the endpoint returned JSON.parse(row[payloadField])
+        // verbatim, which meant tenant IDs, delegation details, spend
+        // amounts, principal IDs, and any other field the writer had
+        // stored would leak to any caller who knew a receipt ID.
+        // Receipt IDs leak via logs, shared URLs, screenshots, and
+        // response headers on sibling endpoints, so treating the ID as
+        // a soft authorization mechanism was not defensible.
+        //
+        // Relying parties that need the full canonical payload to
+        // verify the signature themselves must fetch it through an
+        // authenticated endpoint. The public endpoint now returns the
+        // safe projection plus a payload_sha256 fingerprint so that a
+        // consumer who obtains the full payload elsewhere can confirm
+        // it matches what the gateway signed.
+        // Reference: CODE-AUDIT-2026-04-11.md §2.9.
+        let parsedPayload: any = null
         if (payloadField && row[payloadField]) {
-          try { body = JSON.parse(row[payloadField]) } catch { body = row[payloadField] }
-        } else {
-          // Public proof fields only — strip tenant IDs, spend, delegation details
-          body = { id: row.id, event_type: row.event_type || row.action_type || null, verdict: row.verdict || null, created_at: row.created_at, schema_version: row.schema_version || null, receipt_hash: row.receipt_hash || null }
+          try { parsedPayload = JSON.parse(row[payloadField]) } catch { parsedPayload = null }
         }
+
+        const body = projectPublicBody(type, row, parsedPayload)
+        const payloadSha256 = payloadField && row[payloadField]
+          ? payloadFingerprint(typeof row[payloadField] === 'string' ? row[payloadField] : JSON.stringify(row[payloadField]))
+          : null
 
         const result = {
           proofId: `aps:${receiptId}`,
@@ -181,6 +201,8 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
           issuedAt: row.created_at,
           signature: row[signatureField] || null,
           body,
+          payloadSha256,
+          projectionVersion: 'v1',
           jwksUrl: 'https://gateway.aeoess.com/.well-known/jwks.json',
           resolvedAt: new Date().toISOString(),
         }
