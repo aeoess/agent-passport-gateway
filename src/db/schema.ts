@@ -517,6 +517,19 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_id TEXT DEFAULT NULL`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_verification_endpoint TEXT DEFAULT NULL`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
+
+  // Security triage 2026-04-11 fix 1: tenant role column.
+  // Decouples admin authorization from the `plan` billing concept.
+  // role = 'admin'  → platform operator (can access /api/v1/admin/* routes)
+  // role = 'user'   → regular tenant (default)
+  // The AEOESS operator tenant (email signal@aeoess.com) is elevated to
+  // 'admin' by the idempotent UPDATE below.
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`) } catch {}
+  try {
+    db.prepare(`UPDATE tenants SET role = 'admin' WHERE email = ? AND role != 'admin'`)
+      .run('signal@aeoess.com')
+  } catch {}
+
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 }
 

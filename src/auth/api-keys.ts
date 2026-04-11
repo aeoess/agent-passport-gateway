@@ -12,6 +12,13 @@ import { randomUUID } from 'node:crypto'
 import { getDB } from '../db/schema.js'
 import type { Plan } from '../db/schema.js'
 
+/** Tenant authorization role. Distinct from `plan` (a billing concept).
+ *  `admin` = platform operator with access to /api/v1/admin/* routes.
+ *  `user`  = regular tenant (default). Added by security triage fix 1
+ *  on 2026-04-11 to stop conflating enterprise-plan billing with admin
+ *  authority. See CODE-AUDIT-2026-04-11.md §2.9 for context. */
+export type TenantRole = 'admin' | 'user'
+
 export interface Tenant {
   id: string
   name: string
@@ -19,6 +26,7 @@ export interface Tenant {
   plan: Plan
   stripe_customer_id: string | null
   status: string
+  role: TenantRole
 }
 
 function hashKey(key: string): string {
@@ -46,6 +54,7 @@ export function createTenant(opts: {
   const tenant: Tenant = {
     id: tenantId, name: opts.name, email: opts.email,
     plan: plan as Plan, stripe_customer_id: null, status: 'active',
+    role: 'user',
   }
   return { tenant, apiKey: rawKey }
 }
@@ -60,12 +69,16 @@ export function authenticateKey(rawKey: string): Tenant | null {
     SELECT t.* FROM tenants t
     JOIN api_keys k ON k.tenant_id = t.id
     WHERE k.key_hash = ? AND k.revoked_at IS NULL AND t.status = 'active'
-  `).get(keyHash) as Tenant | undefined
+  `).get(keyHash) as (Tenant & { role?: string }) | undefined
 
   if (!row) return null
   // Update last_used_at
   db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash)
-  return row
+  // Normalize role: the column is added by an idempotent ALTER TABLE in
+  // schema.ts, but defensively default to 'user' if the migration has not
+  // run on a stale DB connection.
+  const role: TenantRole = row.role === 'admin' ? 'admin' : 'user'
+  return { ...row, role }
 }
 
 /**
@@ -82,5 +95,34 @@ export function authMiddleware(req: any, res: any, next: any) {
     return res.status(401).json({ error: 'Invalid or revoked API key' })
   }
   req.tenant = tenant
+  next()
+}
+
+/**
+ * Express middleware: require platform-operator role. Must be chained
+ * AFTER authMiddleware so req.tenant is populated.
+ *
+ * Checks tenant.role === 'admin', NOT tenant.plan. The `plan` column is
+ * a billing concept (free/pro/enterprise) and must not be used for
+ * authorization. Before this middleware existed, the three /api/v1/admin/*
+ * routes gated on `plan === 'enterprise'`, which meant any paying
+ * enterprise customer would have inherited platform-operator capabilities
+ * including listing and soft-deleting other tenants.
+ *
+ * The AEOESS operator tenant (email signal@aeoess.com) is elevated to
+ * role='admin' by the idempotent migration in src/db/schema.ts. All other
+ * tenants default to role='user' regardless of plan.
+ *
+ * Reference: CODE-AUDIT-2026-04-11.md §2.9, security triage fix 1.
+ */
+export function requireAdmin(req: any, res: any, next: any) {
+  const tenant: Tenant | undefined = req.tenant
+  if (!tenant) {
+    // Defensive: should never reach here if authMiddleware ran first.
+    return res.status(401).json({ error: 'Authentication required' })
+  }
+  if (tenant.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin role required for this endpoint' })
+  }
   next()
 }

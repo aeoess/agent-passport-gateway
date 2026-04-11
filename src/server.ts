@@ -59,7 +59,7 @@ import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { initDB, getDB, PLAN_LIMITS } from './db/schema.js'
 import { lookupByAddress, rebuildFromDb as rebuildWalletReverseIndex } from './gateway/wallet-reverse-index.js'
 import { buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
-import { authMiddleware, createTenant } from './auth/api-keys.js'
+import { authMiddleware, requireAdmin, createTenant } from './auth/api-keys.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
 import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
@@ -1019,11 +1019,7 @@ app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 // Admin endpoints (enterprise plan only)
 // ═══════════════════════════════════════
 
-app.get('/api/v1/admin/tenants', authMiddleware, (req: any, res) => {
-  const tenant = req.tenant
-  if (tenant.plan !== 'enterprise') {
-    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
-  }
+app.get('/api/v1/admin/tenants', authMiddleware, requireAdmin, (req: any, res) => {
   const db = getDB()
   const tenants = db.prepare(`
     SELECT t.id as tenant_id, t.name, t.email, t.plan, t.status, t.created_at,
@@ -1034,11 +1030,8 @@ app.get('/api/v1/admin/tenants', authMiddleware, (req: any, res) => {
   res.json({ tenants, count: tenants.length })
 })
 
-app.delete('/api/v1/admin/tenants/:tenantId', authMiddleware, (req: any, res) => {
+app.delete('/api/v1/admin/tenants/:tenantId', authMiddleware, requireAdmin, (req: any, res) => {
   const tenant = req.tenant
-  if (tenant.plan !== 'enterprise') {
-    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
-  }
   const { tenantId } = req.params
   if (tenantId === tenant.id) {
     return res.status(400).json({ error: 'Cannot delete your own tenant' })
@@ -1053,11 +1046,7 @@ app.delete('/api/v1/admin/tenants/:tenantId', authMiddleware, (req: any, res) =>
   res.json({ tenant_id: tenantId, status: 'deleted' })
 })
 
-app.post('/api/v1/admin/send-digest', authMiddleware, async (req: any, res) => {
-  const tenant = req.tenant
-  if (tenant.plan !== 'enterprise') {
-    return res.status(403).json({ error: 'Enterprise plan required for admin endpoints' })
-  }
+app.post('/api/v1/admin/send-digest', authMiddleware, requireAdmin, async (_req: any, res) => {
   const db = getDB()
   const period = new Date().toISOString().slice(0, 7)
   const tenants = db.prepare(`SELECT id, name, email, plan FROM tenants WHERE status = 'active'`).all() as any[]
