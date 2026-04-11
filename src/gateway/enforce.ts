@@ -18,6 +18,7 @@ import type { Tenant } from '../auth/api-keys.js'
 import { computeLineageLinks, storeAndCluster, getClusterRisk } from './lineage.js'
 import { getEventBus } from './events.js'
 import { recordBoundWallets } from './wallet-reverse-index.js'
+import { validateExternalUrl } from './url-safety.js'
 import { sendEmail, spendAlertEmail } from '../notifications/email.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
@@ -360,7 +361,15 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   }
 
   // Entity binding check (vessenes integration — A2A#1575)
-  if (agent.entity_id && agent.entity_verification_endpoint) {
+  //
+  // Security triage 2026-04-11 fix 4: validate the URL before fetch as
+  // defense-in-depth. Registration-time validation is the primary guard,
+  // but any URL stored before that guard existed (or that somehow slipped
+  // past) is still rejected here. The entity binding check falls through
+  // on an unsafe URL; it does not deny the request, because that would
+  // let a tenant weaponize a stored bad URL to deny-list their own agent.
+  const entityUrlSafe = validateExternalUrl(agent.entity_verification_endpoint)
+  if (agent.entity_id && agent.entity_verification_endpoint && entityUrlSafe.safe) {
     try {
       const entityRes = await fetch(agent.entity_verification_endpoint, {
         signal: AbortSignal.timeout(3000)
@@ -388,6 +397,10 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     } catch {
       console.warn(`[entity-binding] Failed to reach ${agent.entity_verification_endpoint} for agent ${agent_id}`)
     }
+  } else if (agent.entity_id && agent.entity_verification_endpoint && !entityUrlSafe.safe) {
+    // URL is stored but fails the SSRF guard. Log once so operators can
+    // find and clean up legacy rows.
+    console.warn(`[entity-binding] Stored endpoint rejected by SSRF guard for agent ${agent_id}: ${entityUrlSafe.reason}`)
   }
 
   // Key rotation enforcement: if request includes signing_key, check against retired keys.
@@ -671,6 +684,18 @@ gatewayRouter.post('/agents', (req: any, res) => {
   const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata } = req.body
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
+  }
+  // Security triage 2026-04-11 fix 4: validate entity_verification_endpoint
+  // against the SSRF guard at registration time. Rejecting here is the
+  // primary defense; the policy evaluation path has defense-in-depth.
+  if (entity_verification_endpoint !== undefined && entity_verification_endpoint !== null && entity_verification_endpoint !== '') {
+    const check = validateExternalUrl(entity_verification_endpoint)
+    if (!check.safe) {
+      return res.status(400).json({
+        error: 'entity_verification_endpoint rejected by SSRF guard',
+        reason: check.reason,
+      })
+    }
   }
   const validTypes = ['general', 'explorer', 'planner', 'executor', 'reviewer', 'monitor']
   const safeType = validTypes.includes(agent_type) ? agent_type : 'general'
