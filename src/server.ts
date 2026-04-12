@@ -23,6 +23,7 @@
  *   POST /api/v1/settlements    — generate settlement
  *   GET  /api/v1/settlements    — list settlements
  *   GET  /api/v1/my-consumption — agent self-service (what did I consume?)
+ *   GET  /api/v1/tenant/:tenantId/audit-export — audit log export (jsonl/csv/pdf)
  *   POST /api/v1/pay/nano/invoice    — create Nano payment request
  *   GET  /api/v1/pay/nano/status/:id — check invoice status
  *   POST /api/v1/pay/nano/settle/:id — execute settlement via Nano
@@ -74,6 +75,7 @@ import { coordinationRouter } from './gateway/coordination.js'
 import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
+import { auditExportRouter } from './gateway/audit-export.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
 
@@ -1036,6 +1038,7 @@ app.use('/api/v1', authMiddleware, coordinationRouter)
 app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
+app.use('/api/v1', authMiddleware, auditExportRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1210,7 +1213,7 @@ console.log(`
   AEOESS Gateway v0.4.0 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
-  Endpoints: 39 API routes + 2 public (.well-known)
+  Endpoints: 40 API routes + 2 public (.well-known)
 ═══════════════════════════════════════
 `)
 app.listen(PORT, () => {
