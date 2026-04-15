@@ -194,6 +194,104 @@ describe('wallet-reverse-index — collision handling', () => {
   })
 })
 
+describe('wallet-reverse-index — Solana / chain-aware normalization', () => {
+  const SOL_A = 'DRiP2Pn2K6fuMLKQmt5rZWxa91GPqgT4gJZN6fyUoF3z'
+
+  it('Solana address roundtrips case-sensitively', () => {
+    recordBoundWallets({
+      tenant_id: 'tenant-1',
+      agent_id: 'solana-agent',
+      bound_wallets: [{ chain: 'solana', address: SOL_A, binding_signature: 'sol-sig' }],
+    })
+    const hit = lookupByAddress(SOL_A, 'solana')
+    assert.ok(hit)
+    assert.equal(hit!.agent_id, 'solana-agent')
+    assert.equal(hit!.entry.chain, 'solana')
+    assert.equal(hit!.entry.address, SOL_A, 'address must be preserved character-for-character')
+  })
+
+  it('Solana lookup on a lowercased form does NOT match (case-sensitive)', () => {
+    recordBoundWallets({
+      tenant_id: 'tenant-1',
+      agent_id: 'solana-agent',
+      bound_wallets: [{ chain: 'solana', address: SOL_A, binding_signature: 'sol-sig' }],
+    })
+    assert.equal(lookupByAddress(SOL_A.toLowerCase(), 'solana'), null)
+  })
+
+  it('EVM lookup is still case-insensitive', () => {
+    const mixedCase = '0xABCdef1234567890ABCDEF1234567890abcdef12'
+    recordBoundWallets({
+      tenant_id: 'tenant-1',
+      agent_id: 'evm-agent',
+      bound_wallets: [{ chain: 'ethereum', address: mixedCase, binding_signature: 'eth-sig' }],
+    })
+    const hit = lookupByAddress(mixedCase.toLowerCase(), 'ethereum')
+    assert.ok(hit)
+    assert.equal(hit!.agent_id, 'evm-agent')
+  })
+
+  it('cross-chain co-binding: one agent, EVM + Solana, both resolve', () => {
+    recordBoundWallets({
+      tenant_id: 'tenant-1',
+      agent_id: 'multi-chain-agent',
+      bound_wallets: [
+        { chain: 'ethereum', address: ETH_A, binding_signature: 'eth-sig' },
+        { chain: 'solana', address: SOL_A, binding_signature: 'sol-sig' },
+      ],
+    })
+    assert.equal(reverseIndexSize(), 2)
+    const eth = lookupByAddress(ETH_A, 'ethereum')
+    const sol = lookupByAddress(SOL_A, 'solana')
+    assert.equal(eth!.agent_id, 'multi-chain-agent')
+    assert.equal(sol!.agent_id, 'multi-chain-agent')
+    assert.equal(sol!.entry.address, SOL_A)
+  })
+
+  it('backwards compat: single-arg lookupByAddress defaults to ethereum', () => {
+    recordBoundWallets({
+      tenant_id: 'tenant-1',
+      agent_id: 'legacy-agent',
+      bound_wallets: [{ chain: 'ethereum', address: ETH_A, binding_signature: 'sig' }],
+    })
+    const hit = lookupByAddress(ETH_A)
+    assert.ok(hit)
+    assert.equal(hit!.agent_id, 'legacy-agent')
+  })
+
+  it('rebuildFromDb indexes a Solana entry from agents.metadata', () => {
+    const db = new Database(':memory:')
+    db.exec(`
+      CREATE TABLE tenants (id TEXT PRIMARY KEY);
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        metadata TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO tenants (id) VALUES ('tenant-1');
+    `)
+    db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, status, metadata) VALUES (?, ?, ?, ?, 'active', ?)`)
+      .run('uuid-sol', 'tenant-1', 'solana-seeded', 'pk', JSON.stringify({
+        bound_wallets: [
+          { chain: 'solana', address: SOL_A, bound_at: '2026-04-15T00:00:00Z', binding_signature: 'sol-sig' },
+        ],
+      }))
+
+    const stats = rebuildFromDb(db)
+    assert.equal(stats.addressesIndexed, 1)
+    const hit = lookupByAddress(SOL_A, 'solana')
+    assert.ok(hit)
+    assert.equal(hit!.agent_id, 'solana-seeded')
+    assert.equal(hit!.entry.address, SOL_A)
+    assert.equal(lookupByAddress(SOL_A), null, 'Solana addr must not resolve under default ethereum chain')
+    db.close()
+  })
+})
+
 describe('wallet-reverse-index — rebuildFromDb', () => {
   function makeTestDb(): Database.Database {
     const db = new Database(':memory:')
