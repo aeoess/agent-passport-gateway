@@ -353,6 +353,54 @@ describe('GET /api/v1/public/trust/:agentId — path-form fall-through', () => {
   })
 })
 
+describe('Trust profile emission — Solana wallet_ref preservation', () => {
+  it('preserves chain="solana" and address verbatim in wallet_ref', () => {
+    const SOL_ADDR = 'DRiP2Pn2K6fuMLKQmt5rZWxa91GPqgT4gJZN6fyUoF3z'
+    const localDb = new Database(':memory:')
+    localDb.exec(`
+      CREATE TABLE tenants (id TEXT PRIMARY KEY);
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+        public_key TEXT NOT NULL, did TEXT, name TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        metadata TEXT, UNIQUE(tenant_id, agent_id)
+      );
+      CREATE TABLE delegations (id TEXT PRIMARY KEY, tenant_id TEXT, parent_agent_id TEXT, child_agent_id TEXT, scope TEXT, spend_limit REAL, spend_used REAL DEFAULT 0, max_depth INTEGER DEFAULT 3, status TEXT DEFAULT 'active', created_at TEXT DEFAULT (datetime('now')), revoked_at TEXT);
+      CREATE TABLE policy_evaluations (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, verdict TEXT, task_class TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')));
+      CREATE TABLE receipts (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, created_at TEXT DEFAULT (datetime('now')));
+      CREATE TABLE issuance_dossiers (id TEXT PRIMARY KEY, tenant_id TEXT, passport_id TEXT, passport_grade INTEGER, attestation_bundle_hash TEXT, created_at TEXT DEFAULT (datetime('now')));
+      CREATE TABLE agent_wallets (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, nano_address TEXT, status TEXT);
+      CREATE TABLE key_rotations (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, mode TEXT, state TEXT, old_key TEXT, new_key TEXT, activation_time TEXT, created_at TEXT DEFAULT (datetime('now')), completed_at TEXT);
+      INSERT INTO tenants (id) VALUES ('tenant-sol');
+    `)
+    localDb.prepare(
+      `INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, status, metadata) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`
+    ).run(
+      'uuid-sol-emit', 'tenant-sol', 'solana-emit-agent',
+      '1ef065d8717910ffaba4416a134ad3ff93acc85e541450c461bd0c4a632befde',
+      'did:aps:solana-emit-agent', 'Solana Emit',
+      JSON.stringify({
+        bound_wallets: [
+          { chain: 'solana', address: SOL_ADDR, bound_at: '2026-04-15T09:00:00Z', binding_signature: 'sol-sig-fixture' },
+        ],
+      }),
+    )
+    const agent = localDb.prepare(`SELECT * FROM agents WHERE agent_id = ?`).get('solana-emit-agent') as any
+    const profile = buildAgentTrustProfile({
+      db: localDb, agent, agentId: 'solana-emit-agent',
+      computeContinuityScore: stubContinuityScore,
+    })
+    assert.equal(profile.wallet_ref.length, 1)
+    const sol = profile.wallet_ref[0]
+    assert.equal(sol.chain, 'solana')
+    assert.equal(sol.address, SOL_ADDR, 'Solana address must pass through character-for-character')
+    assert.equal(sol.binding_sig, 'sol-sig-fixture')
+    assert.equal(sol.bound_at, '2026-04-15T09:00:00Z')
+    localDb.close()
+  })
+})
+
 describe('Direct profile build via buildAgentTrustProfile', () => {
   it('matches the by-wallet HTTP shape when called directly', () => {
     const agent = db.prepare(

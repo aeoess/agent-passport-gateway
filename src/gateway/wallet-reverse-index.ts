@@ -9,15 +9,23 @@
 // already exists on /public/trust/{agent_id}. This module provides the
 // reverse direction.
 //
-// Storage: in-memory map keyed by lowercased address. Wallet bindings
-// are small (typically O(1) per agent across O(thousands) of agents),
-// and rebuilding from agents.metadata on boot is cheap. If wallet count
-// grows past ~100k we revisit with a SQLite index.
+// Storage: in-memory map keyed by `${chain}:${normalizedAddr}`. Wallet
+// bindings are small (typically O(1) per agent across O(thousands) of
+// agents), and rebuilding from agents.metadata on boot is cheap. If
+// wallet count grows past ~100k we revisit with a SQLite index.
 //
-// Multi-tenant: addresses are global namespace (an Ethereum address is
-// globally unique). The index records both tenant_id and agent_id so
-// the lookup result can resolve back through the existing trust profile
-// builder which is tenant-aware.
+// Chain-aware normalization: EVM chains lowercase the address (EIP-55
+// checksum mixed-case is not semantically meaningful). Solana and other
+// base58/base32 chains are case-sensitive — lowercasing there corrupts
+// addresses and silently breaks lookups.
+//
+// Index key namespacing: keys are `${chain.toLowerCase()}:${normalizedAddr}`
+// so a Solana address that happens to lowercase-collide with an EVM one
+// cannot route to the wrong agent.
+//
+// Multi-tenant: addresses are global namespace. The index records both
+// tenant_id and agent_id so the lookup result can resolve back through
+// the existing trust profile builder which is tenant-aware.
 //
 // Source of truth: agents.metadata.bound_wallets in SQLite. The index
 // is a derived view, fully rebuildable from the table. recordBoundWallets()
@@ -46,14 +54,37 @@ export interface ReverseIndexHit {
   }
 }
 
-// Lowercased address → first matching record. The first wins; later binds
-// of the same address by other agents become collisions surfaced separately
-// for observability but are ignored for routing (rare in practice).
+// Chain-namespaced key (`${chain}:${addr}`) → first matching record. The
+// first wins; later binds of the same key by other agents become collisions
+// surfaced separately for observability but are ignored for routing.
 const indexByAddress: Map<string, ReverseIndexHit> = new Map()
 const collisions: Map<string, ReverseIndexHit[]> = new Map()
 
-function normalizeAddress(addr: string): string {
-  return (addr || '').trim().toLowerCase()
+const EVM_CHAIN_RE = /^(ethereum|eth|evm|polygon|arbitrum|optimism|base|bnb|avalanche|fantom)$/i
+
+function isEvmChain(chain: string, addr: string): boolean {
+  if (chain && EVM_CHAIN_RE.test(chain)) return true
+  if (addr && /^0x/i.test(addr)) return true
+  return false
+}
+
+function normalizeAddress(chain: string, addr: string): string {
+  const trimmed = (addr || '').trim()
+  if (!trimmed) return ''
+  return isEvmChain(chain || '', trimmed) ? trimmed.toLowerCase() : trimmed
+}
+
+function indexKey(chain: string, addr: string): string {
+  const normAddr = normalizeAddress(chain, addr)
+  if (!normAddr) return ''
+  // EVM addresses are globally unique across EVM chains, so we bucket all
+  // EVM chains under a shared "evm:" namespace. This preserves the property
+  // that a SkyeProfile-style caller with only an address (no chain) can still
+  // resolve bindings across ethereum/base/polygon/arbitrum/etc. Non-EVM
+  // chains get chain-specific namespaces to prevent cross-chain collisions
+  // (e.g. a Solana base58 addr must not route through an EVM lookup).
+  const ns = isEvmChain(chain || '', addr) ? 'evm' : (chain || '').toLowerCase()
+  return `${ns}:${normAddr}`
 }
 
 function normalizeEntry(raw: any): BoundWalletEntry | null {
@@ -85,7 +116,7 @@ export function recordBoundWallets(opts: {
   for (const raw of opts.bound_wallets) {
     const entry = normalizeEntry(raw)
     if (!entry) continue
-    const key = normalizeAddress(entry.address)
+    const key = indexKey(entry.chain, entry.address)
     if (!key) continue
     const hit: ReverseIndexHit = {
       tenant_id: opts.tenant_id,
@@ -101,8 +132,8 @@ export function recordBoundWallets(opts: {
     if (!existing) {
       indexByAddress.set(key, hit)
     } else if (existing.tenant_id !== opts.tenant_id || existing.agent_id !== opts.agent_id) {
-      // Same address bound by a different agent — keep the first, record the
-      // collision for observability but do not change routing.
+      // Same (chain, address) bound by a different agent — keep the first,
+      // record the collision for observability but do not change routing.
       const list = collisions.get(key) || []
       if (!list.some(h => h.tenant_id === hit.tenant_id && h.agent_id === hit.agent_id)) {
         list.push(hit)
@@ -139,14 +170,19 @@ export function removeAgent(tenant_id: string, agent_id: string): void {
   }
 }
 
-/** Lookup an address. Case-insensitive. Returns null if not bound. */
-export function lookupByAddress(address: string): ReverseIndexHit | null {
-  const key = normalizeAddress(address)
+/**
+ * Lookup an address. Chain defaults to 'ethereum' for backwards compatibility
+ * with callers that pre-date the chain-aware index (e.g. SkyeProfile's EVM-only
+ * path). For EVM chains the lookup is case-insensitive; for non-EVM chains
+ * (solana, nano, bitcoin) it is case-sensitive.
+ */
+export function lookupByAddress(address: string, chain: string = 'ethereum'): ReverseIndexHit | null {
+  const key = indexKey(chain, address)
   if (!key) return null
   return indexByAddress.get(key) || null
 }
 
-/** Test/admin only — number of unique addresses currently indexed. */
+/** Test/admin only — number of unique (chain, address) pairs currently indexed. */
 export function reverseIndexSize(): number {
   return indexByAddress.size
 }
