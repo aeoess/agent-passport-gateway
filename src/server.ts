@@ -402,6 +402,28 @@ function computeDelegationChainHash(
   return createHash('sha256').update(canonicalJsonStringify(chain)).digest('hex')
 }
 
+// Sign the public trust profile with the gateway's Ed25519 key and attach
+// the compact JWS as a response header. Body is unchanged, so callers that
+// don't care about the signature see no difference. Verifiers fetch the
+// JWKS at /.well-known/jwks.json, read X-APS-JWS, verify with the kid
+// advertised there (gateway-v1). Also exposes the kid on X-APS-JWS-KID
+// for easy discovery by clients that want to short-circuit to a specific
+// key without parsing the JWS header.
+function attachTrustProfileJws(res: express.Response, profile: Record<string, unknown>): void {
+  try {
+    const identity = getGatewayIdentity()
+    const jws = identity.sign(profile)
+    res.setHeader('X-APS-JWS', jws)
+    res.setHeader('X-APS-JWS-KID', identity.kid)
+    res.setHeader('X-APS-JWS-JWKS', 'https://gateway.aeoess.com/.well-known/jwks.json')
+  } catch {
+    // Signing failure must not break the response. Ed25519 signing is
+    // effectively infallible once the identity is loaded, but a missing
+    // identity (identity not initialized) should degrade gracefully
+    // rather than 500 the entire endpoint.
+  }
+}
+
 app.get('/api/v1/public/trust/:agentId', async (req, res) => {
   // Rate limit
   try {
@@ -433,6 +455,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
 
   const cached = trustProfileCache.get(agentId)
   if (cached && cached.expires > Date.now() && !req.query.signal && !walletParam) {
+    attachTrustProfileJws(res, cached.data)
     return res.json(cached.data)
   }
 
@@ -565,6 +588,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     })
   }
 
+  attachTrustProfileJws(res, publicProfile)
   res.json(publicProfile)
 })
 
