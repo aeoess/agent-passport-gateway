@@ -12,10 +12,10 @@
 
 import {
   createActionIntent, evaluateIntent,
-  commercePreflight,
   createAgoraMessage, appendToFeed,
   verifyDelegation, getRevocation, scopeAuthorizes,
 } from 'agent-passport-system'
+import { commercePreflight } from './commerce-preflight.js'
 import type { SignedPassport, ActionReceipt, Delegation } from 'agent-passport-system'
 import type { ActionIntent, PolicyDecision, PolicyValidator, ValidationContext } from 'agent-passport-system'
 import type {

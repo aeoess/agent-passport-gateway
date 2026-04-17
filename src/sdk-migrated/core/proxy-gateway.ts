@@ -46,13 +46,14 @@ import {
   DEFAULT_LOAD_POLICY,
   computeEffectiveScore, createScopedReputation, resolveAuthorityTier,
   checkTierForIntent, updateReputationFromResult, shouldDemote,
-  triggerDemotion, DEFAULT_TIERS,
+  DEFAULT_TIERS,
   evaluateDisputeOverlay,
   verifyAgentIdentity, verifyAgentIdentitySync, strengthMeetsMinimum, identityStrengthFailure, DEFAULT_IDENTITY_CONFIG,
   createHybridTimestamp,
   shouldProbe, DEFAULT_PROBE_SCHEDULE,
   checkCommerceConstraint,
 } from 'agent-passport-system'
+import { triggerDemotion } from './reputation-analytics.js'
 import type {
   StorageBackend, StoredAgentRecord,
   ActiveEscalation, EscalationGrant,
