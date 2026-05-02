@@ -15,7 +15,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
-    "agent-passport-system": "file:../agent-passport-system",
+    "agent-passport-system": "^2.6.0-alpha.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
     "csv-stringify": "^6.7.0",
