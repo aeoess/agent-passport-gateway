@@ -109,23 +109,18 @@ app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), h
 app.use(express.json({ limit: '1mb' }))
 
 // ═══════════════════════════════════════
-// Landing page at gateway.aeoess.com/
-// React-via-Babel design served as static HTML from /app/static/index.html.
-// The Dockerfile copies the static/ directory into the image alongside dist/.
-// process.cwd() is /app inside the container; locally it's the repo root.
-// Internal nav links inside the page point to https://aeoess.com/* — the
-// gateway only exposes this single landing surface (plus the API).
+// Gateway is an API host, not a UI. Users hitting the root in a browser
+// get redirected to the marketing site's portal where they can sign in
+// and reach their dashboard. The 'gateway.aeoess.com/' marketing splash
+// (the React-via-Babel design) was an architectural mistake — it pretended
+// to be a user surface when it was actually a public aggregate view that
+// duplicates dashboard.html. Removed in favour of a clean redirect.
+//
+// API clients hitting paths under /api/v1/*, /auth/*, /.well-known/* etc.
+// still get JSON responses as before — this redirect only fires for GET /.
 // ═══════════════════════════════════════
-const STATIC_INDEX = join(process.cwd(), 'static', 'index.html')
-app.get('/', (_req, res) => {
-  res.sendFile(STATIC_INDEX, (err) => {
-    if (err) {
-      console.error('[landing] sendFile error:', err.message)
-      res.status(500).json({ error: 'Landing page unavailable, try aeoess.com directly.' })
-    }
-  })
-})
-app.get('/index.html', (_req, res) => res.redirect(301, '/'))
+app.get('/', (_req, res) => res.redirect(302, `${APP_ORIGIN}/portal.html`))
+app.get('/index.html', (_req, res) => res.redirect(301, `${APP_ORIGIN}/portal.html`))
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
