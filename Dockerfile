@@ -14,6 +14,9 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run build && echo "Build completed at $(date)"
 
+# Static landing page served at GET /
+COPY static/ ./static/
+
 # Remove dev dependencies
 RUN npm prune --production
 

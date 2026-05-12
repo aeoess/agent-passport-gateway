@@ -587,10 +587,31 @@ function createTables() {
   // email_verified is set to 1 because the rename is itself the verification
   // act (an admin operator authorizing the new address).
   //
+  // First attempt (0c56a95) failed with `UNIQUE constraint failed: tenants.email`.
+  // A non-operator tenant exists with email=operator@example.com — likely a stray
+  // signup that was later soft-deleted (status='deleted'). The unique index
+  // does not respect status, so its email still holds the slot. Step 1 below
+  // tombstones that stray row's email so step 2 can claim the address.
+  //
   // signal@aeoess.com remains the public support address in copy throughout
   // the site and in transactional emails — that is separate from the tenant
   // login email.
   // ───────────────────────────────────────
+
+  // Step 1: tombstone any non-operator row that happens to hold operator@example.com.
+  // The operator tenant is identified by the existing email signal@aeoess.com;
+  // we only tombstone OTHER rows that block the rename. Idempotent: after the
+  // first deploy the WHERE clause matches nothing.
+  try {
+    db.prepare(`UPDATE tenants
+                SET email = 'tombstone-' || substr(id, 1, 8) || '@deleted.local'
+                WHERE email = 'operator@example.com'
+                  AND id != COALESCE((SELECT id FROM tenants WHERE email = 'signal@aeoess.com'), '')`).run()
+  } catch (e: any) {
+    console.error('[migration] tombstone of stray tima@ row failed:', e?.message || e)
+  }
+
+  // Step 2: the actual operator rename.
   try {
     db.prepare(`UPDATE tenants
                 SET email = 'operator@example.com',

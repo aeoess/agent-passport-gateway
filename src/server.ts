@@ -44,7 +44,7 @@
 
 import express from 'express'
 import { mkdirSync, existsSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
 // Ensure DB directory exists (Railway Volumes mount at /data)
@@ -94,7 +94,10 @@ const app = express()
 app.set('trust proxy', 1) // Trust first proxy (Railway) for correct req.ip
 
 // Security
-app.use(helmet())
+// CSP is disabled because we serve a React-via-Babel landing page at GET /
+// that needs inline scripts, unpkg-loaded React, and google-fonts CSS.
+// The rest of the gateway returns JSON, where CSP is moot anyway.
+app.use(helmet({ contentSecurityPolicy: false }))
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://aeoess.com,https://gateway.aeoess.com').split(',').map(s => s.trim())
 app.use(cors({ origin: (origin, callback) => {
   if (!origin || allowedOrigins.includes(origin)) callback(null, true)
@@ -104,6 +107,25 @@ app.use(cors({ origin: (origin, callback) => {
 app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook)
 
 app.use(express.json({ limit: '1mb' }))
+
+// ═══════════════════════════════════════
+// Landing page at gateway.aeoess.com/
+// React-via-Babel design served as static HTML from /app/static/index.html.
+// The Dockerfile copies the static/ directory into the image alongside dist/.
+// process.cwd() is /app inside the container; locally it's the repo root.
+// Internal nav links inside the page point to https://aeoess.com/* — the
+// gateway only exposes this single landing surface (plus the API).
+// ═══════════════════════════════════════
+const STATIC_INDEX = join(process.cwd(), 'static', 'index.html')
+app.get('/', (_req, res) => {
+  res.sendFile(STATIC_INDEX, (err) => {
+    if (err) {
+      console.error('[landing] sendFile error:', err.message)
+      res.status(500).json({ error: 'Landing page unavailable, try aeoess.com directly.' })
+    }
+  })
+})
+app.get('/index.html', (_req, res) => res.redirect(301, '/'))
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
