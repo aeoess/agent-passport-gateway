@@ -533,28 +533,6 @@ function createTables() {
                   AND role != 'admin'`).run()
   } catch {}
 
-  // ───────────────────────────────────────
-  // 2026-05-11 operator-email rename
-  // Tima requested moving his login from signal@aeoess.com (public-support
-  // alias) to operator@example.com (personal). Preserves tenant_id and every
-  // foreign-keyed row (API keys, agents, delegations, receipts). Idempotent:
-  // after the first deploy, no row matches the WHERE clause.
-  //
-  // email_verified is set to 1 because the rename is itself the verification
-  // act (an admin operator authorizing the new address).
-  //
-  // signal@aeoess.com remains the public support address in copy throughout
-  // the site and in transactional emails — that is separate from the tenant
-  // login email.
-  // ───────────────────────────────────────
-  try {
-    db.prepare(`UPDATE tenants
-                SET email = 'operator@example.com',
-                    email_verified = 1,
-                    email_verified_at = COALESCE(email_verified_at, datetime('now'))
-                WHERE email = 'signal@aeoess.com'`).run()
-  } catch {}
-
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 
   // ═══════════════════════════════════════
@@ -595,6 +573,33 @@ function createTables() {
     );
     CREATE INDEX IF NOT EXISTS idx_email_verify_tenant ON email_verification_tokens(tenant_id);
   `)
+
+  // ───────────────────────────────────────
+  // 2026-05-11 operator-email rename (must run AFTER email_verified
+  // columns have been added above — otherwise the UPDATE references
+  // columns that do not exist yet and silently fails in the try/catch).
+  //
+  // Tima requested moving his login from signal@aeoess.com (public-support
+  // alias) to operator@example.com (personal). Preserves tenant_id and every
+  // foreign-keyed row (API keys, agents, delegations, receipts). Idempotent:
+  // after the first deploy that runs this, no row matches the WHERE clause.
+  //
+  // email_verified is set to 1 because the rename is itself the verification
+  // act (an admin operator authorizing the new address).
+  //
+  // signal@aeoess.com remains the public support address in copy throughout
+  // the site and in transactional emails — that is separate from the tenant
+  // login email.
+  // ───────────────────────────────────────
+  try {
+    db.prepare(`UPDATE tenants
+                SET email = 'operator@example.com',
+                    email_verified = 1,
+                    email_verified_at = COALESCE(email_verified_at, datetime('now'))
+                WHERE email = 'signal@aeoess.com'`).run()
+  } catch (e: any) {
+    console.error('[migration] operator-email rename failed:', e?.message || e)
+  }
 }
 
 // ═══════════════════════════════════════
