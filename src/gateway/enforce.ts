@@ -1127,6 +1127,54 @@ gatewayRouter.get('/usage', (req: any, res) => {
   res.json({ usage: history })
 })
 
+// GET /api/v1/decisions/recent — Recent policy evaluations for THIS tenant
+// Powers the live-decisions feed on dashboard.html. Tenant-scoped (unlike
+// the public /api/v1/public/recent-decisions which aggregates across all
+// tenants and anonymizes agent IDs).
+gatewayRouter.get('/decisions/recent', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 100)
+  const rows = db.prepare(`
+    SELECT id, agent_id, action_type, action_target, scope_required,
+           verdict, reason, duration_ms, created_at
+    FROM policy_evaluations
+    WHERE tenant_id = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(tenant.id, limit) as Array<any>
+  res.json({
+    decisions: rows.map((r: any) => ({
+      id: r.id,
+      ts: r.created_at,
+      agent_id: r.agent_id,
+      action_type: r.action_type,
+      action_target: r.action_target,
+      scope_required: r.scope_required,
+      decision: r.verdict,
+      reason: r.reason,
+      duration_ms: r.duration_ms,
+    })),
+    count: rows.length,
+  })
+})
+
+// GET /api/v1/receipts/recent — Recent signed receipts for THIS tenant
+gatewayRouter.get('/receipts/recent', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const db = getDB()
+  const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 100)
+  const rows = db.prepare(`
+    SELECT id, evaluation_id, agent_id, action_type, verdict,
+           execution_result, signature, created_at
+    FROM receipts
+    WHERE tenant_id = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(tenant.id, limit) as Array<any>
+  res.json({ receipts: rows, count: rows.length })
+})
+
 // POST /api/v1/alerts/:id/acknowledge — Acknowledge Alert
 gatewayRouter.post('/alerts/:id/acknowledge', (req: any, res) => {
   const tenant: Tenant = req.tenant
