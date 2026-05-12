@@ -279,6 +279,164 @@ app.post('/api/v1/signup', async (req, res) => {
 })
 
 // ═══════════════════════════════════════
+// GitHub OAuth — Sign in / sign up via GitHub
+// Tenants identified by their verified primary GitHub email.
+// New email → create tenant. Existing email → issue an additional API key.
+// Requires GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET env vars.
+// ═══════════════════════════════════════
+const githubStateStore = new Map<string, number>() // state -> expiresAt
+const GITHUB_STATE_TTL_MS = 10 * 60 * 1000
+
+setInterval(() => {
+  const now = Date.now()
+  for (const [s, exp] of githubStateStore.entries()) {
+    if (exp < now) githubStateStore.delete(s)
+  }
+}, 60_000).unref()
+
+const githubOAuthLimiter = new RateLimiterMemory({
+  points: 30,
+  duration: 60,
+  keyPrefix: 'github_oauth',
+})
+
+const APP_ORIGIN = process.env.APP_ORIGIN || 'https://aeoess.com'
+const GATEWAY_URL = process.env.GATEWAY_URL || 'https://gateway.aeoess.com'
+
+function githubOAuthConfigured(): boolean {
+  return !!(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET)
+}
+
+app.get('/auth/github/start', async (req, res) => {
+  if (!githubOAuthConfigured()) {
+    return res.status(503).type('html').send(
+      `<!doctype html><meta charset="utf-8"><title>GitHub sign-in unavailable</title>` +
+      `<body style="font-family:-apple-system,system-ui;background:#1c1c1e;color:#ececec;padding:60px 40px;max-width:600px;margin:0 auto">` +
+      `<h1 style="font-weight:500">GitHub sign-in not configured</h1>` +
+      `<p style="color:#b0b0b0">The gateway is missing GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET. Use email signup or contact <a href="mailto:signal@aeoess.com" style="color:#7cacde">signal@aeoess.com</a>.</p>` +
+      `<p><a href="${APP_ORIGIN}/portal.html" style="color:#7cacde">← Back to portal</a></p></body>`
+    )
+  }
+  try { await githubOAuthLimiter.consume(req.ip || 'unknown') }
+  catch { return res.status(429).send('Rate limit exceeded. Try again later.') }
+
+  const state = randomBytes(24).toString('hex')
+  githubStateStore.set(state, Date.now() + GITHUB_STATE_TTL_MS)
+
+  const params = new URLSearchParams({
+    client_id: process.env.GITHUB_CLIENT_ID!,
+    redirect_uri: `${GATEWAY_URL}/auth/github/callback`,
+    scope: 'read:user user:email',
+    state,
+    allow_signup: 'true',
+  })
+  res.redirect('https://github.com/login/oauth/authorize?' + params.toString())
+})
+
+app.get('/auth/github/callback', async (req, res) => {
+  function redirectErr(msg: string) {
+    return res.redirect(`${APP_ORIGIN}/portal.html?auth_error=${encodeURIComponent(msg)}`)
+  }
+  if (!githubOAuthConfigured()) return redirectErr('GitHub sign-in not configured')
+
+  const code = typeof req.query.code === 'string' ? req.query.code : ''
+  const state = typeof req.query.state === 'string' ? req.query.state : ''
+  const ghError = typeof req.query.error === 'string' ? req.query.error : ''
+
+  if (ghError) return redirectErr('GitHub sign-in cancelled')
+  if (!code || !state) return redirectErr('Missing code or state from GitHub')
+
+  // CSRF state check
+  const stateExp = githubStateStore.get(state)
+  if (!stateExp || stateExp < Date.now()) return redirectErr('Sign-in link expired, try again')
+  githubStateStore.delete(state)
+
+  // Exchange code for access token
+  let accessToken: string
+  try {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    })
+    const tokenJson = await tokenRes.json() as { access_token?: string; error?: string; error_description?: string }
+    if (!tokenJson.access_token) {
+      console.error('[github-oauth] token exchange failed', tokenJson.error, tokenJson.error_description)
+      return redirectErr('Could not verify with GitHub, try email signup')
+    }
+    accessToken = tokenJson.access_token
+  } catch (e) {
+    console.error('[github-oauth] token fetch error', e)
+    return redirectErr('GitHub is unreachable, try email signup')
+  }
+
+  // Fetch user info + emails
+  let userLogin: string
+  let userName: string | null
+  let primaryEmail: string
+  try {
+    const [userRes, emailsRes] = await Promise.all([
+      fetch('https://api.github.com/user', {
+        headers: { Authorization: `token ${accessToken}`, 'User-Agent': 'aeoess-gateway', 'Accept': 'application/vnd.github+json' },
+      }),
+      fetch('https://api.github.com/user/emails', {
+        headers: { Authorization: `token ${accessToken}`, 'User-Agent': 'aeoess-gateway', 'Accept': 'application/vnd.github+json' },
+      }),
+    ])
+    if (!userRes.ok || !emailsRes.ok) {
+      console.error('[github-oauth] api errors', userRes.status, emailsRes.status)
+      return redirectErr('Could not load your GitHub profile')
+    }
+    const userInfo = await userRes.json() as { login: string; name: string | null }
+    userLogin = userInfo.login
+    userName = userInfo.name
+    const emails = await emailsRes.json() as Array<{ email: string; primary: boolean; verified: boolean }>
+    const primary = emails.find(e => e.primary && e.verified) || emails.find(e => e.verified)
+    if (!primary) return redirectErr('Your GitHub email is not verified, verify it on GitHub first')
+    primaryEmail = primary.email
+  } catch (e) {
+    console.error('[github-oauth] user fetch error', e)
+    return redirectErr('Could not load your GitHub profile')
+  }
+
+  // Find or create tenant
+  const db = getDB()
+  const existing = db.prepare(`SELECT * FROM tenants WHERE email = ?`).get(primaryEmail) as any
+
+  let apiKey: string
+  let tenantId: string
+  if (existing) {
+    // Existing tenant — issue an additional key without revoking others
+    tenantId = existing.id
+    apiKey = `aps_live_${randomBytes(32).toString('hex')}`
+    const keyHash = createHash('sha256').update(apiKey).digest('hex')
+    const keyPrefix = apiKey.slice(0, 12)
+    db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
+      .run(randomUUID(), tenantId, keyHash, keyPrefix, 'github-oauth')
+    // Note: no tenant_created event for existing-tenant signin (re-auth, not signup)
+  } else {
+    // New tenant — full signup
+    try {
+      const name = userName || userLogin || primaryEmail.split('@')[0]
+      const result = createTenant({ name, email: primaryEmail, plan: 'free' })
+      tenantId = result.tenant.id
+      apiKey = result.apiKey
+      try { getEventBus().emit(tenantId, { type: 'tenant_created', data: { plan: 'free', source: 'github', github_login: userLogin } }) } catch {}
+      try { sendEmail({ ...signupWelcomeEmail(name, primaryEmail, apiKey), to: primaryEmail }).catch(() => {}) } catch {}
+    } catch (e: any) {
+      console.error('[github-oauth] tenant create error', e)
+      return redirectErr('Could not create your account, email signal@aeoess.com')
+    }
+  }
+
+  res.redirect(`${APP_ORIGIN}/dashboard.html#welcome=${encodeURIComponent(apiKey)}`)
+})
+
+// ═══════════════════════════════════════
 // Public Trust Profile (no auth required)
 // Cross-org trust querying: any sandbox, registry, or agent
 // can check an agent's grade before interaction.
