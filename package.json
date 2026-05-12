@@ -7,7 +7,7 @@
     "build": "npx tsc",
     "start": "node dist/server.js",
     "dev": "npx tsx src/server.ts",
-    "test": "npx tsx --test test/**/*.test.ts",
+    "test": "npx tsx --test test/*.test.ts test/**/*.test.ts",
     "seed:bound-demo": "tsx scripts/seed-bound-demo.ts"
   },
   "keywords": [],
@@ -15,7 +15,9 @@
   "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "agent-passport-system": "^2.6.0-alpha.3",
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
     "csv-stringify": "^6.7.0",
