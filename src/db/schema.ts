@@ -531,6 +531,45 @@ function createTables() {
   } catch {}
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
+
+  // ═══════════════════════════════════════
+  // Email/password authentication (2026-05-11)
+  //
+  // password_hash is nullable: existing tenants created via GitHub OAuth
+  // or via email-only signup do not have one. They authenticate via
+  // existing API keys or GitHub OAuth until they opt into password auth
+  // via the forgot-password flow.
+  //
+  // email_verified is a soft signal — does not gate login. Useful for
+  // future-proofing sensitive ops (e.g. plan upgrades).
+  // ═══════════════════════════════════════
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN password_hash TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN password_set_at TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified_at TEXT`) } catch {}
+
+  // Password reset and email verification tokens.
+  // Store SHA-256(token), never the raw token. Single-use (used_at).
+  // Expires after 1 hour (password_reset) or 24 hours (email_verification).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_hash TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_password_reset_tenant ON password_reset_tokens(tenant_id);
+
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+      token_hash TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_verify_tenant ON email_verification_tokens(tenant_id);
+  `)
 }
 
 // ═══════════════════════════════════════

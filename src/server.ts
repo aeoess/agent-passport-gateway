@@ -77,7 +77,15 @@ import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
-import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail } from './notifications/email.js'
+import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
+import {
+  validatePassword, isValidEmail, normalizeEmail,
+  hashPassword, verifyPassword, burnTime,
+  findTenantByEmail, setTenantPassword, markEmailVerified,
+  issueApiKey, revokeAllApiKeysForTenant,
+  createPasswordResetToken, consumePasswordResetToken,
+  createEmailVerificationToken, consumeEmailVerificationToken,
+} from './auth/email-password.js'
 
 const PORT = parseInt(process.env.PORT || '3200')
 const DB_PATH = dbPath
@@ -434,6 +442,271 @@ app.get('/auth/github/callback', async (req, res) => {
   }
 
   res.redirect(`${APP_ORIGIN}/dashboard.html#welcome=${encodeURIComponent(apiKey)}`)
+})
+
+// ═══════════════════════════════════════
+// Email/password authentication
+// Composes with existing API-key surface — each successful flow issues
+// or re-issues an aps_live_* key. See src/auth/email-password.ts for
+// the rationale on enumeration defence and password rules.
+// ═══════════════════════════════════════
+
+const emailAuthSignupLimiter = new RateLimiterMemory({
+  points: 5,
+  duration: 3600,
+  keyPrefix: 'email_auth_signup',
+})
+
+const emailAuthLoginLimiter = new RateLimiterMemory({
+  points: 10,
+  duration: 900, // 10 attempts per 15 min per IP
+  keyPrefix: 'email_auth_login',
+})
+
+const emailAuthForgotLimiter = new RateLimiterMemory({
+  points: 5,
+  duration: 3600,
+  keyPrefix: 'email_auth_forgot',
+})
+
+const emailAuthResetLimiter = new RateLimiterMemory({
+  points: 10,
+  duration: 3600,
+  keyPrefix: 'email_auth_reset',
+})
+
+// POST /auth/email/signup — create tenant with password
+app.post('/auth/email/signup', async (req, res) => {
+  try {
+    await emailAuthSignupLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Signup rate limit exceeded. Try again later.' })
+  }
+
+  const { name, email: rawEmail, password } = req.body || {}
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Required: name' })
+  }
+  if (!rawEmail || typeof rawEmail !== 'string' || !isValidEmail(rawEmail)) {
+    return res.status(400).json({ error: 'Valid email required' })
+  }
+  const passwordCheck = validatePassword(password)
+  if (!passwordCheck.ok) {
+    return res.status(400).json({ error: passwordCheck.reason })
+  }
+
+  const email = normalizeEmail(rawEmail)
+  const existing = findTenantByEmail(email)
+  if (existing) {
+    // Match the pre-existing /api/v1/signup behaviour (409 on duplicate).
+    // The portal already handles this case with "sign in instead".
+    return res.status(409).json({ error: 'Email already registered' })
+  }
+
+  let tenantId: string
+  let apiKey: string
+  try {
+    const result = createTenant({ name: name.trim(), email, plan: 'free' })
+    tenantId = result.tenant.id
+    apiKey = result.apiKey
+  } catch (e: any) {
+    if (e.message?.includes('UNIQUE')) {
+      return res.status(409).json({ error: 'Email already registered' })
+    }
+    console.error('[email-auth/signup] tenant create error', e)
+    return res.status(500).json({ error: 'Could not create account' })
+  }
+
+  try {
+    const hash = await hashPassword(password)
+    setTenantPassword(tenantId, hash)
+  } catch (e: any) {
+    console.error('[email-auth/signup] password hash error', e)
+    // Tenant was created but password failed to store. They can still
+    // sign in via the forgot-password flow. Surface 500 so client knows
+    // signup did not fully complete.
+    return res.status(500).json({ error: 'Account created without password — use Forgot Password to set one' })
+  }
+
+  // Emit tenant_created event (matches /api/v1/signup behaviour)
+  try { getEventBus().emit(tenantId, { type: 'tenant_created', data: { plan: 'free', source: 'email-password', name } }) } catch {}
+
+  // Send welcome email with API key (matches /api/v1/signup behaviour)
+  try { sendEmail({ ...signupWelcomeEmail(name, email, apiKey), to: email }).catch(() => {}) } catch {}
+
+  // Send email verification (best-effort)
+  try {
+    const verifyToken = createEmailVerificationToken(tenantId)
+    const verifyUrl = `${GATEWAY_URL}/auth/email/verify?token=${encodeURIComponent(verifyToken)}`
+    sendEmail({ ...emailVerificationEmail(name, email, verifyUrl), to: email }).catch(() => {})
+  } catch (e) {
+    console.error('[email-auth/signup] verify email send failed', e)
+  }
+
+  return res.status(201).json({
+    message: 'Account created. Save your API key — it will not be shown again.',
+    tenant_id: tenantId,
+    plan: 'free',
+    api_key: apiKey,
+    email_verified: false,
+  })
+})
+
+// POST /auth/email/login — verify password, issue new API key
+app.post('/auth/email/login', async (req, res) => {
+  try {
+    await emailAuthLoginLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Too many login attempts, try again later.' })
+  }
+
+  const { email: rawEmail, password } = req.body || {}
+  if (!rawEmail || typeof rawEmail !== 'string' || !isValidEmail(rawEmail)) {
+    // Don't leak whether the email is valid-format; still burn time.
+    await burnTime()
+    return res.status(401).json({ error: 'Invalid email or password' })
+  }
+  if (typeof password !== 'string' || password.length === 0) {
+    await burnTime()
+    return res.status(401).json({ error: 'Invalid email or password' })
+  }
+
+  const email = normalizeEmail(rawEmail)
+  const tenant = findTenantByEmail(email)
+
+  // Constant-time on unknown-email path: still run a bcrypt compare so
+  // attackers can't distinguish "no such user" from "wrong password" by
+  // response timing.
+  if (!tenant || !tenant.password_hash) {
+    await burnTime()
+    return res.status(401).json({ error: 'Invalid email or password' })
+  }
+
+  const ok = await verifyPassword(password, tenant.password_hash)
+  if (!ok) {
+    return res.status(401).json({ error: 'Invalid email or password' })
+  }
+
+  if (tenant.status !== 'active') {
+    return res.status(403).json({ error: 'Account is not active. Contact signal@aeoess.com' })
+  }
+
+  // Issue a fresh API key for this sign-in. Mirrors github-oauth pattern.
+  const apiKey = issueApiKey(tenant.id, `email-login-${Date.now()}`)
+
+  return res.status(200).json({
+    message: 'Signed in. Save your API key — it will not be shown again.',
+    tenant_id: tenant.id,
+    plan: tenant.plan,
+    api_key: apiKey,
+    email_verified: tenant.email_verified === 1,
+  })
+})
+
+// POST /auth/email/forgot — send password reset link (always 200)
+app.post('/auth/email/forgot', async (req, res) => {
+  try {
+    await emailAuthForgotLimiter.consume(req.ip || 'unknown')
+  } catch {
+    // Even on rate-limit, return generic 200 to prevent timing/enumeration.
+    return res.status(200).json({ message: 'If that email is on file, a reset link has been sent.' })
+  }
+
+  const { email: rawEmail } = req.body || {}
+  // Generic 200 regardless — never reveals whether the email exists.
+  const genericResponse = { message: 'If that email is on file, a reset link has been sent.' }
+
+  if (!rawEmail || typeof rawEmail !== 'string' || !isValidEmail(rawEmail)) {
+    return res.status(200).json(genericResponse)
+  }
+
+  const email = normalizeEmail(rawEmail)
+  const tenant = findTenantByEmail(email)
+  if (!tenant) {
+    return res.status(200).json(genericResponse)
+  }
+
+  try {
+    const resetToken = createPasswordResetToken(tenant.id)
+    const resetUrl = `${APP_ORIGIN}/portal.html?reset_token=${encodeURIComponent(resetToken)}`
+    sendEmail({ ...passwordResetEmail(tenant.name, email, resetUrl), to: email }).catch(() => {})
+  } catch (e) {
+    console.error('[email-auth/forgot] reset token error', e)
+    // Still return 200 to prevent enumeration.
+  }
+
+  return res.status(200).json(genericResponse)
+})
+
+// POST /auth/email/reset — consume reset token, set new password
+app.post('/auth/email/reset', async (req, res) => {
+  try {
+    await emailAuthResetLimiter.consume(req.ip || 'unknown')
+  } catch {
+    return res.status(429).json({ error: 'Too many reset attempts, try again later.' })
+  }
+
+  const { token, password } = req.body || {}
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'Reset token required' })
+  }
+  const passwordCheck = validatePassword(password)
+  if (!passwordCheck.ok) {
+    return res.status(400).json({ error: passwordCheck.reason })
+  }
+
+  const consumed = consumePasswordResetToken(token)
+  if (!consumed.ok || !consumed.tenantId) {
+    return res.status(400).json({ error: consumed.reason || 'Invalid reset token' })
+  }
+
+  try {
+    const hash = await hashPassword(password)
+    setTenantPassword(consumed.tenantId, hash)
+  } catch (e: any) {
+    console.error('[email-auth/reset] hash error', e)
+    return res.status(500).json({ error: 'Could not update password, try again' })
+  }
+
+  // Defence-in-depth: revoke ALL existing keys. User signs in fresh.
+  const revokedCount = revokeAllApiKeysForTenant(consumed.tenantId)
+
+  // Notify the user that the password changed (best-effort).
+  try {
+    const db = getDB()
+    const row = db.prepare(`SELECT name, email FROM tenants WHERE id = ?`).get(consumed.tenantId) as any
+    if (row?.email) {
+      sendEmail({ ...passwordChangedEmail(row.name || row.email, row.email), to: row.email }).catch(() => {})
+    }
+  } catch (e) {
+    console.error('[email-auth/reset] notify email failed', e)
+  }
+
+  return res.status(200).json({
+    message: 'Password updated. Sign in to issue a new API key.',
+    api_keys_revoked: revokedCount,
+  })
+})
+
+// GET /auth/email/verify?token=... — mark email_verified=1
+app.get('/auth/email/verify', async (req, res) => {
+  const token = typeof req.query.token === 'string' ? req.query.token : ''
+  if (!token) {
+    return res.redirect(`${APP_ORIGIN}/portal.html?verify_error=${encodeURIComponent('Missing verification token')}`)
+  }
+
+  const consumed = consumeEmailVerificationToken(token)
+  if (!consumed.ok || !consumed.tenantId) {
+    return res.redirect(`${APP_ORIGIN}/portal.html?verify_error=${encodeURIComponent(consumed.reason || 'Invalid verification link')}`)
+  }
+
+  try {
+    markEmailVerified(consumed.tenantId)
+  } catch (e) {
+    console.error('[email-auth/verify] mark verified error', e)
+  }
+
+  res.redirect(`${APP_ORIGIN}/portal.html?verify_ok=1`)
 })
 
 // ═══════════════════════════════════════

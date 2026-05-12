@@ -263,6 +263,83 @@ ${spentPercent >= 90 ? '<p style="color:#e53e3e;font-weight:bold">Action require
   return { to: '', subject: `AEOESS Spend Alert - Agent ${agentId} at ${spentPercent}%`, textBody: text, htmlBody: html }
 }
 
+// ═══════════════════════════════════════
+// Email/password authentication templates
+// ═══════════════════════════════════════
+
+export function passwordResetEmail(name: string, email: string, resetUrl: string): EmailOptions {
+  const text = `Password reset requested for ${email}.
+
+Open this link to set a new password (valid for 1 hour):
+
+${resetUrl}
+
+If you did not request this, ignore this email. Your password will not change.
+
+For your safety, after resetting your password all existing API keys for this account will be revoked. Sign in again to issue a fresh key.
+
+-- AEOESS`
+
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+<h2 style="color:#63b3ed">Password reset</h2>
+<p>Hi ${esc(name)},</p>
+<p>A password reset was requested for <strong>${esc(email)}</strong>.</p>
+<p><a href="${esc(resetUrl)}" style="display:inline-block;padding:10px 18px;background:#1a4fa0;color:#fff;text-decoration:none;border-radius:4px;font-weight:500">Set a new password</a></p>
+<p style="font-size:13px;color:#718096">Link valid for 1 hour. If you did not request this, ignore this email.</p>
+<p style="font-size:13px;color:#718096">After resetting, all existing API keys for this account are revoked for your safety. Sign in again to issue a fresh key.</p>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+<p style="font-size:12px;color:#718096">AEOESS - Enforcement infrastructure for AI agents</p>
+</div>`
+
+  return { to: email, subject: 'Reset your AEOESS password', textBody: text, htmlBody: html }
+}
+
+export function emailVerificationEmail(name: string, email: string, verifyUrl: string): EmailOptions {
+  const text = `Verify your email for AEOESS, ${name}.
+
+Open this link to confirm ${email} is yours (valid for 24 hours):
+
+${verifyUrl}
+
+If you did not create an AEOESS account, ignore this email.
+
+-- AEOESS`
+
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+<h2 style="color:#63b3ed">Verify your email</h2>
+<p>Hi ${esc(name)},</p>
+<p>Confirm that <strong>${esc(email)}</strong> is yours so we can keep your account secure.</p>
+<p><a href="${esc(verifyUrl)}" style="display:inline-block;padding:10px 18px;background:#1a4fa0;color:#fff;text-decoration:none;border-radius:4px;font-weight:500">Verify email</a></p>
+<p style="font-size:13px;color:#718096">Link valid for 24 hours.</p>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+<p style="font-size:12px;color:#718096">AEOESS - Enforcement infrastructure for AI agents</p>
+</div>`
+
+  return { to: email, subject: 'Verify your AEOESS email', textBody: text, htmlBody: html }
+}
+
+export function passwordChangedEmail(name: string, email: string): EmailOptions {
+  const text = `Your AEOESS password was just changed, ${name}.
+
+If this was you, no further action is needed. All existing API keys for this account have been revoked. Sign in to issue a fresh key.
+
+If this was NOT you, contact signal@aeoess.com immediately.
+
+-- AEOESS`
+
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+<h2 style="color:#63b3ed">Password changed</h2>
+<p>Hi ${esc(name)},</p>
+<p>Your AEOESS password was just changed.</p>
+<p style="font-size:13px;color:#1a1a2e">All existing API keys for this account have been revoked as a safety measure. Sign in to issue a fresh key.</p>
+<p style="font-size:13px;color:#e53e3e"><strong>If this was not you, contact <a href="mailto:signal@aeoess.com" style="color:#e53e3e">signal@aeoess.com</a> immediately.</strong></p>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+<p style="font-size:12px;color:#718096">AEOESS - Enforcement infrastructure for AI agents</p>
+</div>`
+
+  return { to: email, subject: 'Your AEOESS password was changed', textBody: text, htmlBody: html }
+}
+
 // HTML escape helper
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
