@@ -1159,15 +1159,22 @@ gatewayRouter.get('/decisions/recent', (req: any, res) => {
   })
 })
 
-// GET /api/v1/receipts/recent — Recent signed receipts for THIS tenant
+// GET /api/v1/receipts/recent — Recent signed evaluation receipts for THIS tenant.
+//
+// Reads from evaluation_receipts (gateway-signed decision receipts).
+// The 'receipts' table is the post-execution receipt surface emitted
+// by the SDK after the agent acts; the dashboard "Receipts" tile and
+// this endpoint both reflect evaluation_receipts so the numbers agree.
 gatewayRouter.get('/receipts/recent', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
   const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 100)
   const rows = db.prepare(`
-    SELECT id, evaluation_id, agent_id, action_type, verdict,
-           execution_result, signature, created_at
-    FROM receipts
+    SELECT id, agent_id, evaluation_id, event_type, decision_stage,
+           action_type, verdict, reason_code, delegation_id,
+           policy_hash, schema_version, receipt_hash, gateway_signature,
+           created_at
+    FROM evaluation_receipts
     WHERE tenant_id = ?
     ORDER BY created_at DESC
     LIMIT ?
