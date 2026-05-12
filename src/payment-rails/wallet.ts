@@ -58,6 +58,7 @@ export interface WalletTransaction {
 
 import { xnoToRaw, rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
+import { toCents } from '../billing/money.js'
 import { NanoLocalWallet, getLocalWallet, deriveAddress, getMasterSeed } from './wallet-crypto.js'
 
 // Dynamic import for SDK scope matching (ESM)
@@ -269,8 +270,18 @@ export class AgentWalletService {
         const amount = Math.round(opts.amountXno * 1e6) / 1e6
         if (amount > remaining) return false
       }
-      db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
-        .run(opts.amountXno, delegation.id)
+      // C4 dual-write: mirror to spend_used_cents. Note: this column treats
+      // spend_used uniformly across rails — same convention as the REAL
+      // column already does (i.e. XNO and USD both accumulate here). The
+      // unit-confusion concern is pre-existing and will be addressed when
+      // we introduce a per-rail spend_used column in Phase B.
+      const incCents = toCents(opts.amountXno) || 0
+      db.prepare(
+        `UPDATE delegations
+         SET spend_used = spend_used + ?,
+             spend_used_cents = COALESCE(spend_used_cents, 0) + ?
+         WHERE id = ?`
+      ).run(opts.amountXno, incCents, delegation.id)
       return true
     }).immediate()
 
@@ -324,9 +335,15 @@ export class AgentWalletService {
       return tx
 
     } catch (e: any) {
-      // Reverse the optimistic debit since on-chain send failed
-      db.prepare(`UPDATE delegations SET spend_used = spend_used - ? WHERE id = ?`)
-        .run(opts.amountXno, delegation.id)
+      // Reverse the optimistic debit since on-chain send failed.
+      // C4 dual-write: keep both columns in sync on the rollback.
+      const reverseCents = toCents(opts.amountXno) || 0
+      db.prepare(
+        `UPDATE delegations
+         SET spend_used = spend_used - ?,
+             spend_used_cents = COALESCE(spend_used_cents, 0) - ?
+         WHERE id = ?`
+      ).run(opts.amountXno, reverseCents, delegation.id)
 
       db.prepare(`INSERT INTO wallet_transactions
         (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,

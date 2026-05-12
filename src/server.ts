@@ -94,10 +94,31 @@ const app = express()
 app.set('trust proxy', 1) // Trust first proxy (Railway) for correct req.ip
 
 // Security
-// CSP is disabled because we serve a React-via-Babel landing page at GET /
-// that needs inline scripts, unpkg-loaded React, and google-fonts CSS.
-// The rest of the gateway returns JSON, where CSP is moot anyway.
-app.use(helmet({ contentSecurityPolicy: false }))
+// CSP: gateway origin renders no HTML except a 302 redirect from GET /
+// (to ${APP_ORIGIN}/portal.html) and JSON for every API endpoint. We can
+// therefore lock script/style/connect/img origins tight.
+//
+// Note: a previous comment in this slot claimed CSP was off because of a
+// React-via-Babel landing page. That landing page was removed in bb8607b;
+// the comment outlived the code. Re-enabling here.
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc:    ["'self'"],
+      scriptSrc:     ["'self'"],
+      styleSrc:      ["'self'"],
+      imgSrc:        ["'self'", 'data:'],
+      connectSrc:    ["'self'", 'https://aeoess.com'],
+      fontSrc:       ["'self'"],
+      objectSrc:     ["'none'"],
+      frameAncestors:["'none'"],
+      baseUri:       ["'self'"],
+      formAction:    ["'self'", 'https://aeoess.com'],
+      upgradeInsecureRequests: [],
+    },
+  },
+}))
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://aeoess.com,https://gateway.aeoess.com').split(',').map(s => s.trim())
 app.use(cors({ origin: (origin, callback) => {
   if (!origin || allowedOrigins.includes(origin)) callback(null, true)

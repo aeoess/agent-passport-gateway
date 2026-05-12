@@ -11,6 +11,7 @@
  */
 
 import { Router } from 'express'
+import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { randomUUID, createHash } from 'node:crypto'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import { getGatewayIdentity } from './identity.js'
@@ -24,6 +25,7 @@ import { sendEmail, spendAlertEmail } from '../notifications/email.js'
 // Spend alert dedup: track which delegation+threshold combos have been alerted
 const spendAlertsSent = new Set<string>()
 import { checkAgentLimit, checkEvaluationLimit } from '../billing/limits.js'
+import { toCents } from '../billing/money.js'
 
 function safeError(e: any, context: string): { error: string; ref: string } {
   const ref = randomUUID().slice(0, 8)
@@ -265,30 +267,13 @@ function computeLexicalScore(sourceText: string, outputText: string) {
 // Usage check middleware
 // ═══════════════════════════════════════
 
-function checkUsageLimit(tenant: Tenant): { allowed: boolean; reason?: string } {
-  const db = getDB()
-  const period = new Date().toISOString().slice(0, 7) // YYYY-MM
-  const usage = db.prepare(`SELECT evaluations FROM usage WHERE tenant_id = ? AND period = ?`)
-    .get(tenant.id, period) as { evaluations: number } | undefined
-  const current = usage?.evaluations || 0
-  const limit = PLAN_LIMITS[tenant.plan as keyof typeof PLAN_LIMITS].evaluationsPerMonth
-  if (limit > 0 && current >= limit) {
-    return { allowed: false, reason: `Monthly limit reached: ${current}/${limit}. Upgrade at aeoess.com/pricing` }
-  }
-  return { allowed: true }
-}
-
-function incrementUsage(tenantId: string) {
-  const db = getDB()
-  const period = new Date().toISOString().slice(0, 7)
-  // Manual upsert — works regardless of UNIQUE constraint on table
-  const existing = db.prepare(`SELECT id FROM usage WHERE tenant_id = ? AND period = ?`).get(tenantId, period) as any
-  if (existing) {
-    db.prepare(`UPDATE usage SET evaluations = evaluations + 1, updated_at = datetime('now') WHERE id = ?`).run(existing.id)
-  } else {
-    db.prepare(`INSERT INTO usage (tenant_id, period, evaluations) VALUES (?, ?, 1)`).run(tenantId, period)
-  }
-}
+// C3 (audit 2026-05-12): the legacy `checkUsageLimit` + `incrementUsage`
+// pair maintained a denormalised counter in the `usage` table that
+// diverged from the source-of-truth `policy_evaluations` rowcount under
+// any failure path. We now query `policy_evaluations` directly via
+// `checkEvaluationLimit` (imported from billing/limits.ts). The functions
+// previously here have been removed; the `usage` table is left in place
+// for historical aggregates but is no longer written by /evaluate.
 
 // ═══════════════════════════════════════
 // POST /api/v1/evaluate — Policy Evaluation
@@ -303,12 +288,6 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   const evalLimit = checkEvaluationLimit(tenant.id, tenant.plan)
   if (!evalLimit.allowed) {
     return res.status(429).json({ error: evalLimit.reason, current: evalLimit.current, limit: evalLimit.limit })
-  }
-
-  // Usage check
-  const usageCheck = checkUsageLimit(tenant)
-  if (!usageCheck.allowed) {
-    return res.status(429).json({ error: usageCheck.reason })
   }
 
   const { agent_id, action_type, action_target, scope_required, estimated_cost, action_args } = req.body
@@ -489,8 +468,15 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs, deriveTaskClass(action_type))
 
     if (verdict === 'permit' && estimated_cost && delegation) {
-      db.prepare(`UPDATE delegations SET spend_used = spend_used + ? WHERE id = ?`)
-        .run(estimated_cost, delegation.id)
+      // C4 dual-write: REAL column (existing) + INTEGER cents (forward-compat).
+      // COALESCE guards against rows that pre-date the cents column.
+      const inc_cents = toCents(estimated_cost) || 0
+      db.prepare(
+        `UPDATE delegations
+         SET spend_used = spend_used + ?,
+             spend_used_cents = COALESCE(spend_used_cents, 0) + ?
+         WHERE id = ?`
+      ).run(estimated_cost, inc_cents, delegation.id)
     }
 
     return { verdict, reason, violations, durationMs, delegation }
@@ -506,7 +492,9 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     reason, delegationId: delegation?.id || null,
   })
 
-  incrementUsage(tenant.id)
+  // C3 (audit 2026-05-12): no longer write to the legacy `usage` table.
+  // `policy_evaluations` (inserted via mintEvaluationReceipt above) is
+  // the single source of truth and is what `checkEvaluationLimit` reads.
 
   if (verdict === 'permit' && estimated_cost && delegation) {
     try { getEventBus().emit(tenant.id, { type: 'spend_update', agentId: agent_id, data: { delegation_id: delegation.id, spend_used: (delegation.spend_used || 0) + estimated_cost, spend_limit: delegation.spend_limit } }) } catch {}
@@ -611,8 +599,24 @@ gatewayRouter.post('/receipt', (req: any, res) => {
 // POST /api/v1/revoke — Cascade Revocation
 // ═══════════════════════════════════════
 
-gatewayRouter.post('/revoke', (req: any, res) => {
+// H1 (audit 2026-05-12): per-tenant rate limit on cascade revoke.
+// A leaked API key could otherwise cascade-revoke a tenant's entire fleet
+// in a single hostile session. 5 revokes/min/tenant gives an operator
+// plenty of headroom for normal use; anything past that is suspicious.
+const revokeLimiter = new RateLimiterMemory({
+  points: 5,
+  duration: 60,
+  keyPrefix: 'revoke',
+})
+
+gatewayRouter.post('/revoke', async (req: any, res) => {
   const tenant: Tenant = req.tenant
+  try { await revokeLimiter.consume(tenant.id) }
+  catch {
+    return res.status(429).json({
+      error: 'Revoke rate limit exceeded (5/min/tenant). If this is unexpected, your API key may be compromised — rotate it immediately at aeoess.com/dashboard.html.',
+    })
+  }
   const { target_type, target_id, revoked_by } = req.body
   if (!target_type || !target_id) {
     return res.status(400).json({ error: 'Required: target_type (agent|delegation|data_source), target_id' })
@@ -1033,8 +1037,11 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
   if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
   const id = randomUUID()
-  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spend_limit || null, max_depth || 3)
+  // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
+  const spendLimitUsd = spend_limit || null
+  const spendLimitCents = toCents(spendLimitUsd)
+  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3)
   try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
   res.status(201).json({ id, status: 'active' })
 })
@@ -1085,7 +1092,13 @@ gatewayRouter.get('/dashboard', (req: any, res) => {
 
   const agents = db.prepare(`SELECT COUNT(*) as c FROM agents WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
   const delegations = db.prepare(`SELECT COUNT(*) as c FROM delegations WHERE tenant_id = ? AND status = 'active'`).get(tenant.id) as any
-  const usage = db.prepare(`SELECT evaluations FROM usage WHERE tenant_id = ? AND period = ?`).get(tenant.id, period) as any
+  // C3 (audit 2026-05-12): count from policy_evaluations directly. The `usage`
+  // table is no longer written by /evaluate, so it would always read 0.
+  const monthStart = new Date()
+  monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0)
+  const evalsThisMonth = (db.prepare(
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND created_at >= ?`
+  ).get(tenant.id, monthStart.toISOString()) as { c: number }).c
   const receipts = db.prepare(`SELECT COUNT(*) as c FROM evaluation_receipts WHERE tenant_id = ?`).get(tenant.id) as any
   const alerts = db.prepare(`SELECT * FROM alerts WHERE tenant_id = ? AND acknowledged_at IS NULL ORDER BY created_at DESC LIMIT 10`).all(tenant.id)
   const limit = PLAN_LIMITS[tenant.plan as keyof typeof PLAN_LIMITS]
@@ -1097,10 +1110,10 @@ gatewayRouter.get('/dashboard', (req: any, res) => {
     agents: { active: agents.c, limit: limit.maxAgents },
     delegations: { active: delegations.c },
     usage: {
-      evaluations_this_month: usage?.evaluations || 0,
+      evaluations_this_month: evalsThisMonth,
       limit: limit.evaluationsPerMonth,
       utilization: limit.evaluationsPerMonth > 0
-        ? ((usage?.evaluations || 0) / limit.evaluationsPerMonth * 100).toFixed(1) + '%'
+        ? (evalsThisMonth / limit.evaluationsPerMonth * 100).toFixed(1) + '%'
         : 'unlimited',
     },
     receipts: { total: receipts.c },
@@ -1272,13 +1285,19 @@ gatewayRouter.post('/access-receipts', (req: any, res) => {
   const baseRate = terms?.compensation?.rate || 0
   const weight = getPurposeWeight(purpose || 'read', terms)
   const effectiveRate = baseRate * weight
-  // Atomic upsert — no TOCTOU race on concurrent access receipts
-  db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, currency)
-    VALUES (?, ?, ?, ?, 1, ?, ?)
+  // Atomic upsert — no TOCTOU race on concurrent access receipts.
+  // C4 dual-write: amount (REAL) + amount_cents (INTEGER). The COALESCE
+  // guards rows pre-dating the cents column.
+  const effectiveRateCents = toCents(effectiveRate) || 0
+  db.prepare(`INSERT INTO contributions (id, tenant_id, source_id, agent_id, access_count, amount, amount_cents, currency)
+    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
     ON CONFLICT(tenant_id, source_id, agent_id)
-    DO UPDATE SET access_count = access_count + 1, amount = amount + ?, updated_at = datetime('now')`)
-    .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate,
-      terms?.compensation?.currency || 'usd', effectiveRate)
+    DO UPDATE SET access_count = access_count + 1,
+                  amount = amount + ?,
+                  amount_cents = COALESCE(amount_cents, 0) + ?,
+                  updated_at = datetime('now')`)
+    .run(randomUUID(), tenant.id, source_id, agent_id, effectiveRate, effectiveRateCents,
+      terms?.compensation?.currency || 'usd', effectiveRate, effectiveRateCents)
 
   // ── Attribution Alerts (fire-and-forget) ──
   try {
@@ -1397,8 +1416,10 @@ gatewayRouter.post('/settlements', (req: any, res) => {
   }))
   const total = contributions.reduce((s: number, c: any) => s + c.amount, 0)
   const id = randomUUID()
-  db.prepare(`INSERT INTO settlements (id, tenant_id, period_start, period_end, total_amount, line_items) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, period_start, period_end, total, JSON.stringify(lineItems))
+  // C4 dual-write: total_amount (REAL) + total_amount_cents (INTEGER).
+  const totalCents = toCents(total) || 0
+  db.prepare(`INSERT INTO settlements (id, tenant_id, period_start, period_end, total_amount, total_amount_cents, line_items) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, period_start, period_end, total, totalCents, JSON.stringify(lineItems))
   try { getEventBus().emit(tenant.id, { type: 'settlement_created', data: { settlement_id: id, period_start, period_end, total_amount: total, line_items_count: lineItems.length } }) } catch {}
   res.status(201).json({ settlement_id: id, period_start, period_end, total_amount: Math.round(total * 10000) / 10000, line_items: lineItems.length })
 })

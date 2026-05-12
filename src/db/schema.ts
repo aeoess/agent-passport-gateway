@@ -535,6 +535,70 @@ function createTables() {
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 
+  // H4 (audit 2026-05-12): Enum-shaped columns (tenants.plan, tenants.status)
+  // were not constrained at the DB layer. A typo in a Stripe webhook
+  // metadata field or a future endpoint that skips validation could write
+  // "Pro" / "PRO" / "gold" / "" — all of which silently disable plan-limit
+  // enforcement via PLAN_LIMITS[unknownKey] → undefined → || PLAN_LIMITS.free.
+  // The validation now lives in two places:
+  //   1. App layer: Stripe webhook + billing/checkout already validate against an allowlist.
+  //   2. DB layer (defence in depth): BEFORE INSERT/UPDATE triggers below.
+  // SQLite trigger names are scoped per-database; CREATE TRIGGER IF NOT
+  // EXISTS makes this idempotent across restarts.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS check_tenants_plan_insert
+        BEFORE INSERT ON tenants
+        FOR EACH ROW
+        WHEN NEW.plan NOT IN ('free', 'pro', 'enterprise')
+        BEGIN SELECT RAISE(ABORT, 'invalid plan value (allowed: free, pro, enterprise)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_tenants_plan_update
+        BEFORE UPDATE OF plan ON tenants
+        FOR EACH ROW
+        WHEN NEW.plan NOT IN ('free', 'pro', 'enterprise')
+        BEGIN SELECT RAISE(ABORT, 'invalid plan value (allowed: free, pro, enterprise)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_tenants_status_insert
+        BEFORE INSERT ON tenants
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'suspended', 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'invalid status value (allowed: active, suspended, deleted)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_tenants_status_update
+        BEFORE UPDATE OF status ON tenants
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'suspended', 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'invalid status value (allowed: active, suspended, deleted)'); END;
+    `)
+  } catch (e: any) {
+    console.error('[migration] enum-trigger install failed:', e?.message || e)
+  }
+
+  // ═══════════════════════════════════════
+  // C4 (audit 2026-05-12): Money-as-REAL is unsafe. SQLite stores REAL as
+  // IEEE 754 double; cents arithmetic on doubles drifts under repeated
+  // additions (the classic 0.1 + 0.2 ≠ 0.3 problem). Settlement math
+  // belongs on INTEGER cents.
+  //
+  // This migration is ADDITIVE ONLY. We add *_cents INTEGER columns
+  // alongside the existing REAL columns and dual-write through the
+  // moneyDual() helper (src/lib/money.ts). Reads still come from the
+  // REAL column. A later phase will:
+  //   1. Backfill *_cents from REAL once dual-write has run for a billing cycle.
+  //   2. Verify drift is bounded.
+  //   3. Cut reads over to *_cents.
+  //   4. Drop the REAL columns.
+  // Splitting in two phases means: no risk of partial-write corruption
+  // mid-rollout; no downtime; and the old code path still works on
+  // databases that haven't received the new column yet.
+  // ═══════════════════════════════════════
+  // Scope: USD-denominated columns only. payment_transactions.amount is
+  // rail-native (XNO for Nano, future rails may differ) — its REAL value is
+  // a unit conversion problem, not a cents problem, and gets its own future
+  // migration once we add an explicit `currency` cents column per rail.
+  try { db.exec(`ALTER TABLE delegations ADD COLUMN spend_limit_cents INTEGER`) } catch {}
+  try { db.exec(`ALTER TABLE delegations ADD COLUMN spend_used_cents INTEGER DEFAULT 0`) } catch {}
+  try { db.exec(`ALTER TABLE contributions ADD COLUMN amount_cents INTEGER DEFAULT 0`) } catch {}
+  try { db.exec(`ALTER TABLE settlements ADD COLUMN total_amount_cents INTEGER DEFAULT 0`) } catch {}
+
   // ═══════════════════════════════════════
   // Email/password authentication (2026-05-11)
   //
@@ -793,10 +857,15 @@ export function addTenantAlias(opts: {
 // Plan Limits
 // ═══════════════════════════════════════
 
+// C1+C2 (audit 2026-05-12): Production-tier limits previously set to
+// 25 / 50,000 disagreed with pricing.html which promised 100 / 500,000.
+// We bumped the engineered limits up to match the public commitment.
+// Free tier deliberately tight to push paying signups; Enterprise stays
+// uncapped and is sold via direct contract.
 export const PLAN_LIMITS = {
-  free:       { evaluationsPerMonth: 1000,   maxAgents: 3,    complianceReports: false, sla: false },
-  pro:        { evaluationsPerMonth: 50000,  maxAgents: 25,   complianceReports: true,  sla: false },
-  enterprise: { evaluationsPerMonth: -1,     maxAgents: -1,   complianceReports: true,  sla: true  },
+  free:       { evaluationsPerMonth: 1000,    maxAgents: 3,    complianceReports: false, sla: false },
+  pro:        { evaluationsPerMonth: 500000,  maxAgents: 100,  complianceReports: true,  sla: false },
+  enterprise: { evaluationsPerMonth: -1,      maxAgents: -1,   complianceReports: true,  sla: true  },
 } as const
 
 export type Plan = keyof typeof PLAN_LIMITS
