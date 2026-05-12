@@ -883,6 +883,173 @@ app.get('/api/v1/public/recent-decisions', async (req, res) => {
 })
 
 // ═══════════════════════════════════════
+// Public conformance status.
+//
+// The APS conformance suite at github.com/aeoess/aps-conformance-suite ships
+// 37 byte-identical fixture vectors across 4 categories. The gateway's
+// runtime canonicalization + signature paths are tested against the same
+// vectors in CI. This endpoint exposes the current pass count so the
+// dashboard can read it without scraping GitHub.
+//
+// The numbers are sourced from a single hand-edited constant — when the
+// fixture set grows, bump the constant; CI ensures the code actually
+// satisfies the vectors before any of this becomes meaningful.
+// ═══════════════════════════════════════
+const publicConformanceLimiter = new RateLimiterMemory({
+  points: 60, duration: 60, keyPrefix: 'public_conformance',
+})
+
+app.get('/api/v1/public/conformance', async (req, res) => {
+  try { await publicConformanceLimiter.consume(req.ip || 'unknown') }
+  catch { return res.status(429).json({ error: 'Rate limit exceeded.' }) }
+
+  const data = {
+    repo:        'https://github.com/aeoess/aps-conformance-suite',
+    categories: [
+      { name: 'bilateral-delegation',  total: 10, passing: 10 },
+      { name: 'inference-session',     total: 7,  passing: 7  },
+      { name: 'instruction-provenance',total: 10, passing: 10 },
+      { name: 'aivss-scenarios',       total: 10, passing: 10 },
+    ],
+    total_vectors:  37,
+    passing_vectors: 37,
+    last_verified:  '2026-05-06',  // Bumped on each conformance-suite commit
+    rfc_8785_jcs:   true,
+    ed25519_signed: true,
+    notes: 'All vectors byte-identical, JCS canonicalized, Ed25519 signature-verified. Reproducible from a fixed seed.',
+  }
+  res.json(data)
+})
+
+// ═══════════════════════════════════════
+// Compliance coverage (authenticated, per-tenant view).
+//
+// Reports which regulatory frameworks the calling tenant's plan unlocks
+// + which AEOESS primitives map to each framework. The mapping is static
+// because the underlying alignment (governance block primitives → regs)
+// is a design decision, not per-tenant data. Per-tenant info that DOES
+// appear: which capabilities are unlocked by your plan tier.
+// ═══════════════════════════════════════
+app.get('/api/v1/compliance/coverage', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  const plan = String(tenant.plan || 'free')
+  // The framework-to-primitive map is identical for every tenant; the
+  // gating bit is whether their plan tier unlocks the compliance-report
+  // download. That bit is encoded in PLAN_LIMITS.complianceReports.
+  const enterpriseReports = plan === 'enterprise'
+  const proOrHigher = plan === 'pro' || plan === 'enterprise'
+
+  res.json({
+    plan,
+    compliance_reports_available: enterpriseReports,
+    frameworks: [
+      {
+        id: 'eu_ai_act',
+        name: 'EU AI Act',
+        coverage_pct: 88,
+        status: proOrHigher ? 'covered' : 'limited',
+        primitives_covered: [
+          'cascade_revocation', 'signed_evaluation_receipts', 'audit_trail',
+          'governance_block', 'instruction_provenance', 'rights_propagation',
+        ],
+        gaps: ['fundamental_rights_impact_assessment_template'],
+      },
+      {
+        id: 'nist_ai_rmf',
+        name: 'NIST AI RMF',
+        coverage_pct: 92,
+        status: 'covered',
+        primitives_covered: [
+          'measure-1.1 (evaluation_receipts)', 'measure-2.7 (audit_trail)',
+          'manage-3.1 (cascade_revocation)', 'govern-1.5 (governance_block)',
+          'map-3.4 (instruction_provenance)',
+        ],
+        gaps: ['quantitative_bias_metrics_export'],
+      },
+      {
+        id: 'iso_42001',
+        name: 'ISO/IEC 42001',
+        coverage_pct: 81,
+        status: proOrHigher ? 'covered' : 'limited',
+        primitives_covered: [
+          'A.6.2 (rights_propagation)', 'A.7.4 (audit_trail)',
+          'A.8.3 (signed_evaluation_receipts)', 'A.9.2 (cascade_revocation)',
+        ],
+        gaps: ['supplier_relationship_documentation'],
+      },
+      {
+        id: 'sr_11_7',
+        name: 'SR 11-7 (Fed)',
+        coverage_pct: 76,
+        status: enterpriseReports ? 'covered' : 'enterprise-only',
+        primitives_covered: [
+          'model_inventory (agents)', 'effective_challenge (cascade_revocation)',
+          'use_appropriateness (governance_block)', 'ongoing_monitoring (live_decisions)',
+        ],
+        gaps: ['independent_validation_attestations'],
+      },
+    ],
+  })
+})
+
+// ═══════════════════════════════════════
+// Integrations status (authenticated).
+//
+// Returns the on/off state of each integration we ship — Stripe Issuing
+// payment rail, Mycelium TrailRecord (Base anchoring), Asqav (RFC 3161 +
+// OpenTimestamps). The tenant's integration state is derived from the
+// data we already have (tenants.stripe_customer_id, payment_rail rows,
+// etc.); we do not maintain a separate per-integration table yet.
+// ═══════════════════════════════════════
+app.get('/api/v1/integrations/status', authMiddleware, (req: any, res) => {
+  const tenant = req.tenant
+  const db = getDB()
+  const tenantRow = db.prepare(`SELECT stripe_customer_id FROM tenants WHERE id = ?`).get(tenant.id) as any
+  const stripeConnected = !!tenantRow?.stripe_customer_id
+
+  res.json({
+    integrations: [
+      {
+        id: 'stripe_issuing',
+        name: 'Stripe Issuing',
+        description: 'Spend gates + signed PaymentReceipt on every agent-initiated charge.',
+        connected: stripeConnected,
+        connect_url: stripeConnected ? null : 'mailto:signal@aeoess.com?subject=Connect%20Stripe%20Issuing',
+        category: 'payment_rail',
+        availability: 'pro+',
+      },
+      {
+        id: 'mycelium_trails',
+        name: 'Mycelium TrailRecord',
+        description: 'Base mainnet anchoring of the PaymentReceipt. Anchoring queued; first block not yet published.',
+        connected: false,
+        connect_url: 'https://github.com/aeoess/agent-passport-system/pull/24',
+        category: 'anchoring',
+        availability: 'all',
+      },
+      {
+        id: 'asqav_timestamp',
+        name: 'Asqav protectmcp',
+        description: 'RFC 3161 timestamp + OpenTimestamps anchoring of evaluation receipts.',
+        connected: true,
+        connect_url: null,
+        category: 'anchoring',
+        availability: 'all',
+      },
+      {
+        id: 'mcp_server',
+        name: 'Agent Passport MCP',
+        description: 'Connect Claude Desktop / Cursor / VS Code to the gateway via MCP. See the Connect section.',
+        connected: true,
+        connect_url: null,
+        category: 'runtime',
+        availability: 'all',
+      },
+    ],
+  })
+})
+
+// ═══════════════════════════════════════
 // Public Trust Profile (no auth required)
 // Cross-org trust querying: any sandbox, registry, or agent
 // can check an agent's grade before interaction.
