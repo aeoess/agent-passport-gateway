@@ -572,7 +572,38 @@ function createTables() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_email_verify_tenant ON email_verification_tokens(tenant_id);
+
+    -- ─────────────────────────────────────
+    -- tenant_aliases: many-emails-to-one-tenant mapping.
+    -- A tenant's "primary" email lives on tenants.email; additional
+    -- addresses through which the tenant should be reachable (GitHub
+    -- verified emails, work + personal mailboxes, vanity addresses)
+    -- live here. Lookups in GitHub OAuth, /auth/email/login, and
+    -- /auth/email/forgot all check this table.
+    --
+    -- email is the PK and unique across the table — an address can
+    -- only resolve to one tenant. Removing the row de-links it.
+    -- ─────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS tenant_aliases (
+      email TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      source TEXT NOT NULL DEFAULT 'manual',
+      verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_tenant_aliases_tenant ON tenant_aliases(tenant_id);
   `)
+
+  // Backfill tenant_aliases from tenants.email so every existing tenant
+  // is reachable via its primary email through the alias path. Idempotent
+  // via INSERT OR IGNORE on the PK.
+  try {
+    db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+                SELECT email, id, 'primary', 1 FROM tenants
+                WHERE status = 'active' AND email NOT LIKE 'tombstone-%'`).run()
+  } catch (e: any) {
+    console.error('[migration] tenant_aliases backfill failed:', e?.message || e)
+  }
 
   // ───────────────────────────────────────
   // 2026-05-11 operator-email rename (must run AFTER email_verified
@@ -694,10 +725,68 @@ function createTables() {
       if (admin.email !== 'operator@example.com') {
         console.log(`[migration] reconcile: admin email was '${admin.email}', now 'operator@example.com' (tenant_id=${admin.id})`)
       }
+
+      // Seed admin aliases so both tima@ and signal@ resolve to the same
+      // tenant on every login surface (email-password, GitHub OAuth,
+      // forgot-password). Tima's GitHub primary verified email is
+      // signal@aeoess.com; without this alias, a fresh "Continue with
+      // GitHub" click would re-create the divergence we just cleaned up.
+      try {
+        db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+                    VALUES (?, ?, 'primary', 1)`).run('operator@example.com', admin.id)
+        db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+                    VALUES (?, ?, 'github-primary', 1)`).run('signal@aeoess.com', admin.id)
+      } catch (e: any) {
+        console.error('[migration] admin alias seed failed:', e?.message || e)
+      }
     }
   } catch (e: any) {
     console.error('[migration] operator-identity reconcile failed:', e?.message || e)
   }
+}
+
+// ═══════════════════════════════════════
+// tenant_aliases lookup helper.
+// Used by GitHub OAuth callback + /auth/email/* flows. Resolves any
+// known email (primary or alias) to the owning tenant. Active-only.
+// ═══════════════════════════════════════
+export interface TenantAliasResolveResult {
+  tenant_id: string
+  matched_email: string
+  source: string
+}
+
+export function resolveTenantByEmail(emailOrAlias: string): TenantAliasResolveResult | null {
+  if (!db) return null
+  const normalized = emailOrAlias.trim().toLowerCase()
+  const row = db.prepare(`
+    SELECT a.tenant_id, a.email AS matched_email, a.source
+    FROM tenant_aliases a
+    JOIN tenants t ON t.id = a.tenant_id
+    WHERE a.email = ? AND t.status = 'active'
+    LIMIT 1
+  `).get(normalized) as { tenant_id: string; matched_email: string; source: string } | undefined
+  return row || null
+}
+
+/**
+ * Add an alias email for an existing tenant. Idempotent via INSERT OR IGNORE.
+ * Returns whether a new row was inserted (false if alias already pointed
+ * at this OR another tenant — caller should check first if exclusivity matters).
+ */
+export function addTenantAlias(opts: {
+  tenantId: string
+  email: string
+  source?: string
+  verified?: boolean
+}): { inserted: boolean } {
+  if (!db) return { inserted: false }
+  const email = opts.email.trim().toLowerCase()
+  const result = db.prepare(`
+    INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+    VALUES (?, ?, ?, ?)
+  `).run(email, opts.tenantId, opts.source || 'manual', opts.verified ? 1 : 0)
+  return { inserted: result.changes > 0 }
 }
 
 // ═══════════════════════════════════════

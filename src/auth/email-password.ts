@@ -123,9 +123,25 @@ export interface TenantWithPassword extends Tenant {
   email_verified: 0 | 1
 }
 
+/**
+ * Resolve a tenant by either its primary email OR any alias in
+ * tenant_aliases. Returns null if no active tenant matches.
+ *
+ * This makes `signal@aeoess.com` and `operator@example.com` look up the same
+ * tenant (assuming both are listed as aliases) — necessary because the
+ * email-password sign-in surface needs to be symmetric with GitHub OAuth.
+ */
 export function findTenantByEmail(email: string): TenantWithPassword | null {
   const db = getDB()
-  const row = db.prepare(`SELECT * FROM tenants WHERE email = ?`).get(normalizeEmail(email)) as any
+  const normalized = normalizeEmail(email)
+  const row = db.prepare(`
+    SELECT t.* FROM tenants t
+    WHERE t.status = 'active' AND (
+      t.email = ?
+      OR EXISTS (SELECT 1 FROM tenant_aliases a WHERE a.email = ? AND a.tenant_id = t.id)
+    )
+    LIMIT 1
+  `).get(normalized, normalized) as any
   if (!row) return null
   return {
     id: row.id,

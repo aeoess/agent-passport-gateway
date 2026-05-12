@@ -57,7 +57,7 @@ if (dbDir !== '.' && !existsSync(dbDir)) {
 import cors from 'cors'
 import helmet from 'helmet'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
-import { initDB, getDB, PLAN_LIMITS } from './db/schema.js'
+import { initDB, getDB, PLAN_LIMITS, resolveTenantByEmail, addTenantAlias } from './db/schema.js'
 import { lookupByAddress, rebuildFromDb as rebuildWalletReverseIndex } from './gateway/wallet-reverse-index.js'
 import { buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
 import { authMiddleware, requireAdmin, createTenant } from './auth/api-keys.js'
@@ -404,10 +404,11 @@ app.get('/auth/github/callback', async (req, res) => {
     return redirectErr('GitHub is unreachable, try email signup')
   }
 
-  // Fetch user info + emails
+  // Fetch user info + every verified email (not just primary)
   let userLogin: string
   let userName: string | null
   let primaryEmail: string
+  let verifiedEmails: string[] = []
   try {
     const [userRes, emailsRes] = await Promise.all([
       fetch('https://api.github.com/user', {
@@ -428,35 +429,60 @@ app.get('/auth/github/callback', async (req, res) => {
     const primary = emails.find(e => e.primary && e.verified) || emails.find(e => e.verified)
     if (!primary) return redirectErr('Your GitHub email is not verified, verify it on GitHub first')
     primaryEmail = primary.email
+    // Keep the primary first in the list so it's preferred on alias-creation.
+    verifiedEmails = [primary.email, ...emails.filter(e => e.verified && e.email !== primary.email).map(e => e.email)]
   } catch (e) {
     console.error('[github-oauth] user fetch error', e)
     return redirectErr('Could not load your GitHub profile')
   }
 
-  // Find or create tenant
+  // Find tenant by ANY verified email (primary or otherwise) through the
+  // tenant_aliases table. This is what makes "one account, multiple
+  // verified emails" work: a tenant with email=operator@example.com but a
+  // GitHub primary of signal@aeoess.com resolves to the same row as
+  // long as the admin has seeded signal@aeoess.com as an alias.
   const db = getDB()
-  const existing = db.prepare(`SELECT * FROM tenants WHERE email = ?`).get(primaryEmail) as any
+  let resolvedTenantId: string | null = null
+  let matchedVia: string | null = null
+  for (const candidate of verifiedEmails) {
+    const r = resolveTenantByEmail(candidate)
+    if (r) { resolvedTenantId = r.tenant_id; matchedVia = candidate; break }
+  }
 
   let apiKey: string
   let tenantId: string
-  if (existing) {
-    // Existing tenant — issue an additional key without revoking others
-    tenantId = existing.id
+  if (resolvedTenantId) {
+    // Existing tenant — issue an additional key without revoking others.
+    tenantId = resolvedTenantId
     apiKey = `aps_live_${randomBytes(32).toString('hex')}`
     const keyHash = createHash('sha256').update(apiKey).digest('hex')
     const keyPrefix = apiKey.slice(0, 12)
     db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), tenantId, keyHash, keyPrefix, 'github-oauth')
-    // Note: no tenant_created event for existing-tenant signin (re-auth, not signup)
+    // Backfill: ensure every verified GitHub email we just saw is recorded
+    // as an alias on this tenant. addTenantAlias is INSERT OR IGNORE, so it
+    // never steals an alias from another tenant — if some other tenant
+    // already claims one of these addresses, that alias is left alone.
+    for (const em of verifiedEmails) {
+      try { addTenantAlias({ tenantId, email: em, source: 'github', verified: true }) } catch {}
+    }
+    console.log(`[github-oauth] linked existing tenant ${tenantId} via verified email '${matchedVia}' (github login=${userLogin})`)
   } else {
-    // New tenant — full signup
+    // New tenant — full signup. We only get here if NONE of the user's
+    // verified GitHub emails resolve to any existing tenant.
     try {
       const name = userName || userLogin || primaryEmail.split('@')[0]
       const result = createTenant({ name, email: primaryEmail, plan: 'free' })
       tenantId = result.tenant.id
       apiKey = result.apiKey
+      // Backfill aliases for the fresh tenant so future logins via a
+      // different verified email still find it.
+      for (const em of verifiedEmails) {
+        try { addTenantAlias({ tenantId, email: em, source: em === primaryEmail ? 'primary' : 'github', verified: true }) } catch {}
+      }
       try { getEventBus().emit(tenantId, { type: 'tenant_created', data: { plan: 'free', source: 'github', github_login: userLogin } }) } catch {}
       try { sendEmail({ ...signupWelcomeEmail(name, primaryEmail, apiKey), to: primaryEmail }).catch(() => {}) } catch {}
+      console.log(`[github-oauth] created new tenant ${tenantId} (github login=${userLogin}, primary=${primaryEmail})`)
     } catch (e: any) {
       console.error('[github-oauth] tenant create error', e)
       return redirectErr('Could not create your account, email signal@aeoess.com')
