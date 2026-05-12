@@ -522,12 +522,37 @@ function createTables() {
   // Decouples admin authorization from the `plan` billing concept.
   // role = 'admin'  → platform operator (can access /api/v1/admin/* routes)
   // role = 'user'   → regular tenant (default)
-  // The AEOESS operator tenant (email signal@aeoess.com) is elevated to
-  // 'admin' by the idempotent UPDATE below.
+  // The AEOESS operator tenant is elevated to 'admin' by the idempotent
+  // UPDATE below. The WHERE clause covers both the legacy signal@aeoess.com
+  // (pre-2026-05-11) and the current operator@example.com login email — so a
+  // fresh DB reset that recreates either tenant still gets admin.
   try { db.exec(`ALTER TABLE tenants ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`) } catch {}
   try {
-    db.prepare(`UPDATE tenants SET role = 'admin' WHERE email = ? AND role != 'admin'`)
-      .run('signal@aeoess.com')
+    db.prepare(`UPDATE tenants SET role = 'admin'
+                WHERE email IN ('operator@example.com', 'signal@aeoess.com')
+                  AND role != 'admin'`).run()
+  } catch {}
+
+  // ───────────────────────────────────────
+  // 2026-05-11 operator-email rename
+  // Tima requested moving his login from signal@aeoess.com (public-support
+  // alias) to operator@example.com (personal). Preserves tenant_id and every
+  // foreign-keyed row (API keys, agents, delegations, receipts). Idempotent:
+  // after the first deploy, no row matches the WHERE clause.
+  //
+  // email_verified is set to 1 because the rename is itself the verification
+  // act (an admin operator authorizing the new address).
+  //
+  // signal@aeoess.com remains the public support address in copy throughout
+  // the site and in transactional emails — that is separate from the tenant
+  // login email.
+  // ───────────────────────────────────────
+  try {
+    db.prepare(`UPDATE tenants
+                SET email = 'operator@example.com',
+                    email_verified = 1,
+                    email_verified_at = COALESCE(email_verified_at, datetime('now'))
+                WHERE email = 'signal@aeoess.com'`).run()
   } catch {}
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
