@@ -598,90 +598,105 @@ function createTables() {
   // login email.
   // ───────────────────────────────────────
 
-  // Step 1: tombstone any non-operator row that happens to hold operator@example.com.
-  // The operator tenant is identified by the existing email signal@aeoess.com;
-  // we only tombstone OTHER rows that block the rename. Idempotent: after the
-  // first deploy the WHERE clause matches nothing.
-  try {
-    db.prepare(`UPDATE tenants
-                SET email = 'tombstone-' || substr(id, 1, 8) || '@deleted.local'
-                WHERE email = 'operator@example.com'
-                  AND id != COALESCE((SELECT id FROM tenants WHERE email = 'signal@aeoess.com'), '')`).run()
-  } catch (e: any) {
-    console.error('[migration] tombstone of stray tima@ row failed:', e?.message || e)
-  }
-
-  // Step 2: the actual operator rename.
-  try {
-    db.prepare(`UPDATE tenants
-                SET email = 'operator@example.com',
-                    email_verified = 1,
-                    email_verified_at = COALESCE(email_verified_at, datetime('now'))
-                WHERE email = 'signal@aeoess.com'`).run()
-  } catch (e: any) {
-    console.error('[migration] operator-email rename failed:', e?.message || e)
-  }
-
   // ───────────────────────────────────────
-  // 2026-05-11 stray-tenant merge
-  // After the operator was renamed to operator@example.com, a "Continue with
-  // GitHub" sign-in by Tima (whose GitHub primary verified email is still
-  // signal@aeoess.com) created a NEW free-plan tenant with that email
-  // instead of finding the existing operator. This block detects that
-  // pattern and merges the stray into the operator.
+  // 2026-05-11 operator-identity reconciliation
   //
-  // Tables with tenant_id FK that we move:
-  //   api_keys, agents, delegations, policy_evaluations, receipts, usage,
-  //   revocations, alerts, data_sources, access_receipts,
-  //   evaluation_receipts (+ receipt_window_seals), task_events, tasks,
-  //   bound_demo_state, ipr_anchors. We enumerate the schema at runtime
-  //   to avoid drift.
+  // The earlier migration sequence (signal→tima rename + stray-merge)
+  // was identity-anchored on email values. That broke when a GitHub
+  // OAuth sign-in created a new tenant holding signal@aeoess.com AFTER
+  // the operator had already been renamed to operator@example.com — the
+  // "tombstone any tima@ that isn't the signal@ row" step tombstoned
+  // the ADMIN row instead of the stray, swapping the data identity.
   //
-  // After the move, the stray row gets its email tombstoned (frees the
-  // address for future use) and status set to 'deleted'.
+  // This block re-anchors on the only stable signal: role='admin'.
+  // Only the operator tenant has admin (set via the role migration
+  // above). All other tenants are role='user' regardless of how they
+  // were created.
+  //
+  // Goal end-state (idempotent):
+  //   - role='admin' tenant has email='operator@example.com', email_verified=1
+  //   - any other tenant currently holding operator@example.com has its data
+  //     moved into the admin and its email tombstoned + status='deleted'
+  //   - any tenant with email='signal@aeoess.com' that is NOT admin
+  //     gets its data merged into admin + tombstoned + status='deleted'
   // ───────────────────────────────────────
   try {
-    const operator = db.prepare(
-      `SELECT id FROM tenants WHERE email = 'operator@example.com' LIMIT 1`
-    ).get() as { id?: string } | undefined
-    const stray = db.prepare(
-      `SELECT id FROM tenants WHERE email = 'signal@aeoess.com' LIMIT 1`
-    ).get() as { id?: string } | undefined
+    const admin = db.prepare(
+      `SELECT id, email FROM tenants WHERE role = 'admin' LIMIT 1`
+    ).get() as { id?: string; email?: string } | undefined
 
-    if (operator?.id && stray?.id && operator.id !== stray.id) {
-      // Enumerate every table whose schema declares a tenant_id column.
-      const tables = db.prepare(
-        `SELECT m.name AS table_name
-           FROM sqlite_master m
-          WHERE m.type = 'table'
-            AND EXISTS (
-              SELECT 1 FROM pragma_table_info(m.name) p
-              WHERE p.name = 'tenant_id'
-            )
-            AND m.name != 'tenants'`
-      ).all() as Array<{ table_name: string }>
-
-      for (const { table_name } of tables) {
-        try {
-          const result = db.prepare(
-            `UPDATE "${table_name}" SET tenant_id = ? WHERE tenant_id = ?`
-          ).run(operator.id, stray.id)
-          if (result.changes > 0) {
-            console.log(`[migration] merge: moved ${result.changes} row(s) in ${table_name} from ${stray.id} -> ${operator.id}`)
+    if (!admin?.id) {
+      console.warn('[migration] reconcile: no admin tenant found, skipping')
+    } else {
+      // Helper to merge all FK rows from one tenant into another, then
+      // tombstone the source.
+      const mergeInto = (sourceId: string, destId: string, label: string) => {
+        if (sourceId === destId) return
+        const tables = db.prepare(
+          `SELECT m.name AS table_name
+             FROM sqlite_master m
+            WHERE m.type = 'table'
+              AND EXISTS (
+                SELECT 1 FROM pragma_table_info(m.name) p
+                WHERE p.name = 'tenant_id'
+              )
+              AND m.name != 'tenants'`
+        ).all() as Array<{ table_name: string }>
+        for (const { table_name } of tables) {
+          try {
+            const r = db.prepare(
+              `UPDATE "${table_name}" SET tenant_id = ? WHERE tenant_id = ?`
+            ).run(destId, sourceId)
+            if (r.changes > 0) {
+              console.log(`[migration] reconcile/${label}: moved ${r.changes} row(s) in ${table_name} from ${sourceId} -> ${destId}`)
+            }
+          } catch (e: any) {
+            console.error(`[migration] reconcile/${label}: ${table_name} move failed:`, e?.message || e)
           }
-        } catch (e: any) {
-          console.error(`[migration] merge: failed to move ${table_name}:`, e?.message || e)
         }
+        db.prepare(
+          `UPDATE tenants SET email = ?, status = 'deleted' WHERE id = ?`
+        ).run(`tombstone-${label}-${sourceId.substring(0, 8)}@deleted.local`, sourceId)
       }
 
-      // Tombstone the stray's email + soft-delete.
-      db.prepare(
-        `UPDATE tenants SET email = ?, status = 'deleted' WHERE id = ?`
-      ).run(`tombstone-signal-${stray.id.substring(0, 8)}@deleted.local`, stray.id)
-      console.log(`[migration] merge: stray tenant ${stray.id} soft-deleted, email tombstoned`)
+      // Step 1: any non-admin tenant currently holding operator@example.com
+      // (the imposter installed by the prior buggy migration). Merge it
+      // into the admin, tombstone the imposter.
+      const imposters = db.prepare(
+        `SELECT id FROM tenants WHERE email = 'operator@example.com' AND id != ?`
+      ).all(admin.id) as Array<{ id: string }>
+      for (const imp of imposters) {
+        mergeInto(imp.id, admin.id, 'tima-imposter')
+      }
+
+      // Step 2: any non-admin tenant currently holding signal@aeoess.com.
+      // These are legacy or fresh stray rows; merge their data into admin.
+      const signals = db.prepare(
+        `SELECT id FROM tenants WHERE email = 'signal@aeoess.com' AND id != ?`
+      ).all(admin.id) as Array<{ id: string }>
+      for (const s of signals) {
+        mergeInto(s.id, admin.id, 'signal-stray')
+      }
+
+      // Step 3: now the operator@example.com address slot is guaranteed free
+      // (or it was already on admin). Set the admin's email.
+      try {
+        db.prepare(
+          `UPDATE tenants SET email = 'operator@example.com',
+                              email_verified = 1,
+                              email_verified_at = COALESCE(email_verified_at, datetime('now'))
+            WHERE id = ?`
+        ).run(admin.id)
+      } catch (e: any) {
+        console.error('[migration] reconcile: admin email set failed:', e?.message || e)
+      }
+
+      if (admin.email !== 'operator@example.com') {
+        console.log(`[migration] reconcile: admin email was '${admin.email}', now 'operator@example.com' (tenant_id=${admin.id})`)
+      }
     }
   } catch (e: any) {
-    console.error('[migration] stray-tenant merge failed:', e?.message || e)
+    console.error('[migration] operator-identity reconcile failed:', e?.message || e)
   }
 }
 
