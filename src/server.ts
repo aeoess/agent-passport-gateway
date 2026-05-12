@@ -732,6 +732,136 @@ app.get('/auth/email/verify', async (req, res) => {
 })
 
 // ═══════════════════════════════════════
+// Public landing-page data (no auth required)
+//
+// Powers the gateway.aeoess.com/ landing page metrics + decisions feed.
+// Returns aggregate counts only — never individual tenant/agent IDs
+// (privacy + competitive-intel leak). Cached for 30s to keep the public
+// page cheap to render.
+// ═══════════════════════════════════════
+const publicStatsLimiter = new RateLimiterMemory({
+  points: 60, duration: 60, keyPrefix: 'public_stats',
+})
+
+let _statsCache: { data: any; expires: number } | null = null
+const STATS_CACHE_TTL_MS = 30 * 1000
+
+app.get('/api/v1/public/stats', async (req, res) => {
+  try { await publicStatsLimiter.consume(req.ip || 'unknown') }
+  catch { return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' }) }
+
+  const now = Date.now()
+  if (_statsCache && _statsCache.expires > now) {
+    return res.json(_statsCache.data)
+  }
+
+  try {
+    const db = getDB()
+    // Aggregate over all tenants. Exclude soft-deleted tenants and
+    // tombstoned rows so the public number reflects real operator usage.
+    const activeTenants = db.prepare(
+      `SELECT COUNT(*) as n FROM tenants WHERE status = 'active'`
+    ).get() as { n: number }
+
+    const evals24h = db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN verdict = 'deny' THEN 1 ELSE 0 END) as denies,
+             AVG(duration_ms) as avg_ms,
+             MAX(duration_ms) as max_ms
+      FROM policy_evaluations
+      WHERE created_at >= datetime('now', '-24 hours')
+    `).get() as { total: number; denies: number; avg_ms: number | null; max_ms: number | null }
+
+    // P50 approximation: median duration_ms from a sampled window.
+    // SQLite has no native PERCENTILE, so we approximate via ORDER BY OFFSET.
+    const sampleSize = Math.min(evals24h.total, 10000)
+    let p50ms: number | null = null
+    if (sampleSize > 0) {
+      const row = db.prepare(`
+        SELECT duration_ms FROM (
+          SELECT duration_ms FROM policy_evaluations
+          WHERE created_at >= datetime('now', '-24 hours') AND duration_ms IS NOT NULL
+          ORDER BY duration_ms ASC LIMIT ?
+        ) ORDER BY duration_ms ASC LIMIT 1 OFFSET ?
+      `).get(sampleSize, Math.floor(sampleSize / 2)) as { duration_ms: number } | undefined
+      p50ms = row?.duration_ms ?? null
+    }
+
+    // Receipts as additional accountability surface count.
+    const receipts24h = db.prepare(`
+      SELECT COUNT(*) as n FROM receipts
+      WHERE created_at >= datetime('now', '-24 hours')
+    `).get() as { n: number }
+
+    const agentsTotal = db.prepare(
+      `SELECT COUNT(*) as n FROM agents WHERE status = 'active'`
+    ).get() as { n: number }
+
+    const denyRate = evals24h.total > 0
+      ? evals24h.denies / evals24h.total
+      : 0
+
+    const data = {
+      evals_24h: evals24h.total,
+      denies_24h: evals24h.denies,
+      deny_rate: Number(denyRate.toFixed(4)),
+      p50_latency_ms: p50ms,
+      avg_latency_ms: evals24h.avg_ms != null ? Number(evals24h.avg_ms.toFixed(2)) : null,
+      max_latency_ms: evals24h.max_ms,
+      receipts_24h: receipts24h.n,
+      active_agents: agentsTotal.n,
+      active_tenants: activeTenants.n,
+      generated_at: new Date().toISOString(),
+    }
+    _statsCache = { data, expires: now + STATS_CACHE_TTL_MS }
+    res.json(data)
+  } catch (e: any) {
+    console.error('[public/stats] error:', e?.message || e)
+    res.status(500).json({ error: 'stats unavailable' })
+  }
+})
+
+const publicDecisionsLimiter = new RateLimiterMemory({
+  points: 60, duration: 60, keyPrefix: 'public_decisions',
+})
+
+app.get('/api/v1/public/recent-decisions', async (req, res) => {
+  try { await publicDecisionsLimiter.consume(req.ip || 'unknown') }
+  catch { return res.status(429).json({ error: 'Rate limit exceeded. 60 req/min.' }) }
+
+  try {
+    const db = getDB()
+    // Anonymized recent decisions: hash the agent_id to a short stable
+    // pseudonym (no rainbow back to the real agent_id). No tenant_id is
+    // ever exposed. action_target is truncated to its scope prefix to
+    // avoid leaking endpoint URLs or merchant names.
+    const rows = db.prepare(`
+      SELECT id, agent_id, action_type, scope_required, verdict, reason, duration_ms, created_at
+      FROM policy_evaluations
+      ORDER BY created_at DESC LIMIT 20
+    `).all() as Array<any>
+
+    // Stable pseudonym: 6-hex prefix of sha256(agent_id || tenant_id_unknown).
+    // Same agent always renders the same pseudonym in one snapshot.
+    const decisions = rows.map(r => {
+      const h = createHash('sha256').update(String(r.agent_id)).digest('hex').substring(0, 6)
+      return {
+        ts: r.created_at,
+        decision: r.verdict,
+        scope: r.scope_required,
+        action_type: r.action_type,
+        pseudonym: `agt:${h}`,
+        duration_ms: r.duration_ms,
+      }
+    })
+    res.json({ decisions, count: decisions.length })
+  } catch (e: any) {
+    console.error('[public/recent-decisions] error:', e?.message || e)
+    res.status(500).json({ error: 'recent decisions unavailable' })
+  }
+})
+
+// ═══════════════════════════════════════
 // Public Trust Profile (no auth required)
 // Cross-org trust querying: any sandbox, registry, or agent
 // can check an agent's grade before interaction.

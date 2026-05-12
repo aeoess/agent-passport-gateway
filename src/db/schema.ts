@@ -621,6 +621,68 @@ function createTables() {
   } catch (e: any) {
     console.error('[migration] operator-email rename failed:', e?.message || e)
   }
+
+  // ───────────────────────────────────────
+  // 2026-05-11 stray-tenant merge
+  // After the operator was renamed to operator@example.com, a "Continue with
+  // GitHub" sign-in by Tima (whose GitHub primary verified email is still
+  // signal@aeoess.com) created a NEW free-plan tenant with that email
+  // instead of finding the existing operator. This block detects that
+  // pattern and merges the stray into the operator.
+  //
+  // Tables with tenant_id FK that we move:
+  //   api_keys, agents, delegations, policy_evaluations, receipts, usage,
+  //   revocations, alerts, data_sources, access_receipts,
+  //   evaluation_receipts (+ receipt_window_seals), task_events, tasks,
+  //   bound_demo_state, ipr_anchors. We enumerate the schema at runtime
+  //   to avoid drift.
+  //
+  // After the move, the stray row gets its email tombstoned (frees the
+  // address for future use) and status set to 'deleted'.
+  // ───────────────────────────────────────
+  try {
+    const operator = db.prepare(
+      `SELECT id FROM tenants WHERE email = 'operator@example.com' LIMIT 1`
+    ).get() as { id?: string } | undefined
+    const stray = db.prepare(
+      `SELECT id FROM tenants WHERE email = 'signal@aeoess.com' LIMIT 1`
+    ).get() as { id?: string } | undefined
+
+    if (operator?.id && stray?.id && operator.id !== stray.id) {
+      // Enumerate every table whose schema declares a tenant_id column.
+      const tables = db.prepare(
+        `SELECT m.name AS table_name
+           FROM sqlite_master m
+          WHERE m.type = 'table'
+            AND EXISTS (
+              SELECT 1 FROM pragma_table_info(m.name) p
+              WHERE p.name = 'tenant_id'
+            )
+            AND m.name != 'tenants'`
+      ).all() as Array<{ table_name: string }>
+
+      for (const { table_name } of tables) {
+        try {
+          const result = db.prepare(
+            `UPDATE "${table_name}" SET tenant_id = ? WHERE tenant_id = ?`
+          ).run(operator.id, stray.id)
+          if (result.changes > 0) {
+            console.log(`[migration] merge: moved ${result.changes} row(s) in ${table_name} from ${stray.id} -> ${operator.id}`)
+          }
+        } catch (e: any) {
+          console.error(`[migration] merge: failed to move ${table_name}:`, e?.message || e)
+        }
+      }
+
+      // Tombstone the stray's email + soft-delete.
+      db.prepare(
+        `UPDATE tenants SET email = ?, status = 'deleted' WHERE id = ?`
+      ).run(`tombstone-signal-${stray.id.substring(0, 8)}@deleted.local`, stray.id)
+      console.log(`[migration] merge: stray tenant ${stray.id} soft-deleted, email tombstoned`)
+    }
+  } catch (e: any) {
+    console.error('[migration] stray-tenant merge failed:', e?.message || e)
+  }
 }
 
 // ═══════════════════════════════════════
