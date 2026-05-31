@@ -24,6 +24,9 @@ export interface GatewayEvent {
     | 'wallet_frozen' | 'payment_created' | 'cost_recorded'
     | 'task_created' | 'task_assigned' | 'task_accepted'
     | 'task_evidence' | 'task_reviewed' | 'task_completed' | 'task_cancelled'
+    // Risk queue (G-A3). Shared union; G-A1 event-merkle also extends this file,
+    // so additions here are a merge-coordination point with the event spine.
+    | 'risk_flagged' | 'approval_required' | 'approval_resolved'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>
