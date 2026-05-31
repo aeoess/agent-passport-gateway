@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════════════
-// Rekor Anchoring — Transparency Log Integration
+// Rekor Anchoring - Transparency Log Integration
 // ══════════════════════════════════════════════════════════════════
 // Submits receipt hashes to Sigstore Rekor for independent temporal proof.
 // Source: desiorac on A2A#1672
@@ -137,3 +137,63 @@ rekorRouter.get('/anchors', (req, res) => {
   ).all(tenantId)
   res.json({ anchors, count: anchors.length })
 })
+
+// ══════════════════════════════════════════════════════════════════
+// GEM (G-A1) - Merkle batch-root anchoring
+// ══════════════════════════════════════════════════════════════════
+// The Rekor flow above anchors a single receipt hash. GEM aggregates many
+// receipts into one Merkle batch and anchors only the batch root, so the
+// transparency log carries one entry per batch instead of one per receipt.
+// This reuses the same rekor_anchors table and pending/anchored lifecycle;
+// the batch root is stored in the receipt_hash column with a stable
+// batch: prefix in receipt_id so the two anchor kinds do not collide.
+
+export interface MerkleRootAnchor {
+  anchorId: string
+  batchId: string
+  merkleRoot: string
+  status: 'pending' | 'anchored' | 'failed'
+}
+
+/**
+ * Anchor a Merkle batch root to the transparency log. Idempotent per
+ * (tenant, batch): a repeated call returns the existing anchor record rather
+ * than creating a duplicate. Network submission to Rekor stays staged as
+ * pending exactly like the per-receipt path; an out-of-band batch submitter
+ * promotes pending -> anchored.
+ */
+export function anchorMerkleRoot(
+  tenantId: string,
+  batchId: string,
+  merkleRoot: string,
+  agentDid: string = 'gateway',
+): MerkleRootAnchor {
+  const db = getDB()
+  const receiptId = `batch:${batchId}`
+  const receiptHash = merkleRoot.startsWith('sha256:') ? merkleRoot : `sha256:${merkleRoot}`
+
+  const existing = db.prepare(
+    'SELECT id, status FROM rekor_anchors WHERE tenant_id = ? AND receipt_id = ?',
+  ).get(tenantId, receiptId) as { id: string; status: MerkleRootAnchor['status'] } | undefined
+  if (existing) {
+    return { anchorId: existing.id, batchId, merkleRoot, status: existing.status }
+  }
+
+  const anchorId = `anc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  db.prepare(`
+    INSERT INTO rekor_anchors (id, tenant_id, receipt_id, receipt_hash, agent_did, status, created_at)
+    VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))
+  `).run(anchorId, tenantId, receiptId, receiptHash, agentDid)
+
+  return { anchorId, batchId, merkleRoot, status: 'pending' }
+}
+
+/** Look up the anchor record for a batch root, if any. */
+export function getMerkleRootAnchor(tenantId: string, batchId: string): MerkleRootAnchor | null {
+  const db = getDB()
+  const row = db.prepare(
+    'SELECT id, receipt_hash, status FROM rekor_anchors WHERE tenant_id = ? AND receipt_id = ?',
+  ).get(tenantId, `batch:${batchId}`) as { id: string; receipt_hash: string; status: MerkleRootAnchor['status'] } | undefined
+  if (!row) return null
+  return { anchorId: row.id, batchId, merkleRoot: row.receipt_hash, status: row.status }
+}
