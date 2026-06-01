@@ -1,0 +1,17 @@
+apiVersion: v2
+name: aeoess-gateway
+description: In-tenant AEOESS gateway (G-D4). Customer-run, isolation-by-default, customer-owned trust root.
+type: application
+version: 0.1.0
+# appVersion tracks the gateway package version, kept in sync at release.
+appVersion: "0.4.0"
+keywords:
+  - aeoess
+  - gateway
+  - in-tenant
+  - isolation
+home: https://aeoess.com
+sources:
+  - https://github.com/aeoess/aeoess-gateway
+maintainers:
+  - name: Tymofii Pidlisnyi

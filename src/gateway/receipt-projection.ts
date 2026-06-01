@@ -53,6 +53,24 @@ export const PUBLIC_BODY_WHITELISTS: Record<string, readonly string[]> = {
   settlement: [
     'schema_version', 'merkle_root', 'period', 'timestamp', 'receipt_hash',
   ],
+  // G-C3 scoped approval. Public-safe fields ONLY: class/tier/verdict, the
+  // scope and approver fingerprints (hashes), counts, and the issued_at
+  // timestamp. Deliberately excludes reason text, raw approver public keys,
+  // approver ids, subject internals, requested_by, and tenant id - none of
+  // those names appear here, so projectPublicBody drops them by default.
+  approval_receipt: [
+    'schema_version', 'proof_type', 'request_id', 'action_class',
+    'risk_tier', 'verdict', 'subject_type', 'scope_hash', 'approvers_hash',
+    'signature_count', 'sampled', 'issued_at', 'receipt_hash', 'statement',
+  ],
+  // G-D3 source classification. The class is itself an assurance-graded
+  // claim: confidence is how the source labeled it, grade is the
+  // verifier-derived assurance level. We expose hashes of the source
+  // and evidence, never the raw connector label or the source content.
+  classification_receipt: [
+    'schema_version', 'receipt_hash', 'timestamp', 'data_class',
+    'confidence', 'grade', 'source_hash', 'evidence_hash',
+  ],
 }
 
 /** Fields that a row fallback is allowed to expose when no parsed

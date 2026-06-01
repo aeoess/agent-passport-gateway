@@ -559,6 +559,97 @@ function createTables() {
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 
+  // ═══════════════════════════════════════
+  // G-D4 (onboarding / D2 isolation): per-tenant isolation switch.
+  //
+  // isolation_mode is the D2 settled decision surfaced on the existing
+  // tenant model (build directive 9: extend, do not fork the tenant store).
+  //   'hard'     → regulated tenant. NO cross-tenant path. Cross-tenant
+  //                signal contribution and consumption are both blocked,
+  //                regardless of opt-in. This is the default-safe value
+  //                for a freshly onboarded regulated tenant.
+  //   'standard' → tenant MAY contribute to / consume de-identified,
+  //                aggregated, opt-in, above-k-floor cross-tenant signal.
+  //
+  // The column default is 'hard' so a tenant created before opting in is
+  // isolated by default (D2 isolation-by-default). Opt-in is a separate,
+  // explicit flag (cohort_opt_in) so that switching to 'standard' does not
+  // by itself enrol the tenant in the cohort.
+  // ═══════════════════════════════════════
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN isolation_mode TEXT NOT NULL DEFAULT 'hard'`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN cohort_opt_in INTEGER NOT NULL DEFAULT 0`) } catch {}
+  // Customer-brings-own trust root: where the tenant signing key lives.
+  //   'gateway' → gateway-generated, DB-stored Ed25519 key (today's default).
+  //   'hsm'     → customer HSM-resident key, bound via the W2-B1 seam.
+  //   'kms'     → customer KMS-resident key, bound via the W2-B1 seam.
+  // key_ref is an opaque reference (HSM slot URI / KMS key ARN), NEVER the
+  // private key material itself. Hash-and-pointer discipline applies here too.
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN trust_root_source TEXT NOT NULL DEFAULT 'gateway'`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN trust_root_key_ref TEXT`) } catch {}
+  // air_gapped marks a tenant whose deployment has no outbound network path.
+  // Cross-tenant emission is structurally impossible for an air-gapped tenant
+  // (there is nowhere to emit to); we still record the flag so onboarding and
+  // export bundling can branch on it.
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN air_gapped INTEGER NOT NULL DEFAULT 0`) } catch {}
+
+  // DB-layer guard: isolation_mode must be one of the two settled values.
+  // Defence in depth alongside the application-layer resolver.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS check_tenants_isolation_insert
+        BEFORE INSERT ON tenants
+        FOR EACH ROW
+        WHEN NEW.isolation_mode NOT IN ('hard', 'standard')
+        BEGIN SELECT RAISE(ABORT, 'invalid isolation_mode (allowed: hard, standard)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_tenants_isolation_update
+        BEFORE UPDATE OF isolation_mode ON tenants
+        FOR EACH ROW
+        WHEN NEW.isolation_mode NOT IN ('hard', 'standard')
+        BEGIN SELECT RAISE(ABORT, 'invalid isolation_mode (allowed: hard, standard)'); END;
+    `)
+  } catch (e: any) {
+    console.error('[migration] isolation-trigger install failed:', e?.message || e)
+  }
+
+  // Cohort emission ledger. The k-floor that holds OVER TIME-SERIES (C3)
+  // cannot be enforced from a single snapshot: an attacker who watches two
+  // emissions where the cohort shrank from {A,B,C} to {A,B} learns C's
+  // contribution by differencing, even though each snapshot independently
+  // cleared k. To gate against that we persist the membership digest of
+  // every emitted cohort window keyed by (cohort_key, emission_seq) and the
+  // gate compares the new window against the prior emitted window for the
+  // same cohort_key. member_digest is a hash of the SORTED set of
+  // tenant-id hashes (never raw tenant ids), so the ledger itself stores no
+  // tenant identity. metric_key namespaces independent time-series.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cohort_emissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cohort_key TEXT NOT NULL,
+      metric_key TEXT NOT NULL,
+      emission_seq INTEGER NOT NULL,
+      k_observed INTEGER NOT NULL,
+      member_digest TEXT NOT NULL,
+      member_count INTEGER NOT NULL,
+      emitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(cohort_key, metric_key, emission_seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cohort_emissions_key
+      ON cohort_emissions(cohort_key, metric_key, emission_seq);
+
+    -- Onboarding lifecycle ledger: append-only record of deployment-hardening
+    -- and isolation-switch events per tenant. Hash-and-pointer: stores event
+    -- type + an opaque detail pointer, never PHI or raw payloads.
+    CREATE TABLE IF NOT EXISTS onboarding_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      event_type TEXT NOT NULL,
+      detail_pointer TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_onboarding_events_tenant
+      ON onboarding_events(tenant_id, created_at);
+  `)
+
   // H4 (audit 2026-05-12): Enum-shaped columns (tenants.plan, tenants.status)
   // were not constrained at the DB layer. A typo in a Stripe webhook
   // metadata field or a future endpoint that skips validation could write
@@ -638,6 +729,69 @@ function createTables() {
   try { db.exec(`ALTER TABLE tenants ADD COLUMN password_set_at TEXT`) } catch {}
   try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified_at TEXT`) } catch {}
+
+  // ═══════════════════════════════════════
+  // Source-based data classification (G-D3, 2026-05-31)
+  //
+  // Classification of a data source comes from a LABELED SOURCE (a
+  // connector emits the label: a Salesforce field, an Epic record type,
+  // a connector label), NEVER from gateway payload scanning. We extend
+  // the existing data_sources table rather than introducing a parallel
+  // sources table, so a single source_id has exactly one classification.
+  //
+  //   data_class            the class string declared by the source label
+  //                         (vocabulary lives behind the W2-classification
+  //                         seam in the data-classification module).
+  //   class_confidence      'declared' | 'detected' | 'inferred' - how the
+  //                         connector arrived at the class. This is a
+  //                         source-supplied input, not a verdict.
+  //   class_grade           verifier-derived assurance grade (0..3) computed
+  //                         from confidence + evidence via the SDK
+  //                         classifyEvidenceQuality / evidenceQualityToGrade
+  //                         pattern. NOT issuer-set.
+  //   class_evidence        JSON describing the labeling evidence
+  //                         (connectorId, recordType, fieldRef).
+  //   class_source_label    the connector label descriptor as received.
+  //   classified_at         when the class was last attached.
+  //
+  // All nullable: a source registered before classification, or one with
+  // no connector label, has no class and is treated as unclassified.
+  // ═══════════════════════════════════════
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN data_class TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_confidence TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_grade INTEGER`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_evidence TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_source_label TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN classified_at TEXT`) } catch {}
+
+  // Destination registry (G-D3). A destination is a sink an agent may
+  // send classified data to. The gateway records the destination's
+  // POLICY and its sink-confirmation SUPPORT; it does not perform the
+  // confirmation. Enforcement stays at the sink. risk_tier and
+  // allowed_data_classes drive the before-the-fact destination-control
+  // check, which returns permit/deny without mutating anything.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS destinations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      destination_id TEXT NOT NULL,
+      destination_name TEXT NOT NULL,
+      placement TEXT NOT NULL DEFAULT 'external',
+      allowed_data_classes TEXT NOT NULL DEFAULT '[]',
+      allowed_agent_roles TEXT NOT NULL DEFAULT '[]',
+      allowed_purposes TEXT NOT NULL DEFAULT '[]',
+      storage_policy TEXT NOT NULL DEFAULT '{}',
+      training_policy TEXT NOT NULL DEFAULT '{}',
+      sink_confirmation_support TEXT NOT NULL DEFAULT 'none',
+      risk_tier TEXT NOT NULL DEFAULT 'unknown',
+      attestation TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at TEXT,
+      UNIQUE(tenant_id, destination_id)
+    );
+  `)
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_destinations_tenant ON destinations(tenant_id, status)`) } catch {}
 
   // Password reset and email verification tokens.
   // Store SHA-256(token), never the raw token. Single-use (used_at).

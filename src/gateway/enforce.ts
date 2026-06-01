@@ -22,6 +22,22 @@ import { recordBoundWallets } from './wallet-reverse-index.js'
 import { validateExternalUrl } from './url-safety.js'
 import { sendEmail, spendAlertEmail } from '../notifications/email.js'
 import { runFreshnessGate, type FreshnessGateResult } from './freshness/gate.js'
+// G-C2 layer (a): compiled, stateless, non-Turing-complete pre-flight guards.
+// Slotted BEFORE the billable evaluate decision below. No agent/LLM in this path.
+import {
+  evaluateGuards,
+  isScopeHighRisk,
+  DEFAULT_HIGH_RISK_SCOPES,
+  type GuardContext,
+} from './guards/index.js'
+// G-C2 layer (c): whether a live customer-signed playbook covers a high-risk
+// scope. Read-only; the guard only consumes the resolved boolean.
+import { scopeCoveredByLivePlaybook } from './playbooks/index.js'
+// G-D1: enforcement modes (observe/warn/approval/enforce/emergency).
+import { resolveMode } from './simulation/mode-config.js'
+import { applyMode, classifyRequestRisk } from './simulation/modes.js'
+import { recordModeObservation } from './simulation/migration-metric.js'
+import { emitToEventSpine } from './simulation/event-spine.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
 const spendAlertsSent = new Set<string>()
@@ -415,6 +431,49 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     }
   }
 
+  // ── G-C2 layer (a): real-time pre-flight guards (constraint C2) ──
+  //
+  // Compiled, stateless, non-Turing-complete guards run HERE, before the billable
+  // evaluate decision. There is no agent and no LLM in this path: evaluateGuards
+  // runs a fixed array of straight-line predicates over an immutable context.
+  // A BLOCK is fail-closed deny-before; the request never reaches the billable
+  // transaction. The guard never approves a high-risk action on its own authority
+  // and never mutates policy - that authority lives at the sink (B2 epoch check,
+  // offline) and in the customer-signed playbooks (layer c).
+  //
+  // `coveredBySignedPlaybook` is resolved from the playbook registry. A high-risk
+  // scope with no live signed playbook is blocked here: no free-form autonomous
+  // high-risk action exists outside a signed playbook (constraint C1).
+  const guardHighRisk = isScopeHighRisk(scope_required, DEFAULT_HIGH_RISK_SCOPES)
+  let guardCoveredByPlaybook = false
+  if (guardHighRisk) {
+    try { guardCoveredByPlaybook = scopeCoveredByLivePlaybook(tenant.id, scope_required) }
+    catch { guardCoveredByPlaybook = false } // fail-closed: unresolved => not covered
+  }
+  const guardCtx: GuardContext = {
+    agentStatus: agent.status,
+    scopeRequired: scope_required,
+    actionType: action_type,
+    estimatedCost: typeof estimated_cost === 'number' ? estimated_cost : 0,
+    isHighRisk: guardHighRisk,
+    coveredBySignedPlaybook: guardCoveredByPlaybook,
+    costCeiling: 0, // per-action ceiling is opt-in; 0 disables this guard
+  }
+  const guardDecision = evaluateGuards(guardCtx)
+  if (guardDecision.verdict === 'block') {
+    const gEvalId = randomUUID()
+    const gDurationMs = Date.now() - start
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(gEvalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Pre-flight guard: ${guardDecision.reason}`, gDurationMs, deriveTaskClass(action_type))
+    mintEvaluationReceipt({
+      tenantId: tenant.id, agentId: agent_id, evaluationId: gEvalId,
+      verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
+      reason: guardDecision.code, delegationId: null,
+    })
+    try { getEventBus().emit(tenant.id, { type: 'guard_block', agentId: agent_id, data: { evaluationId: gEvalId, guard: guardDecision.guard, code: guardDecision.code, scope_required, duration_ms: gDurationMs } }) } catch {}
+    return res.json({ evaluation_id: gEvalId, verdict: 'deny', reason: `Pre-flight guard: ${guardDecision.reason}`, violations: [guardDecision.code], duration_ms: gDurationMs, agent_id, action: { type: action_type, target: action_target, scope_required } })
+  }
+
   // C2: Atomic delegation check + spend update (prevents TOCTOU double-spend)
   const scopeAuth = await getScopeAuthorizes()
   const evalId = randomUUID()
@@ -528,7 +587,36 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
   const { verdict, reason, violations, durationMs, delegation } = evalResult
 
-  try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs } }) } catch {}
+  // ── G-D1: apply the enforcement mode ──────────────────────────────
+  // `verdict` above is the RAW policy decision (a violation is a violation,
+  // recorded faithfully in policy_evaluations and the minted receipt). The
+  // active mode decides the CONSEQUENCE the caller actually sees: observe/warn
+  // never block (evidence only), approval blocks only high-risk for sign-off,
+  // enforce blocks every violation, emergency additionally fails closed on
+  // high-risk permits. The body accepts an optional workflow_id so a single
+  // tenant can run different workflows at different rollout stages.
+  const workflowId = (req.body.workflow_id as string) || null
+  const mode = resolveMode(tenant.id, workflowId)
+  const risk = classifyRequestRisk({ scopeRequired: scope_required, violations, estimatedCost: estimated_cost ?? null })
+  const modeDecision = applyMode({ rawVerdict: verdict === 'permit' ? 'permit' : 'deny', risk, mode })
+
+  // Effective verdict the caller sees. permit unless the mode chose to stop it.
+  const effectiveVerdict = modeDecision.blocked ? 'deny' : 'permit'
+
+  // Record the migration signal (would-have-been-denied or a real block) so the
+  // migration metric can answer "is it safe to graduate to enforce yet".
+  recordModeObservation({
+    tenantId: tenant.id, agentId: agent_id, workflowId, evaluationId: evalId,
+    scopeRequired: scope_required, decision: modeDecision,
+  })
+  if (modeDecision.wouldHaveBeenDenied || modeDecision.blocked) {
+    emitToEventSpine(tenant.id, 'mode_observation', {
+      agent_id: agent_id, evaluation_id: evalId, mode, effect: modeDecision.effect, risk,
+      would_have_been_denied: modeDecision.wouldHaveBeenDenied, blocked: modeDecision.blocked,
+    })
+  }
+
+  try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs, mode, effect: modeDecision.effect } }) } catch {}
 
   mintEvaluationReceipt({
     tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
@@ -611,6 +699,15 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     revocation_mode: freshnessGate.revocationMode,
   } : undefined
 
+  // G-D1: `verdict` remains the RAW policy decision (unchanged contract: the
+  // receipt records the policy's view of the action). The mode dimension is
+  // surfaced separately:
+  //   effective_verdict - what the caller should actually do (deny only when the
+  //                        mode chose to stop the action).
+  //   enforced          - true when the mode actually blocked (enforce/emergency
+  //                        block, or approval_required). false in shadow modes.
+  //   would_have_been_denied - a violation the current mode let through. The
+  //                        shadow signal an operator watches before enforcing.
   res.json({
     evaluation_id: evalId,
     verdict,
@@ -621,6 +718,12 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     duration_ms: durationMs,
     agent_id,
     action: { type: action_type, target: action_target, scope_required },
+    mode,
+    effective_verdict: effectiveVerdict,
+    enforced: modeDecision.blocked,
+    mode_effect: modeDecision.effect,
+    would_have_been_denied: modeDecision.wouldHaveBeenDenied,
+    risk,
   })
   } catch (e) {
     const msg = (e as Error).message || String(e)

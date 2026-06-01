@@ -77,6 +77,17 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+// G-C2: pre-flight guards (a), governance automations (b), incident playbooks (c).
+import { guardsRouter } from './gateway/guards/router.js'
+import { automationsRouter } from './gateway/automations/router.js'
+import { playbooksRouter } from './gateway/playbooks/router.js'
+import { initPlaybookTables } from './gateway/playbooks/index.js'
+import { approvalRouter } from './gateway/approval/index.js'
+// G-D1: enforcement modes + policy simulation.
+import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
+import { dataClassificationRouter } from './gateway/data-classification/router.js'
+import { destinationsRouter } from './gateway/destinations/router.js'
+import { tenantIsolationRouter, applyDeploymentIsolationDefault } from './gateway/tenant-isolation/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -222,6 +233,9 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
     { table: 'access_receipts', type: 'access_receipt', payloadField: null, signatureField: 'signature' },
     { table: 'derivations', type: 'derivation_receipt', payloadField: 'derivation_json', signatureField: 'signature' },
     { table: 'settlements', type: 'settlement', payloadField: 'merkle_root', signatureField: 'signature' },
+    // G-C3 scoped-approval receipts resolve publicly with the
+    // approval_receipt whitelist (no reason text, no approver PII).
+    { table: 'approval_receipts', type: 'approval_receipt', payloadField: 'payload', signatureField: 'signature' },
   ]
 
   for (const { table, type, payloadField, signatureField } of tables) {
@@ -1870,6 +1884,15 @@ app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
 app.use('/api/v1', authMiddleware, connectorsRouter)
+// G-C2 routers: guards (a, read-only surface), automations (b), playbooks (c).
+app.use('/api/v1', authMiddleware, guardsRouter)
+app.use('/api/v1', authMiddleware, automationsRouter)
+app.use('/api/v1', authMiddleware, playbooksRouter)
+app.use('/api/v1', authMiddleware, approvalRouter)
+app.use('/api/v1', authMiddleware, simulationRouter)
+app.use('/api/v1', authMiddleware, dataClassificationRouter)
+app.use('/api/v1', authMiddleware, destinationsRouter)
+app.use('/api/v1', authMiddleware, tenantIsolationRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1947,6 +1970,23 @@ initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
 initConnectorTables()
+// G-C2 layer (c): customer pre-signed incident-playbook registry tables.
+initPlaybookTables()
+// G-D1: mode configuration + migration-signal ledger tables.
+initModeConfigTable()
+initModeObservationsTable()
+
+// G-D4: apply in-tenant deployment isolation defaults from env
+// (ISOLATION_MODE / TRUST_ROOT_SOURCE / AIR_GAPPED). Tighten-only:
+// a regulated deployment forces hard isolation on boot. No-op on the
+// hosted single-tenant path where these env vars are unset (default 'hard').
+const isolationBoot = applyDeploymentIsolationDefault()
+if (isolationBoot.tenantsForcedHard > 0 || isolationBoot.airGapped) {
+  console.log(
+    `[isolation] deployment default mode=${isolationBoot.mode} ` +
+    `tenantsForcedHard=${isolationBoot.tenantsForcedHard} airGapped=${isolationBoot.airGapped}`,
+  )
+}
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo

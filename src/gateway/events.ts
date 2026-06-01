@@ -33,6 +33,19 @@ export interface GatewayEvent {
     // Risk queue (G-A3). Shared union; G-A1 event-merkle also extends this file,
     // so additions here are a merge-coordination point with the event spine.
     | 'risk_flagged' | 'approval_required' | 'approval_resolved'
+    // G-C2 governance automations, pre-flight guards, incident playbooks.
+    | 'guard_block' | 'drift_detected' | 'evidence_bundle'
+    | 'playbook_triggered' | 'revocation_recommended' | 'integration_health'
+    | 'approval_requested' | 'approval_granted' | 'approval_denied' | 'approval_expired'
+    // G-D2: emitted when a signed audit evidence bundle is generated. Added
+    // additively; when G-A1 lands it extends this same union with its own
+    // members (batch_committed, anchor_submitted, leaf_fetch, ...).
+    | 'audit_bundle_created'
+    | 'source_classified' | 'destination_registered' | 'destination_check'
+    // G-D4 onboarding / D2 isolation lifecycle. Added as new union members
+    // (build directive 9: extend the union, do not fork the event system).
+    | 'tenant_isolation_set' | 'tenant_cohort_opt_in' | 'tenant_trust_root_bound'
+    | 'tenant_onboarded' | 'cohort_signal_emitted' | 'cohort_signal_suppressed'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>
