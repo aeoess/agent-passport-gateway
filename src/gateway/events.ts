@@ -37,6 +37,10 @@ export interface GatewayEvent {
     | 'guard_block' | 'drift_detected' | 'evidence_bundle'
     | 'playbook_triggered' | 'revocation_recommended' | 'integration_health'
     | 'approval_requested' | 'approval_granted' | 'approval_denied' | 'approval_expired'
+    // G-D2: emitted when a signed audit evidence bundle is generated. Added
+    // additively; when G-A1 lands it extends this same union with its own
+    // members (batch_committed, anchor_submitted, leaf_fetch, ...).
+    | 'audit_bundle_created'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>
