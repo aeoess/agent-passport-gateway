@@ -76,6 +76,8 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+// G-D1: enforcement modes + policy simulation.
+import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import {
@@ -1855,6 +1857,7 @@ app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
+app.use('/api/v1', authMiddleware, simulationRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1931,6 +1934,9 @@ const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
+// G-D1: mode configuration + migration-signal ledger tables.
+initModeConfigTable()
+initModeObservationsTable()
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo
