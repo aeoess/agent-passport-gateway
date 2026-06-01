@@ -82,6 +82,31 @@ describe('resolveRiskTier - precedence and class mapping', () => {
   })
 })
 
+describe('resolveRiskTier - class default is a FLOOR (B3 clamp)', () => {
+  it('class-3 actions cannot be lowered by an explicit request tier', () => {
+    for (const cls of ['commerce', 'payment', 'transfer', 'secret', 'deploy']) {
+      assert.equal(resolveRiskTier({ taskClass: cls, explicitTier: 0 }), 3, cls)
+    }
+  })
+  it('class-2 actions cannot be lowered by an explicit request tier', () => {
+    for (const cls of ['external', 'email', 'send']) {
+      assert.equal(resolveRiskTier({ taskClass: cls, explicitTier: 0 }), 2, cls)
+    }
+  })
+  it('class-1 write cannot be lowered by an explicit request tier', () => {
+    assert.equal(resolveRiskTier({ taskClass: 'write', explicitTier: 0 }), 1)
+  })
+  it('a request tier may RAISE above the class floor', () => {
+    assert.equal(resolveRiskTier({ taskClass: 'read', explicitTier: 2 }), 2)
+  })
+  it('a delegation tier cannot lower a class-3 action either', () => {
+    assert.equal(resolveRiskTier({ taskClass: 'commerce', delegationTier: 0 }), 3)
+  })
+  it('class default is unchanged when no explicit or delegation tier is given', () => {
+    assert.equal(resolveRiskTier({ taskClass: 'commerce' }), 3)
+  })
+})
+
 describe('evaluateFreshnessTier - tier 3 fails closed always', () => {
   it('denies with fresh evidence', () => {
     const r = evaluateFreshnessTier({ tier: 3, freshness: DESC, ...fixedFresh(true) })

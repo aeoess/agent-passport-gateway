@@ -123,32 +123,35 @@ export function coerceRiskTier(value: unknown): RiskTier | null {
 }
 
 /**
- * Resolve the risk tier for an action. Precedence:
- *   1. an explicit per-action tier (request field), if valid
- *   2. an explicit per-delegation tier (contract field), if valid
- *   3. the default task-class mapping
- *   4. fallback tier 2 (deny-if-stale) for unknown classes
+ * Resolve the risk tier for an action. The action-class default is a FLOOR:
+ *   resolved = max(classDefault, explicitTier?, delegationTier?)
+ * where classDefault = DEFAULT_TIER_BY_TASK_CLASS[taskClass], or tier 2 for an
+ * unknown class (cautious deny-if-stale floor).
  *
- * `explicitTier` and `delegationTier` are the additive request/contract fields;
- * passing them undefined falls through to the class mapping.
+ * The explicit (request) tier and the delegation (contract) tier may only
+ * RAISE the resolved tier above the class floor, never lower it. A protected
+ * action (commerce / payment / secret / deploy, class 3) stays tier 3 even when
+ * the caller passes risk_tier 0, so the tier-3 fail-closed cannot be bypassed.
+ * Invalid or out-of-range tier inputs are ignored (coerceRiskTier returns null).
  */
 export function resolveRiskTier(opts: {
   taskClass: string
   explicitTier?: unknown
   delegationTier?: unknown
 }): RiskTier {
-  const explicit = coerceRiskTier(opts.explicitTier)
-  if (explicit !== null) return explicit
-
-  const delegationTier = coerceRiskTier(opts.delegationTier)
-  if (delegationTier !== null) return delegationTier
-
   const cls = (opts.taskClass || '').toLowerCase()
-  if (Object.prototype.hasOwnProperty.call(DEFAULT_TIER_BY_TASK_CLASS, cls)) {
-    return DEFAULT_TIER_BY_TASK_CLASS[cls]
-  }
-  // Unknown action class: be cautious, not permissive.
-  return 2
+  // The action-class default is a floor, not a ceiling a caller can undercut.
+  const classDefault: RiskTier = Object.prototype.hasOwnProperty.call(DEFAULT_TIER_BY_TASK_CLASS, cls)
+    ? DEFAULT_TIER_BY_TASK_CLASS[cls]
+    : 2 // unknown action class: be cautious, not permissive
+
+  // Request and delegation tiers may only RAISE the tier above the class floor.
+  let resolved: RiskTier = classDefault
+  const explicit = coerceRiskTier(opts.explicitTier)
+  if (explicit !== null && explicit > resolved) resolved = explicit
+  const delegationTier = coerceRiskTier(opts.delegationTier)
+  if (delegationTier !== null && delegationTier > resolved) resolved = delegationTier
+  return resolved
 }
 
 /**

@@ -426,8 +426,11 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   // here (async SDK import) and folded into the transaction's violations[]
   // below so it composes with scope/spend denials.
   //
-  // Precedence: explicit per-action `risk_tier` (request) > per-delegation
-  // contract tier (`delegation_risk_tier`) > default task-class mapping.
+  // Tier resolution: the default task-class mapping is a FLOOR. The explicit
+  // per-action `risk_tier` (request) and the per-delegation contract tier
+  // (`delegation_risk_tier`) may only RAISE the tier above the class floor,
+  // never lower it, so a protected class (e.g. commerce tier 3) cannot be
+  // undercut to bypass the tier-3 fail-closed.
   // TODO(W2-B3): persist the per-delegation contract tier as a durable
   // `delegations.risk_tier` column; today it rides on the request as the
   // signed-contract input so this module stays inside its allowed surface.

@@ -118,7 +118,7 @@ describe('runFreshnessGate - real SDK: tier 2 denies stale, allows fresh', () =>
   })
 })
 
-describe('runFreshnessGate - explicit per-action tier overrides the class mapping', () => {
+describe('runFreshnessGate - request tier raises but cannot lower the class floor (B3 clamp)', () => {
   it('a read action forced to tier 3 fails closed', async () => {
     const r = await runFreshnessGate({
       taskClass: 'read',
@@ -128,18 +128,17 @@ describe('runFreshnessGate - explicit per-action tier overrides the class mappin
     assert.equal(r.tier, 3)
     assert.equal(r.outcome, 'fail_closed')
   })
-  it('a commerce action cannot be downgraded below tier 3 by a request field... unless explicitly set', async () => {
-    // Precedence: an explicit request tier IS honored. This documents that the
-    // gateway trusts the caller-provided tier; the contract tier / class map is
-    // only the default. A money action with an explicit tier-0 override is the
-    // caller's risk decision, recorded in the receipt.
+  it('a commerce action cannot be downgraded below tier 3 by a request field', async () => {
+    // The action-class default is a floor. A money action stays tier 3 even when
+    // the caller passes risk_tier 0, so the tier-3 fail-closed cannot be bypassed.
+    // The request tier may only raise the resolved tier, never lower it.
     const r = await runFreshnessGate({
       taskClass: 'commerce',
       requestTier: 0,
       freshnessInput: { type: 'rotating', validAt: isoAgo(3600), ttl: 60 },
     })
-    assert.equal(r.tier, 0)
-    assert.equal(r.outcome, 'allow')
+    assert.equal(r.tier, 3)
+    assert.equal(r.outcome, 'fail_closed')
   })
 })
 
