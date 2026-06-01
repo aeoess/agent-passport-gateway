@@ -24,6 +24,10 @@ export interface GatewayEvent {
     | 'wallet_frozen' | 'payment_created' | 'cost_recorded'
     | 'task_created' | 'task_assigned' | 'task_accepted'
     | 'task_evidence' | 'task_reviewed' | 'task_completed' | 'task_cancelled'
+    // G-D2: emitted when a signed audit evidence bundle is generated. Added
+    // additively; when G-A1 lands it extends this same union with its own
+    // members (batch_committed, anchor_submitted, leaf_fetch, ...).
+    | 'audit_bundle_created'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getDB } from '../db/schema.js'
 import type { Tenant } from '../auth/api-keys.js'
+import { auditBundlesRouter } from './audit-bundles/router.js'
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -265,6 +266,12 @@ export async function toPdf(
 // ─── Router ──────────────────────────────────────────────────────────
 
 export const auditExportRouter = Router()
+
+// G-D2: signed audit evidence bundle endpoints. Mounted onto this same router
+// so server.ts wiring is untouched (auditExportRouter is already mounted at
+// /api/v1 behind authMiddleware). The bundle router has its own rate limiter
+// with a distinct keyPrefix, so it does not collide with auditExportLimiter.
+auditExportRouter.use(auditBundlesRouter)
 
 const auditExportLimiter = new RateLimiterMemory({
   points: 10,
