@@ -83,6 +83,8 @@ import { automationsRouter } from './gateway/automations/router.js'
 import { playbooksRouter } from './gateway/playbooks/router.js'
 import { initPlaybookTables } from './gateway/playbooks/index.js'
 import { approvalRouter } from './gateway/approval/index.js'
+// G-D1: enforcement modes + policy simulation.
+import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -1884,6 +1886,7 @@ app.use('/api/v1', authMiddleware, guardsRouter)
 app.use('/api/v1', authMiddleware, automationsRouter)
 app.use('/api/v1', authMiddleware, playbooksRouter)
 app.use('/api/v1', authMiddleware, approvalRouter)
+app.use('/api/v1', authMiddleware, simulationRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1963,6 +1966,9 @@ initAnchorTable()
 initConnectorTables()
 // G-C2 layer (c): customer pre-signed incident-playbook registry tables.
 initPlaybookTables()
+// G-D1: mode configuration + migration-signal ledger tables.
+initModeConfigTable()
+initModeObservationsTable()
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo

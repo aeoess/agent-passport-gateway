@@ -33,6 +33,11 @@ import {
 // G-C2 layer (c): whether a live customer-signed playbook covers a high-risk
 // scope. Read-only; the guard only consumes the resolved boolean.
 import { scopeCoveredByLivePlaybook } from './playbooks/index.js'
+// G-D1: enforcement modes (observe/warn/approval/enforce/emergency).
+import { resolveMode } from './simulation/mode-config.js'
+import { applyMode, classifyRequestRisk } from './simulation/modes.js'
+import { recordModeObservation } from './simulation/migration-metric.js'
+import { emitToEventSpine } from './simulation/event-spine.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
 const spendAlertsSent = new Set<string>()
@@ -582,7 +587,36 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
   const { verdict, reason, violations, durationMs, delegation } = evalResult
 
-  try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs } }) } catch {}
+  // ── G-D1: apply the enforcement mode ──────────────────────────────
+  // `verdict` above is the RAW policy decision (a violation is a violation,
+  // recorded faithfully in policy_evaluations and the minted receipt). The
+  // active mode decides the CONSEQUENCE the caller actually sees: observe/warn
+  // never block (evidence only), approval blocks only high-risk for sign-off,
+  // enforce blocks every violation, emergency additionally fails closed on
+  // high-risk permits. The body accepts an optional workflow_id so a single
+  // tenant can run different workflows at different rollout stages.
+  const workflowId = (req.body.workflow_id as string) || null
+  const mode = resolveMode(tenant.id, workflowId)
+  const risk = classifyRequestRisk({ scopeRequired: scope_required, violations, estimatedCost: estimated_cost ?? null })
+  const modeDecision = applyMode({ rawVerdict: verdict === 'permit' ? 'permit' : 'deny', risk, mode })
+
+  // Effective verdict the caller sees. permit unless the mode chose to stop it.
+  const effectiveVerdict = modeDecision.blocked ? 'deny' : 'permit'
+
+  // Record the migration signal (would-have-been-denied or a real block) so the
+  // migration metric can answer "is it safe to graduate to enforce yet".
+  recordModeObservation({
+    tenantId: tenant.id, agentId: agent_id, workflowId, evaluationId: evalId,
+    scopeRequired: scope_required, decision: modeDecision,
+  })
+  if (modeDecision.wouldHaveBeenDenied || modeDecision.blocked) {
+    emitToEventSpine(tenant.id, 'mode_observation', {
+      agent_id: agent_id, evaluation_id: evalId, mode, effect: modeDecision.effect, risk,
+      would_have_been_denied: modeDecision.wouldHaveBeenDenied, blocked: modeDecision.blocked,
+    })
+  }
+
+  try { getEventBus().emit(tenant.id, { type: verdict === 'permit' ? 'evaluation' : 'denial', agentId: agent_id, data: { evaluationId: evalId, action_type, scope_required, verdict, reason, duration_ms: durationMs, mode, effect: modeDecision.effect } }) } catch {}
 
   mintEvaluationReceipt({
     tenantId: tenant.id, agentId: agent_id, evaluationId: evalId,
@@ -665,6 +699,15 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     revocation_mode: freshnessGate.revocationMode,
   } : undefined
 
+  // G-D1: `verdict` remains the RAW policy decision (unchanged contract: the
+  // receipt records the policy's view of the action). The mode dimension is
+  // surfaced separately:
+  //   effective_verdict - what the caller should actually do (deny only when the
+  //                        mode chose to stop the action).
+  //   enforced          - true when the mode actually blocked (enforce/emergency
+  //                        block, or approval_required). false in shadow modes.
+  //   would_have_been_denied - a violation the current mode let through. The
+  //                        shadow signal an operator watches before enforcing.
   res.json({
     evaluation_id: evalId,
     verdict,
@@ -675,6 +718,12 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     duration_ms: durationMs,
     agent_id,
     action: { type: action_type, target: action_target, scope_required },
+    mode,
+    effective_verdict: effectiveVerdict,
+    enforced: modeDecision.blocked,
+    mode_effect: modeDecision.effect,
+    would_have_been_denied: modeDecision.wouldHaveBeenDenied,
+    risk,
   })
   } catch (e) {
     const msg = (e as Error).message || String(e)
