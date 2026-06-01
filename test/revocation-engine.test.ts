@@ -273,6 +273,39 @@ describe('multi-sig thaw: quorum required, single signer cannot thaw', () => {
       .get(TENANT, 'thaw-target') as any
     assert.equal(agentRow.status, 'revoked')
   })
+
+  it('a destroy proposal is floored to quorum 3 even when 2 is requested', () => {
+    const proposal = proposeThaw({
+      tenantId: TENANT, agentId: 'thaw-target', kind: 'destroy', requiredQuorum: 2, proposedBy: 'admin-1',
+    })
+    // destroy is terminal and irreversible, so the floor is 3, not 2.
+    assert.equal(proposal.requiredQuorum, 3)
+    assert.equal(getThaw(proposal.thawId)!.requiredQuorum, 3)
+  })
+
+  it('a destroy with only 2 distinct approvals cannot finalize (needs 3)', () => {
+    panicFreeze({ tenantId: TENANT, agentId: 'thaw-target', mode: 'zero_authority', frozenBy: 'admin-solo' })
+    const proposal = proposeThaw({
+      tenantId: TENANT, agentId: 'thaw-target', kind: 'destroy', requiredQuorum: 2, proposedBy: 'admin-1',
+    })
+    addThawApproval({ thawId: proposal.thawId, signer: 'admin-1' })
+    const r2 = addThawApproval({ thawId: proposal.thawId, signer: 'admin-2' })
+    // Floored to 3: two distinct approvals are not a quorum for a destroy.
+    assert.equal(r2.quorumReached, false)
+    assert.throws(() => finalizeThaw({ thawId: proposal.thawId, finalizedBy: 'admin-2' }), /quorum not reached/)
+  })
+
+  it('a restore proposal keeps the quorum-2 floor and finalizes at 2', () => {
+    const proposal = proposeThaw({
+      tenantId: TENANT, agentId: 'thaw-target', kind: 'restore', requiredQuorum: 2, proposedBy: 'admin-1',
+    })
+    assert.equal(proposal.requiredQuorum, 2)
+    addThawApproval({ thawId: proposal.thawId, signer: 'admin-1' })
+    const r2 = addThawApproval({ thawId: proposal.thawId, signer: 'admin-2' })
+    assert.equal(r2.quorumReached, true)
+    const done = finalizeThaw({ thawId: proposal.thawId, finalizedBy: 'admin-2' })
+    assert.equal(done.state, 'complete')
+  })
 })
 
 describe('cascade preview: accuracy against a delegation-tree + lineage fixture', () => {

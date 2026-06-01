@@ -209,7 +209,12 @@ export function proposeThaw(opts: {
   reason?: string
 }): ThawProposal {
   const { tenantId, agentId, kind, proposedBy } = opts
-  const requiredQuorum = Math.max(2, Math.floor(opts.requiredQuorum))
+  // The quorum floor is asymmetric by kind. A 'destroy' (zero_authority,
+  // terminal) is irreversible, so it is forced to at least 3 distinct signers;
+  // a 'restore' is recoverable and is forced to at least 2. A caller may raise
+  // the quorum above the floor but never below it.
+  const floor = kind === 'destroy' ? 3 : 2
+  const requiredQuorum = Math.max(floor, Math.floor(opts.requiredQuorum))
   const reason = opts.reason ?? `${kind} proposal`
   if (!proposedBy) throw new Error('proposeThaw requires an authenticated proposedBy actor')
 
@@ -275,7 +280,8 @@ export function addThawApproval(opts: {
 
 /**
  * Finalize a thaw once a distinct-signer quorum is reached. A single signer can
- * never reach this: requiredQuorum is forced >= 2 and approvals are distinct.
+ * never reach this: requiredQuorum is forced >= 2 for a 'restore' and >= 3 for
+ * a 'destroy' (terminal, irreversible), and approvals are distinct.
  *
  *  - kind 'restore': bumps the agent epoch (new live epoch for fresh tokens),
  *    sets the agent status back to active, reactivates the wallet, marks the
