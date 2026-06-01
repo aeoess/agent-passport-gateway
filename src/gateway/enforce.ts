@@ -21,6 +21,7 @@ import { getEventBus } from './events.js'
 import { recordBoundWallets } from './wallet-reverse-index.js'
 import { validateExternalUrl } from './url-safety.js'
 import { sendEmail, spendAlertEmail } from '../notifications/email.js'
+import { runFreshnessGate, type FreshnessGateResult } from './freshness/gate.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
 const spendAlertsSent = new Set<string>()
@@ -226,6 +227,7 @@ async function getEvaluateRecovery() {
 // Map denial reason to SDK failure type
 function mapFailureType(violations: string[]): string {
   const joined = violations.join(' ').toLowerCase()
+  if (joined.includes('stale') || joined.includes('freshness')) return 'evidence_stale'
   if (joined.includes('scope')) return 'scope_denied'
   if (joined.includes('budget') || joined.includes('spend') || joined.includes('cost')) return 'budget_exceeded'
   if (joined.includes('suspended')) return 'passport_expired'
@@ -417,6 +419,33 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
   const scopeAuth = await getScopeAuthorizes()
   const evalId = randomUUID()
 
+  // ── G-B3: Risk-tiered freshness gate ──
+  // Per-action risk tier sets the freshness window and the fail behavior. The
+  // customer supplies the freshness evidence descriptor at the edge; the
+  // gateway observes the staleness and applies the tier's posture. Computed
+  // here (async SDK import) and folded into the transaction's violations[]
+  // below so it composes with scope/spend denials.
+  //
+  // Precedence: explicit per-action `risk_tier` (request) > per-delegation
+  // contract tier (`delegation_risk_tier`) > default task-class mapping.
+  // TODO(W2-B3): persist the per-delegation contract tier as a durable
+  // `delegations.risk_tier` column; today it rides on the request as the
+  // signed-contract input so this module stays inside its allowed surface.
+  let freshnessGate: FreshnessGateResult | null = null
+  try {
+    freshnessGate = await runFreshnessGate({
+      taskClass: deriveTaskClass(action_type),
+      requestTier: req.body.risk_tier,
+      delegationTier: req.body.delegation_risk_tier,
+      freshnessInput: req.body.freshness ?? req.body.freshness_required,
+    })
+  } catch (e) {
+    // Freshness gate must never crash the evaluation. On failure, leave the
+    // existing scope/spend path authoritative (no freshness verdict added).
+    console.error('[freshness] gate error - skipping freshness verdict:', (e as Error).message)
+    freshnessGate = null
+  }
+
   const evalResult = db.transaction(() => {
     const delegation = db.prepare(`
       SELECT * FROM delegations
@@ -426,6 +455,16 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
     let verdict = 'permit'
     const violations: string[] = []
+
+    // G-B3: fold the freshness-tier outcome into the verdict. A blocking
+    // outcome (tier 3 fail-closed, tier 2 deny-if-stale, tier 1
+    // require-approval) denies; a non-blocking outcome (allow/warn) records
+    // the staleness but does not deny. The reason carries the tier's detail
+    // so the receipt shows which fail behavior was applied.
+    if (freshnessGate && freshnessGate.blocks) {
+      verdict = 'deny'
+      violations.push(freshnessGate.detail)
+    }
 
     if (!delegation) {
       verdict = 'deny'
@@ -557,12 +596,25 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     } catch { /* recovery lookup is best-effort, never blocks response */ }
   }
 
+  // G-B3: surface the freshness-tier verdict additively. Shows which fail
+  // behavior the gateway applied for this action class and the staleness it
+  // observed. Recorded durably in the evaluation receipt via the reason above.
+  const freshness = freshnessGate ? {
+    risk_tier: freshnessGate.tier,
+    outcome: freshnessGate.outcome,
+    fresh: freshnessGate.fresh,
+    observed_age_seconds: freshnessGate.ageSeconds,
+    reason_code: freshnessGate.reasonCode,
+    revocation_mode: freshnessGate.revocationMode,
+  } : undefined
+
   res.json({
     evaluation_id: evalId,
     verdict,
     reason,
     violations: violations.length > 0 ? violations : undefined,
     recovery,
+    freshness,
     duration_ms: durationMs,
     agent_id,
     action: { type: action_type, target: action_target, scope_required },
