@@ -24,6 +24,9 @@ export interface GatewayEvent {
     | 'wallet_frozen' | 'payment_created' | 'cost_recorded'
     | 'task_created' | 'task_assigned' | 'task_accepted'
     | 'task_evidence' | 'task_reviewed' | 'task_completed' | 'task_cancelled'
+    // G-C2 governance automations, pre-flight guards, incident playbooks.
+    | 'guard_block' | 'drift_detected' | 'evidence_bundle'
+    | 'playbook_triggered' | 'revocation_recommended' | 'integration_health'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

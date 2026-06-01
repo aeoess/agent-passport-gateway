@@ -21,6 +21,17 @@ import { getEventBus } from './events.js'
 import { recordBoundWallets } from './wallet-reverse-index.js'
 import { validateExternalUrl } from './url-safety.js'
 import { sendEmail, spendAlertEmail } from '../notifications/email.js'
+// G-C2 layer (a): compiled, stateless, non-Turing-complete pre-flight guards.
+// Slotted BEFORE the billable evaluate decision below. No agent/LLM in this path.
+import {
+  evaluateGuards,
+  isScopeHighRisk,
+  DEFAULT_HIGH_RISK_SCOPES,
+  type GuardContext,
+} from './guards/index.js'
+// G-C2 layer (c): whether a live customer-signed playbook covers a high-risk
+// scope. Read-only; the guard only consumes the resolved boolean.
+import { scopeCoveredByLivePlaybook } from './playbooks/index.js'
 
 // Spend alert dedup: track which delegation+threshold combos have been alerted
 const spendAlertsSent = new Set<string>()
@@ -409,6 +420,49 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
         action: { type: action_type, target: action_target, scope_required },
       })
     }
+  }
+
+  // ── G-C2 layer (a): real-time pre-flight guards (constraint C2) ──
+  //
+  // Compiled, stateless, non-Turing-complete guards run HERE, before the billable
+  // evaluate decision. There is no agent and no LLM in this path: evaluateGuards
+  // runs a fixed array of straight-line predicates over an immutable context.
+  // A BLOCK is fail-closed deny-before; the request never reaches the billable
+  // transaction. The guard never approves a high-risk action on its own authority
+  // and never mutates policy - that authority lives at the sink (B2 epoch check,
+  // offline) and in the customer-signed playbooks (layer c).
+  //
+  // `coveredBySignedPlaybook` is resolved from the playbook registry. A high-risk
+  // scope with no live signed playbook is blocked here: no free-form autonomous
+  // high-risk action exists outside a signed playbook (constraint C1).
+  const guardHighRisk = isScopeHighRisk(scope_required, DEFAULT_HIGH_RISK_SCOPES)
+  let guardCoveredByPlaybook = false
+  if (guardHighRisk) {
+    try { guardCoveredByPlaybook = scopeCoveredByLivePlaybook(tenant.id, scope_required) }
+    catch { guardCoveredByPlaybook = false } // fail-closed: unresolved => not covered
+  }
+  const guardCtx: GuardContext = {
+    agentStatus: agent.status,
+    scopeRequired: scope_required,
+    actionType: action_type,
+    estimatedCost: typeof estimated_cost === 'number' ? estimated_cost : 0,
+    isHighRisk: guardHighRisk,
+    coveredBySignedPlaybook: guardCoveredByPlaybook,
+    costCeiling: 0, // per-action ceiling is opt-in; 0 disables this guard
+  }
+  const guardDecision = evaluateGuards(guardCtx)
+  if (guardDecision.verdict === 'block') {
+    const gEvalId = randomUUID()
+    const gDurationMs = Date.now() - start
+    db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(gEvalId, tenant.id, agent_id, action_type, action_target || '', scope_required, 'deny', `Pre-flight guard: ${guardDecision.reason}`, gDurationMs, deriveTaskClass(action_type))
+    mintEvaluationReceipt({
+      tenantId: tenant.id, agentId: agent_id, evaluationId: gEvalId,
+      verdict: 'deny', actionType: action_type, scopeRequired: scope_required,
+      reason: guardDecision.code, delegationId: null,
+    })
+    try { getEventBus().emit(tenant.id, { type: 'guard_block', agentId: agent_id, data: { evaluationId: gEvalId, guard: guardDecision.guard, code: guardDecision.code, scope_required, duration_ms: gDurationMs } }) } catch {}
+    return res.json({ evaluation_id: gEvalId, verdict: 'deny', reason: `Pre-flight guard: ${guardDecision.reason}`, violations: [guardDecision.code], duration_ms: gDurationMs, agent_id, action: { type: action_type, target: action_target, scope_required } })
   }
 
   // C2: Atomic delegation check + spend update (prevents TOCTOU double-spend)
