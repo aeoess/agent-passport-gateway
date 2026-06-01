@@ -82,6 +82,7 @@ import { guardsRouter } from './gateway/guards/router.js'
 import { automationsRouter } from './gateway/automations/router.js'
 import { playbooksRouter } from './gateway/playbooks/router.js'
 import { initPlaybookTables } from './gateway/playbooks/index.js'
+import { approvalRouter } from './gateway/approval/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -227,6 +228,9 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
     { table: 'access_receipts', type: 'access_receipt', payloadField: null, signatureField: 'signature' },
     { table: 'derivations', type: 'derivation_receipt', payloadField: 'derivation_json', signatureField: 'signature' },
     { table: 'settlements', type: 'settlement', payloadField: 'merkle_root', signatureField: 'signature' },
+    // G-C3 scoped-approval receipts resolve publicly with the
+    // approval_receipt whitelist (no reason text, no approver PII).
+    { table: 'approval_receipts', type: 'approval_receipt', payloadField: 'payload', signatureField: 'signature' },
   ]
 
   for (const { table, type, payloadField, signatureField } of tables) {
@@ -1879,6 +1883,7 @@ app.use('/api/v1', authMiddleware, connectorsRouter)
 app.use('/api/v1', authMiddleware, guardsRouter)
 app.use('/api/v1', authMiddleware, automationsRouter)
 app.use('/api/v1', authMiddleware, playbooksRouter)
+app.use('/api/v1', authMiddleware, approvalRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)

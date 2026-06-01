@@ -36,6 +36,7 @@ export interface GatewayEvent {
     // G-C2 governance automations, pre-flight guards, incident playbooks.
     | 'guard_block' | 'drift_detected' | 'evidence_bundle'
     | 'playbook_triggered' | 'revocation_recommended' | 'integration_health'
+    | 'approval_requested' | 'approval_granted' | 'approval_denied' | 'approval_expired'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>
