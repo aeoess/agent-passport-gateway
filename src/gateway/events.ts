@@ -24,6 +24,10 @@ export interface GatewayEvent {
     | 'wallet_frozen' | 'payment_created' | 'cost_recorded'
     | 'task_created' | 'task_assigned' | 'task_accepted'
     | 'task_evidence' | 'task_reviewed' | 'task_completed' | 'task_cancelled'
+    // G-D4 onboarding / D2 isolation lifecycle. Added as new union members
+    // (build directive 9: extend the union, do not fork the event system).
+    | 'tenant_isolation_set' | 'tenant_cohort_opt_in' | 'tenant_trust_root_bound'
+    | 'tenant_onboarded' | 'cohort_signal_emitted' | 'cohort_signal_suppressed'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

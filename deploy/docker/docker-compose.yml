@@ -1,0 +1,38 @@
+# In-tenant single-node deployment (G-D4).
+# Runs the gateway inside the customer's own host with a customer-owned
+# volume. For a regulated tenant, set ISOLATION_MODE=hard (the default) and
+# point TRUST_ROOT_SOURCE at the customer HSM/KMS.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d
+
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: aeoess-gateway:in-tenant
+    restart: unless-stopped
+    ports:
+      - "3200:3200"
+    environment:
+      # D2 isolation-by-default. A regulated tenant stays 'hard'.
+      ISOLATION_MODE: ${ISOLATION_MODE:-hard}
+      DB_PATH: /data/gateway.db
+      # Customer brings their own trust root. 'gateway' | 'hsm' | 'kms'.
+      TRUST_ROOT_SOURCE: ${TRUST_ROOT_SOURCE:-gateway}
+      # Opaque reference to the customer HSM/KMS key. NEVER the private key.
+      TRUST_ROOT_KEY_REF: ${TRUST_ROOT_KEY_REF:-}
+      NODE_ENV: production
+      PORT: "3200"
+    volumes:
+      # Customer-owned persistent data. The gateway stores only hashes and
+      # pointers here, never PHI or raw payloads.
+      - gateway-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3200/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  gateway-data:

@@ -1,0 +1,54 @@
+# In-tenant AEOESS gateway Helm values (G-D4).
+# Defaults are isolation-by-default (D2) and customer-owned everything.
+
+image:
+  repository: aeoess-gateway
+  tag: in-tenant
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 3200
+
+# ── Isolation switch (D2) ──
+# 'hard' = regulated tenant, no cross-tenant path (default-safe).
+# 'standard' = may opt in to de-identified, aggregated, above-k-floor signal.
+isolation:
+  mode: hard
+
+# ── Customer bring-your-own trust root (W2-B1 seam) ──
+# source: 'gateway' (DB-generated, not for regulated tenants), 'hsm', or 'kms'.
+# keyRefSecret references a Kubernetes Secret holding the OPAQUE key reference
+# (HSM slot URI / KMS key ARN). The private key never enters the cluster as
+# plaintext; the gateway only ever holds the reference.
+trustRoot:
+  source: gateway
+  keyRefSecret: ""        # name of a Secret with key TRUST_ROOT_KEY_REF
+  keyRefSecretKey: TRUST_ROOT_KEY_REF
+
+# ── Customer-owned persistent storage ──
+# The gateway stores only hashes and pointers, never PHI or raw payloads.
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""        # empty = cluster default
+  mountPath: /data
+
+# ── Network egress ──
+# For a regulated/air-gapped tenant, denyEgress installs a NetworkPolicy that
+# blocks all outbound traffic, making cross-tenant emission structurally
+# impossible at the network layer in addition to the application gate.
+network:
+  denyEgress: false
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+env: {}

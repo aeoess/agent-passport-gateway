@@ -535,6 +535,97 @@ function createTables() {
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 
+  // ═══════════════════════════════════════
+  // G-D4 (onboarding / D2 isolation): per-tenant isolation switch.
+  //
+  // isolation_mode is the D2 settled decision surfaced on the existing
+  // tenant model (build directive 9: extend, do not fork the tenant store).
+  //   'hard'     → regulated tenant. NO cross-tenant path. Cross-tenant
+  //                signal contribution and consumption are both blocked,
+  //                regardless of opt-in. This is the default-safe value
+  //                for a freshly onboarded regulated tenant.
+  //   'standard' → tenant MAY contribute to / consume de-identified,
+  //                aggregated, opt-in, above-k-floor cross-tenant signal.
+  //
+  // The column default is 'hard' so a tenant created before opting in is
+  // isolated by default (D2 isolation-by-default). Opt-in is a separate,
+  // explicit flag (cohort_opt_in) so that switching to 'standard' does not
+  // by itself enrol the tenant in the cohort.
+  // ═══════════════════════════════════════
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN isolation_mode TEXT NOT NULL DEFAULT 'hard'`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN cohort_opt_in INTEGER NOT NULL DEFAULT 0`) } catch {}
+  // Customer-brings-own trust root: where the tenant signing key lives.
+  //   'gateway' → gateway-generated, DB-stored Ed25519 key (today's default).
+  //   'hsm'     → customer HSM-resident key, bound via the W2-B1 seam.
+  //   'kms'     → customer KMS-resident key, bound via the W2-B1 seam.
+  // key_ref is an opaque reference (HSM slot URI / KMS key ARN), NEVER the
+  // private key material itself. Hash-and-pointer discipline applies here too.
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN trust_root_source TEXT NOT NULL DEFAULT 'gateway'`) } catch {}
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN trust_root_key_ref TEXT`) } catch {}
+  // air_gapped marks a tenant whose deployment has no outbound network path.
+  // Cross-tenant emission is structurally impossible for an air-gapped tenant
+  // (there is nowhere to emit to); we still record the flag so onboarding and
+  // export bundling can branch on it.
+  try { db.exec(`ALTER TABLE tenants ADD COLUMN air_gapped INTEGER NOT NULL DEFAULT 0`) } catch {}
+
+  // DB-layer guard: isolation_mode must be one of the two settled values.
+  // Defence in depth alongside the application-layer resolver.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS check_tenants_isolation_insert
+        BEFORE INSERT ON tenants
+        FOR EACH ROW
+        WHEN NEW.isolation_mode NOT IN ('hard', 'standard')
+        BEGIN SELECT RAISE(ABORT, 'invalid isolation_mode (allowed: hard, standard)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_tenants_isolation_update
+        BEFORE UPDATE OF isolation_mode ON tenants
+        FOR EACH ROW
+        WHEN NEW.isolation_mode NOT IN ('hard', 'standard')
+        BEGIN SELECT RAISE(ABORT, 'invalid isolation_mode (allowed: hard, standard)'); END;
+    `)
+  } catch (e: any) {
+    console.error('[migration] isolation-trigger install failed:', e?.message || e)
+  }
+
+  // Cohort emission ledger. The k-floor that holds OVER TIME-SERIES (C3)
+  // cannot be enforced from a single snapshot: an attacker who watches two
+  // emissions where the cohort shrank from {A,B,C} to {A,B} learns C's
+  // contribution by differencing, even though each snapshot independently
+  // cleared k. To gate against that we persist the membership digest of
+  // every emitted cohort window keyed by (cohort_key, emission_seq) and the
+  // gate compares the new window against the prior emitted window for the
+  // same cohort_key. member_digest is a hash of the SORTED set of
+  // tenant-id hashes (never raw tenant ids), so the ledger itself stores no
+  // tenant identity. metric_key namespaces independent time-series.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cohort_emissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cohort_key TEXT NOT NULL,
+      metric_key TEXT NOT NULL,
+      emission_seq INTEGER NOT NULL,
+      k_observed INTEGER NOT NULL,
+      member_digest TEXT NOT NULL,
+      member_count INTEGER NOT NULL,
+      emitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(cohort_key, metric_key, emission_seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cohort_emissions_key
+      ON cohort_emissions(cohort_key, metric_key, emission_seq);
+
+    -- Onboarding lifecycle ledger: append-only record of deployment-hardening
+    -- and isolation-switch events per tenant. Hash-and-pointer: stores event
+    -- type + an opaque detail pointer, never PHI or raw payloads.
+    CREATE TABLE IF NOT EXISTS onboarding_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      event_type TEXT NOT NULL,
+      detail_pointer TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_onboarding_events_tenant
+      ON onboarding_events(tenant_id, created_at);
+  `)
+
   // H4 (audit 2026-05-12): Enum-shaped columns (tenants.plan, tenants.status)
   // were not constrained at the DB layer. A typo in a Stripe webhook
   // metadata field or a future endpoint that skips validation could write

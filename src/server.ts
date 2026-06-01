@@ -76,6 +76,7 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+import { tenantIsolationRouter, applyDeploymentIsolationDefault } from './gateway/tenant-isolation/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import {
@@ -1855,6 +1856,7 @@ app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
+app.use('/api/v1', authMiddleware, tenantIsolationRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1931,6 +1933,18 @@ const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
+
+// G-D4: apply in-tenant deployment isolation defaults from env
+// (ISOLATION_MODE / TRUST_ROOT_SOURCE / AIR_GAPPED). Tighten-only:
+// a regulated deployment forces hard isolation on boot. No-op on the
+// hosted single-tenant path where these env vars are unset (default 'hard').
+const isolationBoot = applyDeploymentIsolationDefault()
+if (isolationBoot.tenantsForcedHard > 0 || isolationBoot.airGapped) {
+  console.log(
+    `[isolation] deployment default mode=${isolationBoot.mode} ` +
+    `tenantsForcedHard=${isolationBoot.tenantsForcedHard} airGapped=${isolationBoot.airGapped}`,
+  )
+}
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo
