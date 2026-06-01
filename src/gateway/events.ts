@@ -41,6 +41,7 @@ export interface GatewayEvent {
     // additively; when G-A1 lands it extends this same union with its own
     // members (batch_committed, anchor_submitted, leaf_fetch, ...).
     | 'audit_bundle_created'
+    | 'source_classified' | 'destination_registered' | 'destination_check'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

@@ -63,6 +63,14 @@ export const PUBLIC_BODY_WHITELISTS: Record<string, readonly string[]> = {
     'risk_tier', 'verdict', 'subject_type', 'scope_hash', 'approvers_hash',
     'signature_count', 'sampled', 'issued_at', 'receipt_hash', 'statement',
   ],
+  // G-D3 source classification. The class is itself an assurance-graded
+  // claim: confidence is how the source labeled it, grade is the
+  // verifier-derived assurance level. We expose hashes of the source
+  // and evidence, never the raw connector label or the source content.
+  classification_receipt: [
+    'schema_version', 'receipt_hash', 'timestamp', 'data_class',
+    'confidence', 'grade', 'source_hash', 'evidence_hash',
+  ],
 }
 
 /** Fields that a row fallback is allowed to expose when no parsed

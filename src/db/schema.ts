@@ -639,6 +639,69 @@ function createTables() {
   try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE tenants ADD COLUMN email_verified_at TEXT`) } catch {}
 
+  // ═══════════════════════════════════════
+  // Source-based data classification (G-D3, 2026-05-31)
+  //
+  // Classification of a data source comes from a LABELED SOURCE (a
+  // connector emits the label: a Salesforce field, an Epic record type,
+  // a connector label), NEVER from gateway payload scanning. We extend
+  // the existing data_sources table rather than introducing a parallel
+  // sources table, so a single source_id has exactly one classification.
+  //
+  //   data_class            the class string declared by the source label
+  //                         (vocabulary lives behind the W2-classification
+  //                         seam in the data-classification module).
+  //   class_confidence      'declared' | 'detected' | 'inferred' - how the
+  //                         connector arrived at the class. This is a
+  //                         source-supplied input, not a verdict.
+  //   class_grade           verifier-derived assurance grade (0..3) computed
+  //                         from confidence + evidence via the SDK
+  //                         classifyEvidenceQuality / evidenceQualityToGrade
+  //                         pattern. NOT issuer-set.
+  //   class_evidence        JSON describing the labeling evidence
+  //                         (connectorId, recordType, fieldRef).
+  //   class_source_label    the connector label descriptor as received.
+  //   classified_at         when the class was last attached.
+  //
+  // All nullable: a source registered before classification, or one with
+  // no connector label, has no class and is treated as unclassified.
+  // ═══════════════════════════════════════
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN data_class TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_confidence TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_grade INTEGER`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_evidence TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN class_source_label TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE data_sources ADD COLUMN classified_at TEXT`) } catch {}
+
+  // Destination registry (G-D3). A destination is a sink an agent may
+  // send classified data to. The gateway records the destination's
+  // POLICY and its sink-confirmation SUPPORT; it does not perform the
+  // confirmation. Enforcement stays at the sink. risk_tier and
+  // allowed_data_classes drive the before-the-fact destination-control
+  // check, which returns permit/deny without mutating anything.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS destinations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      destination_id TEXT NOT NULL,
+      destination_name TEXT NOT NULL,
+      placement TEXT NOT NULL DEFAULT 'external',
+      allowed_data_classes TEXT NOT NULL DEFAULT '[]',
+      allowed_agent_roles TEXT NOT NULL DEFAULT '[]',
+      allowed_purposes TEXT NOT NULL DEFAULT '[]',
+      storage_policy TEXT NOT NULL DEFAULT '{}',
+      training_policy TEXT NOT NULL DEFAULT '{}',
+      sink_confirmation_support TEXT NOT NULL DEFAULT 'none',
+      risk_tier TEXT NOT NULL DEFAULT 'unknown',
+      attestation TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at TEXT,
+      UNIQUE(tenant_id, destination_id)
+    );
+  `)
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_destinations_tenant ON destinations(tenant_id, status)`) } catch {}
+
   // Password reset and email verification tokens.
   // Store SHA-256(token), never the raw token. Single-use (used_at).
   // Expires after 1 hour (password_reset) or 24 hours (email_verification).

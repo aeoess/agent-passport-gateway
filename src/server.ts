@@ -85,6 +85,8 @@ import { initPlaybookTables } from './gateway/playbooks/index.js'
 import { approvalRouter } from './gateway/approval/index.js'
 // G-D1: enforcement modes + policy simulation.
 import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
+import { dataClassificationRouter } from './gateway/data-classification/router.js'
+import { destinationsRouter } from './gateway/destinations/router.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -1887,6 +1889,8 @@ app.use('/api/v1', authMiddleware, automationsRouter)
 app.use('/api/v1', authMiddleware, playbooksRouter)
 app.use('/api/v1', authMiddleware, approvalRouter)
 app.use('/api/v1', authMiddleware, simulationRouter)
+app.use('/api/v1', authMiddleware, dataClassificationRouter)
+app.use('/api/v1', authMiddleware, destinationsRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
