@@ -131,7 +131,14 @@ app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), h
 
 // Inbound identity-bridge (Okta / Entra offboard -> revoke) needs the raw body
 // for HMAC verification, so it is mounted before express.json like Stripe.
-mountInboundIdentityBridge(app)
+// DARK by default in Stage 1 integration: the inbound IdP bridge stays unmounted
+// unless GATEWAY_IDP_BRIDGE_ENABLED is explicitly set to 'true', and no per-tenant
+// IdP secret wiring is configured here. This is a Tima-gated surface (G-C1 founder
+// gate). The outbound connector adapters (OTel, Slack, Teams, Jira, ServiceNow,
+// internal-HTTP) are unaffected and stay active via connectorsRouter.
+if (process.env.GATEWAY_IDP_BRIDGE_ENABLED === 'true') {
+  mountInboundIdentityBridge(app)
+}
 
 app.use(express.json({ limit: '1mb' }))
 
