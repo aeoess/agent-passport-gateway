@@ -87,6 +87,7 @@ import { approvalRouter } from './gateway/approval/index.js'
 import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
 import { dataClassificationRouter } from './gateway/data-classification/router.js'
 import { destinationsRouter } from './gateway/destinations/router.js'
+import { tenantIsolationRouter, applyDeploymentIsolationDefault } from './gateway/tenant-isolation/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -1891,6 +1892,7 @@ app.use('/api/v1', authMiddleware, approvalRouter)
 app.use('/api/v1', authMiddleware, simulationRouter)
 app.use('/api/v1', authMiddleware, dataClassificationRouter)
 app.use('/api/v1', authMiddleware, destinationsRouter)
+app.use('/api/v1', authMiddleware, tenantIsolationRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1973,6 +1975,18 @@ initPlaybookTables()
 // G-D1: mode configuration + migration-signal ledger tables.
 initModeConfigTable()
 initModeObservationsTable()
+
+// G-D4: apply in-tenant deployment isolation defaults from env
+// (ISOLATION_MODE / TRUST_ROOT_SOURCE / AIR_GAPPED). Tighten-only:
+// a regulated deployment forces hard isolation on boot. No-op on the
+// hosted single-tenant path where these env vars are unset (default 'hard').
+const isolationBoot = applyDeploymentIsolationDefault()
+if (isolationBoot.tenantsForcedHard > 0 || isolationBoot.airGapped) {
+  console.log(
+    `[isolation] deployment default mode=${isolationBoot.mode} ` +
+    `tenantsForcedHard=${isolationBoot.tenantsForcedHard} airGapped=${isolationBoot.airGapped}`,
+  )
+}
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo

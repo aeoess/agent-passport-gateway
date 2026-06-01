@@ -1,0 +1,27 @@
+{{- if .Values.network.denyEgress }}
+# Deny-all-egress NetworkPolicy for regulated / air-gapped tenants.
+# With no outbound path, cross-tenant emission is structurally impossible at
+# the network layer, in addition to the application-level isolation gate.
+# DNS to kube-system is permitted so in-cluster service discovery still works.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aeoess-gateway.fullname" . }}-deny-egress
+  labels:
+    {{- include "aeoess-gateway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aeoess-gateway.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS only.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}

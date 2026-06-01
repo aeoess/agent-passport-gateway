@@ -42,6 +42,10 @@ export interface GatewayEvent {
     // members (batch_committed, anchor_submitted, leaf_fetch, ...).
     | 'audit_bundle_created'
     | 'source_classified' | 'destination_registered' | 'destination_check'
+    // G-D4 onboarding / D2 isolation lifecycle. Added as new union members
+    // (build directive 9: extend the union, do not fork the event system).
+    | 'tenant_isolation_set' | 'tenant_cohort_opt_in' | 'tenant_trust_root_bound'
+    | 'tenant_onboarded' | 'cohort_signal_emitted' | 'cohort_signal_suppressed'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

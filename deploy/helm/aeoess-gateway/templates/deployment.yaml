@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aeoess-gateway.fullname" . }}
+  labels:
+    {{- include "aeoess-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "aeoess-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aeoess-gateway.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.service.port }}"
+            - name: DB_PATH
+              value: "{{ .Values.persistence.mountPath }}/gateway.db"
+            - name: NODE_ENV
+              value: production
+            # D2 isolation-by-default. A regulated tenant stays 'hard'.
+            - name: ISOLATION_MODE
+              value: "{{ .Values.isolation.mode }}"
+            - name: TRUST_ROOT_SOURCE
+              value: "{{ .Values.trustRoot.source }}"
+            {{- if .Values.trustRoot.keyRefSecret }}
+            # Opaque HSM/KMS key reference from a customer-owned Secret.
+            # NEVER the private key material.
+            - name: TRUST_ROOT_KEY_REF
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.trustRoot.keyRefSecret }}
+                  key: {{ .Values.trustRoot.keyRefSecretKey }}
+            {{- end }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+      volumes:
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "aeoess-gateway.fullname" . }}-data
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
