@@ -15,11 +15,10 @@
 // edge (the sink, the customer SIEM), not in a central gateway brain.
 // ══════════════════════════════════════════════════════════════════
 
-// TODO(G-A1 / gw-a1-event-merkle): import type { EgressEnvelope, SummaryMatrix }
-//   from '../../gateway/egress/index.js'. The egress/ directory is NOT merged
-//   into base 5ccdac7, so the structural fields are re-declared locally as a
-//   typed seam and kept field-compatible with G-A1's EgressEnvelope. When
-//   egress/ lands, replace ConnectorEnvelopeBody.batch with the imported type.
+// G-A1 egress is now merged. The connector batch reference and summary are the
+// real egress types, re-exported under the connector names the barrel already
+// publishes so existing callers keep their import sites unchanged.
+import type { EgressEnvelope, SummaryMatrix } from '../../gateway/egress/index.js'
 
 /** The current connector event schema version. Bumped on any breaking
  *  change to the envelope shape. Customers branch on this. */
@@ -37,27 +36,14 @@ export type ConnectorEventType =
   | 'identity_offboard'    // an inbound identity-provider offboard mapped to a revoke
   | 'connector_test'       // a delivery test ping for a freshly registered endpoint
 
-/** Field-compatible mirror of G-A1's SummaryMatrix. Counts only, no payload. */
-export interface ConnectorSummaryMatrix {
-  total: number
-  byVerdict: Record<string, number>
-  byActionType: Record<string, number>
-}
+/** G-A1's structural summary. Counts only, no payload. Re-exported under the
+ *  connector name the barrel publishes; it IS the real egress type now. */
+export type ConnectorSummaryMatrix = SummaryMatrix
 
-/** Field-compatible mirror of G-A1's EgressEnvelope structural fields. The
- *  batch root and a structural summary travel; the leaves never do. */
-export interface ConnectorBatchRef {
-  batchId: string
-  merkleRoot: string
-  epoch: number
-  previousBatchId: string | null
-  previousMerkleRoot: string | null
-  receiptCount: number
-  committedAt: string
-  summary: ConnectorSummaryMatrix
-  /** Out-of-band handle for fetching leaves if an anomaly is flagged. */
-  leafFetchRef: string
-}
+/** G-A1's downstream batch envelope: the batch root and a structural summary
+ *  travel, the leaves never do. The connector name is an alias for the real
+ *  EgressEnvelope so batch_committed events carry exactly what G-A1 emits. */
+export type ConnectorBatchRef = EgressEnvelope
 
 /** The versioned envelope every connector delivers. */
 export interface ConnectorEvent {

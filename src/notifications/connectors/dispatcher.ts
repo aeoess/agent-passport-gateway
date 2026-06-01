@@ -17,29 +17,19 @@ import { getDB } from '../../db/schema.js'
 import { getEventBus } from '../../gateway/events.js'
 import type { ConnectorEvent } from './event-schema.js'
 import type { ConnectorKind, ConnectorSink } from './connector.js'
+// G-A1 egress is now merged. The retry POLICY shape and backoff math are owned
+// by G-A1: we import its RetryPolicy type and re-export its DEFAULT_RETRY_POLICY
+// and backoffDelay so the connector surface uses the exact same values, not a
+// copy. The retry LOOP below stays local on purpose: it operates on a
+// ConnectorEvent + ConnectorSink (the versioned schema) and persists exhausted
+// deliveries to the durable connector_dead_letters table, which G-A1's
+// in-memory EgressDispatcher does not do. Delegating the loop to
+// EgressDispatcher.dispatch would drop that durable DLQ and change behavior, so
+// we keep the loop and reuse only the policy + backoff from G-A1.
+import { DEFAULT_RETRY_POLICY, backoffDelay, type RetryPolicy } from '../../gateway/egress/index.js'
 
-// TODO(G-A1 / gw-a1-event-merkle): replace this RetryPolicy + the retry loop in
-//   deliver() with { EgressDispatcher, DEFAULT_RETRY_POLICY, backoffDelay,
-//   type RetryPolicy } from '../../gateway/egress/index.js'. The shape below is
-//   field-identical to G-A1's so the swap is mechanical.
-export interface RetryPolicy {
-  maxAttempts: number
-  baseDelayMs: number
-  maxDelayMs: number
-}
-
-/** Identical to G-A1 DEFAULT_RETRY_POLICY (maxAttempts 4, base 200, cap 5000). */
-export const DEFAULT_RETRY_POLICY: RetryPolicy = {
-  maxAttempts: 4,
-  baseDelayMs: 200,
-  maxDelayMs: 5000,
-}
-
-/** Exponential backoff, capped. Mirrors G-A1 backoffDelay. Exposed for tests. */
-export function backoffDelay(attempt: number, policy: RetryPolicy): number {
-  const raw = policy.baseDelayMs * Math.pow(2, Math.max(0, attempt - 1))
-  return Math.min(raw, policy.maxDelayMs)
-}
+export { DEFAULT_RETRY_POLICY, backoffDelay }
+export type { RetryPolicy }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 

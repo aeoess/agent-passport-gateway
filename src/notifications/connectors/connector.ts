@@ -16,18 +16,28 @@
 
 import type { ConnectorEvent } from './event-schema.js'
 
-// TODO(G-A1 / gw-a1-event-merkle): import { EgressDispatcher, type EgressSink,
-//   type EgressEnvelope, DEFAULT_RETRY_POLICY, backoffDelay,
-//   type RetryPolicy, type DeadLetter, type DispatchResult }
-//   from '../../gateway/egress/index.js' once egress/ is merged into base.
-//   Until then EgressSink is mirrored locally, field-compatible, so adapters
-//   typecheck against the same shape they will get from G-A1.
+// G-A1 egress is now merged. We import its real sink/envelope types so the
+// adaptation below is anchored to the source of truth rather than a local
+// mirror. EgressSink is (EgressEnvelope) => Promise<void>; ConnectorSink
+// deliberately takes a ConnectorEvent (the versioned schema) instead, so the
+// two are NOT the same type. batch-egress.ts is the seam that adapts an
+// EgressEnvelope into a ConnectorEvent when G-A1 batch egress drives delivery.
+import type { EgressSink, EgressEnvelope } from '../../gateway/egress/index.js'
 
-/** A downstream sink, mirrored from G-A1's egress/dispatcher.ts. Resolves on
- *  accepted delivery, rejects to trigger the dispatcher's retry. The arg is a
- *  ConnectorEvent rather than a raw EgressEnvelope so adapters receive the
- *  versioned schema; the dispatcher seam below adapts an EgressEnvelope into a
- *  ConnectorEvent when G-A1 batch egress drives the delivery. */
+/** G-A1's raw downstream sink: (EgressEnvelope) => Promise<void>. Re-exported
+ *  under a local name so the adaptation below can point at the source of truth.
+ *  ConnectorSink deliberately diverges from this - do not collapse the two. */
+export type RawEgressSink = EgressSink
+/** The raw envelope G-A1 hands its EgressSink; a ConnectorEvent wraps the
+ *  versioned schema around this same structural batch reference. */
+export type EgressBatchEnvelope = EgressEnvelope
+
+/** A downstream sink. Resolves on accepted delivery, rejects to trigger the
+ *  dispatcher's retry. The arg is a ConnectorEvent (the versioned schema)
+ *  rather than a raw {@link EgressBatchEnvelope} so adapters receive the
+ *  versioned shape; batch-egress.ts adapts an EgressEnvelope into a
+ *  ConnectorEvent when G-A1 batch egress drives the delivery. Distinct from
+ *  G-A1's {@link RawEgressSink} by design - do not collapse the two. */
 export type ConnectorSink = (event: ConnectorEvent) => Promise<void>
 
 /** A registered, named adapter. `kind` selects the integration; `deliver` is

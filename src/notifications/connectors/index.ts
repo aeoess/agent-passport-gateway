@@ -86,7 +86,7 @@ export {
 export type { IdentityProvider, NormalizedOffboard, OffboardOutcome } from './identity-bridge.js'
 
 // G-A1 batch egress -> connector fan-out seam
-export { batchToConnectorEvent } from './batch-egress.js'
+export { batchToConnectorEvent, makeBatchEgressSink } from './batch-egress.js'
 
 // Router + table bootstrap
 export { connectorsRouter, mountInboundIdentityBridge } from './router.js'
