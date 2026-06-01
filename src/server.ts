@@ -76,6 +76,7 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+import { approvalRouter } from './gateway/approval/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import {
@@ -209,6 +210,9 @@ app.get('/.well-known/receipts/:receiptId', async (req, res) => {
     { table: 'access_receipts', type: 'access_receipt', payloadField: null, signatureField: 'signature' },
     { table: 'derivations', type: 'derivation_receipt', payloadField: 'derivation_json', signatureField: 'signature' },
     { table: 'settlements', type: 'settlement', payloadField: 'merkle_root', signatureField: 'signature' },
+    // G-C3 scoped-approval receipts resolve publicly with the
+    // approval_receipt whitelist (no reason text, no approver PII).
+    { table: 'approval_receipts', type: 'approval_receipt', payloadField: 'payload', signatureField: 'signature' },
   ]
 
   for (const { table, type, payloadField, signatureField } of tables) {
@@ -1855,6 +1859,7 @@ app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
+app.use('/api/v1', authMiddleware, approvalRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
