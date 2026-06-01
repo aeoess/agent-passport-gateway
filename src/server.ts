@@ -78,6 +78,7 @@ import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
+import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
 import {
   validatePassword, isValidEmail, normalizeEmail,
   hashPassword, verifyPassword, burnTime,
@@ -126,6 +127,10 @@ app.use(cors({ origin: (origin, callback) => {
 } }))
 // Stripe webhook needs raw body (must be before express.json)
 app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook)
+
+// Inbound identity-bridge (Okta / Entra offboard -> revoke) needs the raw body
+// for HMAC verification, so it is mounted before express.json like Stripe.
+mountInboundIdentityBridge(app)
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -1855,6 +1860,7 @@ app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
+app.use('/api/v1', authMiddleware, connectorsRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1931,6 +1937,7 @@ const db = initDB(DB_PATH)
 initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
+initConnectorTables()
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo
