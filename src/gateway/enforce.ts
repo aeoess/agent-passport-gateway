@@ -116,7 +116,9 @@ function mintEvaluationReceipt(opts: {
 
 // SDK scope matching — respects monotonic narrowing invariant
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
-async function getScopeAuthorizes() {
+// Exported so the sink-side verifier consumes the SAME SDK-backed scope
+// matcher as the source-side pre-check (no hand-rolled matcher at the sink).
+export async function getScopeAuthorizes() {
   if (!_scopeAuthorizes) {
     try {
       const sdk = await import('agent-passport-system')
@@ -131,13 +133,13 @@ async function getScopeAuthorizes() {
 }
 
 // ── Task class derivation (first segment of action_type) ──
-function deriveTaskClass(actionType: string): string {
+export function deriveTaskClass(actionType: string): string {
   return (actionType || '').split(':')[0] || ''
 }
 
 // ── Argument-pattern scope matching (Feature: broad-capability tool scoping) ──
 
-function globMatch(pattern: string, value: string): boolean {
+export function globMatch(pattern: string, value: string): boolean {
   // Convert glob to regex: ** = any path depth, * = one segment
   const parts = pattern.split('/')
   let regex = '^'
@@ -151,7 +153,7 @@ function globMatch(pattern: string, value: string): boolean {
   try { return new RegExp(regex).test(value) } catch { return false }
 }
 
-function scopeMatchesWithArguments(
+export function scopeMatchesWithArguments(
   delegationScope: string[],
   actionType: string,
   actionArgs: Record<string, unknown>,
@@ -1988,10 +1990,14 @@ function sealReceiptWindow() {
   }
 }
 
-// Seal every hour
-setInterval(sealReceiptWindow, 3600_000)
+// Seal every hour. unref() so these background timers do not by
+// themselves keep the process alive: under the running server the HTTP
+// listener holds the loop open and sealing fires on schedule as before;
+// in a bare import (e.g. a unit test of a consumer module) the process
+// can still exit cleanly. Production cadence is unchanged.
+setInterval(sealReceiptWindow, 3600_000).unref()
 // Seal on startup (catch unsealed receipts from before crash)
-setTimeout(sealReceiptWindow, 5000)
+setTimeout(sealReceiptWindow, 5000).unref()
 
 function maybeAutoSeal() {
   _receiptsSinceLastSeal++
