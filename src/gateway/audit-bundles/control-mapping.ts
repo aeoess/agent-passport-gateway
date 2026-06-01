@@ -79,15 +79,17 @@ const CONTROL_CATALOG: ControlMappingEntry[] = [
     controlId: 'Article 10',
     controlName: 'Data and data governance',
     supportsEvidenceFor:
-      'Data governance practices are increasingly required for high-risk AI ' +
-      'systems. The scope, action-type, and delegation-chain records in this ' +
-      'bundle support evidence for which authorities and data scopes were in ' +
-      'effect for each recorded action.',
+      'High-risk AI systems are increasingly required to govern the data ' +
+      'they use. The scope, action-type, and delegation-chain records in ' +
+      'this bundle support evidence for which authorities and data scopes ' +
+      'were in effect for each recorded action, the access-governance ' +
+      'dimension of data governance.',
     backedBy: ['records', 'approvalEvidence'],
     evidenceLimits:
-      'Supports evidence about authorized scope at decision time. Does not ' +
-      'establish data quality, representativeness, or lawful basis for the ' +
-      'underlying data.',
+      'Supports evidence about authorized data scope at decision time. Does ' +
+      'not address training, validation, or test dataset quality, ' +
+      'representativeness, or bias, which are the core of this control, and ' +
+      'does not establish lawful basis for the underlying data.',
   },
   {
     framework: 'GDPR',
@@ -107,17 +109,20 @@ const CONTROL_CATALOG: ControlMappingEntry[] = [
   {
     framework: 'GDPR',
     controlId: 'Article 17',
-    controlName: 'Right to erasure and revocation handling',
+    controlName: 'Right to erasure',
     supportsEvidenceFor:
-      'Erasure and withdrawal of authorization leave an evidentiary trail. ' +
-      'The revocation checks in this bundle support evidence for whether a ' +
-      'delegation or agent authority was revoked at bundle time and whether ' +
-      'any ancestor authority was revoked.',
+      'An erasure or consent-withdrawal request requires a controller to ' +
+      'stop processing under the withdrawn authorization. The revocation ' +
+      'checks in this bundle support evidence for whether the agent or ' +
+      'delegation authority behind a processing activity was revoked, and ' +
+      'whether any ancestor authority was revoked, at bundle time.',
     backedBy: ['revocationChecks'],
     evidenceLimits:
-      'Supports evidence for the revocation state observed at bundle time. ' +
-      'Revocation propagation to downstream sinks is enforced at the edge ' +
-      'through the epoch check and is not asserted as immediate here.',
+      'Supports evidence for the authorization-revocation state observed at ' +
+      'bundle time. Does not establish that stored personal data was ' +
+      'deleted, which is the substance of an erasure request, and does not ' +
+      'assert immediate propagation. Downstream enforcement is through the ' +
+      'edge epoch check.',
   },
   {
     framework: 'SOC 2',
@@ -145,19 +150,17 @@ const CONTROL_CATALOG: ControlMappingEntry[] = [
       'Supports evidence for the authority asserted at decision time. Does not ' +
       'establish the correctness of the access policy itself.',
   },
-  {
-    framework: 'ISO 42001',
-    controlId: 'A.6.2.8',
-    controlName: 'AI system recording of events',
-    supportsEvidenceFor:
-      'The AI management system standard calls for recording of system ' +
-      'events. The receipt chain and hash-manifest support evidence for a ' +
-      'recorded, tamper-evident event history.',
-    backedBy: ['receiptChain', 'hashManifest'],
-    evidenceLimits:
-      'Supports evidence for recorded events within gateway scope. Does not ' +
-      'establish conformance of the broader management system.',
-  },
+  /*
+   * TODO(D2-ISO): ISO/IEC 42001 Annex A control held pending verification of the
+   * exact control number and title against the standard. Re-add to the live
+   * catalog once confirmed. Held, not dropped; an unverified regulatory control
+   * ID is not asserted on a live compliance surface.
+   *   framework: 'ISO 42001'  controlId: 'A.6.2.8' (UNVERIFIED)
+   *   controlName: AI system recording of events
+   *   backedBy: receiptChain, hashManifest
+   *   supports evidence for: a recorded, tamper-evident event history within
+   *   gateway scope. Does not establish conformance of the broader system.
+   */
   {
     framework: 'NIST AI RMF',
     controlId: 'MEASURE 2.7',
