@@ -264,6 +264,54 @@ ${spentPercent >= 90 ? '<p style="color:#e53e3e;font-weight:bold">Action require
 }
 
 // ═══════════════════════════════════════
+// G-C2 governance automation alert routing template
+// ═══════════════════════════════════════
+
+/**
+ * Alert-routing email for a governance automation (layer b). The automation only
+ * ROUTES and SUMMARIZES; it never auto-acts. Copy follows claims discipline:
+ * assurance is verifier-derived, nothing is "instant" or "guaranteed", and the
+ * automation recommends rather than enforces.
+ */
+export function governanceAlertEmail(opts: {
+  recipientName: string
+  signal: string
+  severity: 'info' | 'warning' | 'critical'
+  summary: string
+  recommendation: string
+}): EmailOptions {
+  const { recipientName, signal, severity, summary, recommendation } = opts
+  const color = severity === 'critical' ? '#e53e3e' : severity === 'warning' ? '#ed8936' : '#3182ce'
+  const text = `Governance signal (${severity}), ${recipientName}.
+
+Signal: ${signal}
+
+${summary}
+
+Recommended next step (review required): ${recommendation}
+
+This is a routed summary from a post-flight governance automation. It does not change policy and takes no action on its own. Review and decide in the dashboard.
+
+Dashboard: https://aeoess.com/portal.html
+
+-- AEOESS`
+
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+<h2 style="color:${color}">Governance Signal - ${esc(severity)}</h2>
+<p>Hi ${esc(recipientName)},</p>
+<p><strong>Signal:</strong> ${esc(signal)}</p>
+<p>${esc(summary)}</p>
+<p style="color:${color}"><strong>Recommended next step (review required):</strong> ${esc(recommendation)}</p>
+<p style="font-size:13px;color:#718096">This is a routed summary from a post-flight governance automation. It does not change policy and takes no action on its own.</p>
+<p><a href="https://aeoess.com/portal.html" style="color:#63b3ed">Review in Dashboard</a></p>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+<p style="font-size:12px;color:#718096">AEOESS - supports evidence for AI agent governance</p>
+</div>`
+
+  return { to: '', subject: `AEOESS Governance Signal - ${signal} (${severity})`, textBody: text, htmlBody: html }
+}
+
+// ═══════════════════════════════════════
 // Email/password authentication templates
 // ═══════════════════════════════════════
 

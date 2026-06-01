@@ -33,6 +33,9 @@ export interface GatewayEvent {
     // Risk queue (G-A3). Shared union; G-A1 event-merkle also extends this file,
     // so additions here are a merge-coordination point with the event spine.
     | 'risk_flagged' | 'approval_required' | 'approval_resolved'
+    // G-C2 governance automations, pre-flight guards, incident playbooks.
+    | 'guard_block' | 'drift_detected' | 'evidence_bundle'
+    | 'playbook_triggered' | 'revocation_recommended' | 'integration_health'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

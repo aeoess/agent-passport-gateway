@@ -77,6 +77,11 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+// G-C2: pre-flight guards (a), governance automations (b), incident playbooks (c).
+import { guardsRouter } from './gateway/guards/router.js'
+import { automationsRouter } from './gateway/automations/router.js'
+import { playbooksRouter } from './gateway/playbooks/router.js'
+import { initPlaybookTables } from './gateway/playbooks/index.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import { connectorsRouter, mountInboundIdentityBridge, initConnectorTables } from './notifications/connectors/index.js'
@@ -1870,6 +1875,10 @@ app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
 app.use('/api/v1', authMiddleware, connectorsRouter)
+// G-C2 routers: guards (a, read-only surface), automations (b), playbooks (c).
+app.use('/api/v1', authMiddleware, guardsRouter)
+app.use('/api/v1', authMiddleware, automationsRouter)
+app.use('/api/v1', authMiddleware, playbooksRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
@@ -1947,6 +1956,8 @@ initLineageTables()
 initGatewayIdentity()
 initAnchorTable()
 initConnectorTables()
+// G-C2 layer (c): customer pre-signed incident-playbook registry tables.
+initPlaybookTables()
 
 // One-shot bound-demo placeholder→fixture migration. Replaces
 // DEMO_FIXTURE_SIG_NOT_PRODUCTION_VALID strings on the live aeoess-bound-demo
