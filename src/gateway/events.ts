@@ -24,6 +24,7 @@ export interface GatewayEvent {
     | 'wallet_frozen' | 'payment_created' | 'cost_recorded'
     | 'task_created' | 'task_assigned' | 'task_accepted'
     | 'task_evidence' | 'task_reviewed' | 'task_completed' | 'task_cancelled'
+    | 'source_classified' | 'destination_registered' | 'destination_check'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

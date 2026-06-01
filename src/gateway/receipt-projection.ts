@@ -53,6 +53,14 @@ export const PUBLIC_BODY_WHITELISTS: Record<string, readonly string[]> = {
   settlement: [
     'schema_version', 'merkle_root', 'period', 'timestamp', 'receipt_hash',
   ],
+  // G-D3 source classification. The class is itself an assurance-graded
+  // claim: confidence is how the source labeled it, grade is the
+  // verifier-derived assurance level. We expose hashes of the source
+  // and evidence, never the raw connector label or the source content.
+  classification_receipt: [
+    'schema_version', 'receipt_hash', 'timestamp', 'data_class',
+    'confidence', 'grade', 'source_hash', 'evidence_hash',
+  ],
 }
 
 /** Fields that a row fallback is allowed to expose when no parsed

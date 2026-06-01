@@ -76,6 +76,8 @@ import { bmoRouter } from './gateway/bmo.js'
 import { providerAttestationRouter } from './gateway/provider-attestation.js'
 import { bmoEvidenceRouter } from './gateway/bmo-evidence.js'
 import { auditExportRouter } from './gateway/audit-export.js'
+import { dataClassificationRouter } from './gateway/data-classification/router.js'
+import { destinationsRouter } from './gateway/destinations/router.js'
 import { projectPublicBody, payloadFingerprint } from './gateway/receipt-projection.js'
 import { sendEmail, signupWelcomeEmail, weeklyDigestEmail, spendAlertEmail, passwordResetEmail, emailVerificationEmail, passwordChangedEmail } from './notifications/email.js'
 import {
@@ -1855,6 +1857,8 @@ app.use('/api/v1', authMiddleware, bmoRouter)
 app.use('/api/v1', authMiddleware, providerAttestationRouter)
 app.use('/api/v1', authMiddleware, bmoEvidenceRouter)
 app.use('/api/v1', authMiddleware, auditExportRouter)
+app.use('/api/v1', authMiddleware, dataClassificationRouter)
+app.use('/api/v1', authMiddleware, destinationsRouter)
 
 // ═══════════════════════════════════════
 // Admin endpoints (enterprise plan only)
