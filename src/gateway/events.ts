@@ -30,6 +30,9 @@ export interface GatewayEvent {
     // local outbox and are fetched out of band on anomaly.
     | 'batch_committed' | 'anchor_submitted' | 'egress_dispatched'
     | 'egress_retry' | 'egress_dead_lettered' | 'leaf_fetch'
+    // Risk queue (G-A3). Shared union; G-A1 event-merkle also extends this file,
+    // so additions here are a merge-coordination point with the event spine.
+    | 'risk_flagged' | 'approval_required' | 'approval_resolved'
   timestamp: string
   agentId?: string
   data: Record<string, unknown>

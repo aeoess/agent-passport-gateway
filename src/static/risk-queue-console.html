@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2024-2026 Tymofii Pidlisnyi. Apache-2.0 license. See LICENSE.
+
+  Risk Queue Console (G-A3) - the portal center.
+
+  A prioritized worklist of the actions a human operator should act on,
+  derived from gateway-observed events. This is a self-contained console
+  artifact: external CSS and JS only (no inline script or style), so it
+  loads under the gateway's strict Content-Security-Policy (script-src and
+  style-src locked to 'self'). The marketing/portal web app embeds or serves
+  this surface; the gateway itself stays an API host.
+
+  It reads GET /api/v1/risk-queue, applies operator actions via
+  POST /api/v1/risk-queue/:id/action, and subscribes to the live event feed
+  at GET /api/v1/events/stream for in-place updates.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Risk Queue - AEOESS Gateway Console</title>
+  <link rel="stylesheet" href="./risk-queue-console.css" />
+</head>
+<body>
+  <header class="console-header">
+    <h1>Risk Queue</h1>
+    <p class="subtitle">
+      Prioritized actions to act on, highest risk first. Each item is surfaced
+      for a decision; resolving an item records the decision, not that the
+      effect was carried out.
+    </p>
+    <div class="status-row">
+      <span id="live-status" class="live-dot" data-state="off">live feed: connecting</span>
+      <span id="item-count" class="count">0 open</span>
+      <button id="refresh-btn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="oversight" class="oversight" hidden>
+      <h2>Operator oversight signals</h2>
+      <ul id="oversight-list"></ul>
+    </section>
+
+    <section class="queue">
+      <ul id="queue-list" class="queue-list" aria-live="polite"></ul>
+      <p id="empty-state" class="empty" hidden>No open items. The queue is clear.</p>
+    </section>
+  </main>
+
+  <footer class="console-footer">
+    <p>
+      Resolution receipts support evidence for who decided what and when. The
+      EU AI Act and similar frameworks increasingly require human oversight of
+      high-risk agent actions; this console surfaces those actions for review.
+    </p>
+  </footer>
+
+  <template id="item-template">
+    <li class="queue-item">
+      <div class="item-main">
+        <span class="badge severity"></span>
+        <span class="badge kind"></span>
+        <span class="summary"></span>
+      </div>
+      <div class="item-meta">
+        <span class="agent"></span>
+        <span class="subject"></span>
+        <span class="age"></span>
+      </div>
+      <div class="item-actions"></div>
+    </li>
+  </template>
+
+  <script src="./risk-queue-console.js" defer></script>
+</body>
+</html>

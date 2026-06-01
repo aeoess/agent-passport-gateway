@@ -399,6 +399,30 @@ function createTables() {
       gateway_signature TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    -- Risk Queue (G-A3): prioritized operator inbox of actions a human
+    -- should act on, derived from gateway-observed events. Modeled on the
+    -- alerts table (resolved_at mirrors acknowledged_at). A row here surfaces
+    -- a decision for a human; it does not record that an action was taken.
+    CREATE TABLE IF NOT EXISTS risk_queue (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      kind TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'medium',
+      priority INTEGER NOT NULL DEFAULT 0,
+      agent_id TEXT,
+      subject TEXT,
+      summary TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '{}',
+      source_event_id TEXT,
+      resolved_at TEXT,
+      resolved_action TEXT,
+      resolution_receipt TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_risk_queue_open
+      ON risk_queue(tenant_id, resolved_at, priority);
   `)
 
   db.exec(`
