@@ -36,7 +36,14 @@ export interface ReconcileOutcome {
   final: boolean
   replayed: boolean
   state: LifecycleState
+  // true if a final disposition was refused because the prior lifecycle state was terminal
+  // (e.g. a voided record cannot be relabeled reconciled). The audit trail is preserved.
+  illegal_transition: boolean
 }
+
+// Lifecycle states from which a reconciled-final transition is NOT permitted. A terminal void
+// record must never be relabeled reconciled (state-machine + audit-trail integrity, contract C).
+const TERMINAL_VOID_STATES = new Set<LifecycleState>(['voided'])
 
 function mapState(disposition: string, final: boolean): LifecycleState {
   if (final) return 'reconciled'
@@ -63,25 +70,35 @@ export function createRegulatedGateway(store: RaStore): RegulatedGateway {
     reconcile(tenantId, receipt, ctx) {
       const result = evaluateDisposition(receipt, ctx)
 
-      // Replay layer (the gateway concern the public verifier defers as not_evaluated).
+      // Replay layer (the gateway concern the public verifier defers as not_evaluated). The
+      // authority jti is IdP-global, so it is bound by issuer ACROSS tenants (an operator
+      // controlling multiple tenant partitions cannot reconcile one IdP grant twice). The
+      // gateway-issued nonce is bound per tenant.
       let replayed = false
       const ar = receipt.authority_ref
       const ic = receipt.intent_commitment
-      if (ar?.jti) {
-        const owner = store.bindOwner(tenantId, 'jti', String(ar.jti), receipt.receipt_id)
+      if (ar?.jti && ar?.issuer) {
+        const owner = store.bindOwner(`idp:${ar.issuer}`, 'jti', String(ar.jti), receipt.receipt_id)
         if (owner !== receipt.receipt_id) replayed = true
       }
       if (ic?.gateway_nonce) {
-        const owner = store.bindOwner(tenantId, 'nonce', String(ic.gateway_nonce), receipt.receipt_id)
+        const owner = store.bindOwner(`tenant:${tenantId}`, 'nonce', String(ic.gateway_nonce), receipt.receipt_id)
         if (owner !== receipt.receipt_id) replayed = true
       }
       result.authority_replay = replayed ? 'fail' : 'pass'
 
       const wouldBeFinal = result.disposition === 'reconciled' || result.disposition === 'regulator_grade_for_class'
-      const final = wouldBeFinal && !replayed
+      // Illegal-prior-state guard: never promote a terminal voided record to reconciled-final.
+      const prior = store.getState(tenantId, receipt.receipt_id)
+      const illegalTransition = wouldBeFinal && prior !== null && TERMINAL_VOID_STATES.has(prior)
+      const final = wouldBeFinal && !replayed && !illegalTransition
+      if (illegalTransition) {
+        // Preserve the terminal void record; do not relabel it.
+        return { result, final, replayed, state: prior as LifecycleState, illegal_transition: true }
+      }
       const state = mapState(result.disposition, final)
       store.setState(tenantId, receipt.receipt_id, state)
-      return { result, final, replayed, state }
+      return { result, final, replayed, state, illegal_transition: false }
     },
 
     markFinal(tenantId, receipt, ctx) {

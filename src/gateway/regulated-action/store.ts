@@ -19,11 +19,14 @@ export interface RaStore {
   setState(tenantId: string, receiptId: string, state: LifecycleState): void
   getState(tenantId: string, receiptId: string): LifecycleState | null
   /**
-   * Bind (kind,value) to the first receipt that claims it and return the OWNING receipt id.
-   * The same receipt re-binding is a no-op; a DIFFERENT receipt reusing the value is a replay
-   * (the returned owner will differ from the caller's receiptId).
+   * Bind (scope_key, kind, value) to the first receipt that claims it and return the OWNING
+   * receipt id. The same receipt re-binding is a no-op; a DIFFERENT receipt reusing the value is a
+   * replay (the returned owner differs from the caller's receiptId). scope_key controls the replay
+   * partition: an IdP-issued authority jti is bound GLOBALLY by issuer (scope_key "idp:<issuer>")
+   * so reuse is caught across tenants of the same operator; a gateway-issued nonce is bound
+   * per tenant (scope_key "tenant:<id>").
    */
-  bindOwner(tenantId: string, kind: 'jti' | 'nonce', value: string, receiptId: string): string
+  bindOwner(scopeKey: string, kind: 'jti' | 'nonce', value: string, receiptId: string): string
   close(): void
 }
 
@@ -41,11 +44,11 @@ export function openRaStore(path = ':memory:'): RaStore {
       PRIMARY KEY (tenant_id, receipt_id)
     );
     CREATE TABLE IF NOT EXISTS ra_seen (
-      tenant_id   TEXT NOT NULL,
-      kind        TEXT NOT NULL,
-      value       TEXT NOT NULL,
+      scope_key     TEXT NOT NULL,
+      kind          TEXT NOT NULL,
+      value         TEXT NOT NULL,
       owner_receipt TEXT NOT NULL,
-      PRIMARY KEY (tenant_id, kind, value)
+      PRIMARY KEY (scope_key, kind, value)
     );
   `)
   const upsert = db.prepare(
@@ -53,8 +56,8 @@ export function openRaStore(path = ':memory:'): RaStore {
      ON CONFLICT(tenant_id, receipt_id) DO UPDATE SET state = excluded.state, updated_ms = excluded.updated_ms`,
   )
   const get = db.prepare(`SELECT state FROM ra_lifecycle WHERE tenant_id = ? AND receipt_id = ?`)
-  const insertSeen = db.prepare(`INSERT OR IGNORE INTO ra_seen (tenant_id, kind, value, owner_receipt) VALUES (?, ?, ?, ?)`)
-  const getOwner = db.prepare(`SELECT owner_receipt FROM ra_seen WHERE tenant_id = ? AND kind = ? AND value = ?`)
+  const insertSeen = db.prepare(`INSERT OR IGNORE INTO ra_seen (scope_key, kind, value, owner_receipt) VALUES (?, ?, ?, ?)`)
+  const getOwner = db.prepare(`SELECT owner_receipt FROM ra_seen WHERE scope_key = ? AND kind = ? AND value = ?`)
 
   return {
     setState(tenantId, receiptId, state) {
@@ -64,9 +67,9 @@ export function openRaStore(path = ':memory:'): RaStore {
       const row = get.get(tenantId, receiptId) as { state: LifecycleState } | undefined
       return row?.state ?? null
     },
-    bindOwner(tenantId, kind, value, receiptId) {
-      insertSeen.run(tenantId, kind, value, receiptId)
-      const row = getOwner.get(tenantId, kind, value) as { owner_receipt: string }
+    bindOwner(scopeKey, kind, value, receiptId) {
+      insertSeen.run(scopeKey, kind, value, receiptId)
+      const row = getOwner.get(scopeKey, kind, value) as { owner_receipt: string }
       return row.owner_receipt
     },
     close() { db.close() },

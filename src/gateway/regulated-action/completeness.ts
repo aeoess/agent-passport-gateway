@@ -27,7 +27,11 @@ export interface Orphan {
 export interface CompletenessInput {
   coverage_scope: CoverageScope
   resource_events: ResourceEvent[]
+  // Reconciled-receipt identifiers. Per contract section E the left-join supports BOTH keys: an
+  // event is covered if its correlation_id OR its resource_transaction_id matches a reconciled
+  // receipt. reconciled_transaction_ids is optional for backward compatibility.
   reconciled_correlation_ids: string[]
+  reconciled_transaction_ids?: string[]
 }
 
 /**
@@ -36,7 +40,8 @@ export interface CompletenessInput {
  * covered). The scope filter is what makes "0 orphans" an honest statement rather than a blind one.
  */
 export function detectOrphans(input: CompletenessInput): { orphans: Orphan[]; out_of_scope: number; in_scope: number } {
-  const reconciled = new Set(input.reconciled_correlation_ids)
+  const reconciledCorr = new Set(input.reconciled_correlation_ids)
+  const reconciledTx = new Set(input.reconciled_transaction_ids ?? [])
   const orphans: Orphan[] = []
   let inScope = 0
   let outOfScope = 0
@@ -44,7 +49,10 @@ export function detectOrphans(input: CompletenessInput): { orphans: Orphan[]; ou
     const isInScope = ev.resource === input.coverage_scope.resource && ev.tenant === input.coverage_scope.tenant
     if (!isInScope) { outOfScope++; continue }
     inScope++
-    const covered = ev.correlation_id !== undefined && reconciled.has(ev.correlation_id)
+    // Left-join on correlation_id OR resource_transaction_id (contract section E).
+    const covered =
+      (ev.correlation_id !== undefined && reconciledCorr.has(ev.correlation_id)) ||
+      reconciledTx.has(ev.resource_transaction_id)
     if (!covered) orphans.push({ resource_transaction_id: ev.resource_transaction_id, timestamp_ms: ev.timestamp_ms })
   }
   return { orphans, out_of_scope: outOfScope, in_scope: inScope }

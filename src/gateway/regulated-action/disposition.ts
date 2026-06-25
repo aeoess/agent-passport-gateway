@@ -82,6 +82,11 @@ function jcsHash(obj: unknown): string {
 }
 function sigOk(payload: string, sig: string | undefined, pub: string | undefined): boolean {
   if (!sig || !pub) return false
+  // Length guards mirroring the HEAD SDK keys.ts. The installed SDK predates those guards, so an
+  // over-long public key whose leading 32 bytes are valid could otherwise verify here while
+  // failing on the HEAD verifier. Reject anything but exactly 64-hex pubkey / 128-hex sig up front
+  // so the gateway matcher cannot diverge from the public verifier on malformed key material.
+  if (pub.length !== 64 || sig.length !== 128) return false
   try { return edVerify(payload, sig, pub) } catch { return false }
 }
 function signedPayload(tag: string, sub: Record<string, unknown>, sigField: string): string {

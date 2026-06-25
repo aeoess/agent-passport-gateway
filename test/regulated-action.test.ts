@@ -231,6 +231,55 @@ describe('RAPV0 gateway: completeness, authority ceiling, transparency', () => {
     assert.equal(verifyInclusion(jcsHash({ tampered: true }), anchor.transparency_ref.inclusion_proof, anchor.root), false)
   })
 
+  it('cross-tenant replay: an IdP jti reused in a SECOND tenant is flagged and cannot finalize (C1)', () => {
+    const c1 = buildHonestCore('xtenant-a')
+    const r1 = assembleReceipt(c1, strongResourceConfirmation(c1))
+    const ctx1 = ctxFor(c1, { registered_resource_keys: { 'strong-key': { publicKey: strongPub, registered_by_operator: false } } })
+    const { gateway, store } = openRegulatedGateway()
+    const first = gateway.markFinal('tenant-A', r1, ctx1)
+    assert.equal(first.final, true)
+
+    // second receipt, DIFFERENT tenant, reuses the same IdP-issued jti (re-signed so authority is valid)
+    const c2 = buildHonestCore('xtenant-b')
+    c2.ar.jti = c1.ar.jti
+    const claims = { ...c2.ar } as Record<string, unknown>
+    delete claims.assertion_sig
+    c2.ar.assertion_sig = sign(`${RAPV0_TAG.authority}.${canonicalizeJCS(claims)}`, idpPriv)
+    const r2 = assembleReceipt(c2, strongResourceConfirmation(c2))
+    const ctx2 = ctxFor(c2, { registered_resource_keys: { 'strong-key': { publicKey: strongPub, registered_by_operator: false } } })
+    const second = gateway.reconcile('tenant-B', r2, ctx2)
+    assert.equal(second.result.disposition, 'reconciled', 'c2 authority+resource are valid')
+    assert.equal(second.replayed, true, 'cross-tenant IdP jti reuse is a replay')
+    assert.equal(second.result.authority_replay, 'fail')
+    assert.equal(second.final, false)
+    store.close()
+  })
+
+  it('illegal prior state: a terminal voided record cannot be relabeled reconciled-final (C2)', () => {
+    const c = buildHonestCore('illegal-1')
+    const receipt = assembleReceipt(c, strongResourceConfirmation(c))
+    const ctx = ctxFor(c, { registered_resource_keys: { 'strong-key': { publicKey: strongPub, registered_by_operator: false } } })
+    const { gateway, store } = openRegulatedGateway()
+    store.setState('tenant-1', receipt.receipt_id, 'voided') // illegal terminal prior state
+    const outcome = gateway.reconcile('tenant-1', receipt, ctx)
+    assert.equal(outcome.illegal_transition, true)
+    assert.equal(outcome.final, false)
+    assert.equal(store.getState('tenant-1', receipt.receipt_id), 'voided', 'void record not relabeled')
+    assert.throws(() => gateway.markFinal('tenant-1', receipt, ctx), RegulatedChokepointError)
+    store.close()
+  })
+
+  it('completeness covers an event by resource_transaction_id when correlation_id is absent (C3)', () => {
+    const r = detectOrphans({
+      coverage_scope: { resource: 'bank-api', tenant: 'tenant-1' },
+      resource_events: [{ resource: 'bank-api', tenant: 'tenant-1', resource_transaction_id: 'tx-cov', timestamp_ms: SUB }],
+      reconciled_correlation_ids: [],
+      reconciled_transaction_ids: ['tx-cov'],
+    })
+    assert.equal(r.orphans.length, 0, 'covered by resource_transaction_id, not an orphan')
+    assert.equal(r.in_scope, 1)
+  })
+
   it('a same-uid forged confirmation never reconciles even with intent precommitted (disposition unit)', () => {
     const c = buildHonestCore('unit-weak')
     const core = {
