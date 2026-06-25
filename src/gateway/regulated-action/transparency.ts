@@ -3,8 +3,8 @@
 // Anchors the pre-committed intent into an append-only Merkle log AT THE reserved STATE, before
 // execution. Produces an inclusion proof the public verifier can check against a registered root.
 // This provides NON-EQUIVOCATION, not truth (SCITT-shaped, draft-ietf-scitt-architecture): it
-// proves the log did not show different histories to different parties; it does not prove the
-// anchored statement is true. The leaf/root construction matches the public verifier and the
+// shows the log did not present different histories to different parties; it does not establish
+// that the anchored statement is true. The leaf/root construction matches the public verifier and the
 // conformance generator so anchors verify across the boundary.
 
 import { jcsHash } from './disposition.js'

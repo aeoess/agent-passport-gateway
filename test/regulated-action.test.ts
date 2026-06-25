@@ -2,7 +2,7 @@
 // Covers the forced chokepoint, lifecycle state machine, the level_1 BAN honest floor (the live
 // path returns intent_precommitted, not reconciled), the BAN forge test, replay detection, the
 // completeness/orphan layer, authority ceiling binding, and transparency inclusion. A level_2 BAN
-// is SIMULATED (an independently-registered boundary_attested confirmation) to prove the verifier
+// is SIMULATED (an independently-registered boundary_attested confirmation) to show the verifier
 // and chokepoint do reconcile under a genuine level_2 deployment, which is the deployment upgrade.
 
 import { describe, it, before, after } from 'node:test'
