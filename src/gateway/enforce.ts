@@ -252,6 +252,57 @@ function mapFailureType(violations: string[]): string {
   return 'unknown'
 }
 
+/**
+ * True iff x is a finite number >= 0. Used to reject a malformed or negative estimated_cost before
+ * any budget math: a negative cost slips past the `cost > remaining` overspend check (a negative is
+ * never greater than the remaining budget) and, on permit, would be ADDED to spend_used, refunding
+ * the budget. Both let an agent spend without limit.
+ */
+export function isNonNegativeFiniteCost(x: unknown): boolean {
+  return typeof x === 'number' && Number.isFinite(x) && x >= 0
+}
+
+/** True iff the granted scope token covers the required one: exact, global '*', hierarchical
+ *  prefix ('a' or 'a:b' covers 'a:b...'), or wildcard suffix ('a:*' covers 'a:b'). */
+export function scopeCovers(granted: string, required: string): boolean {
+  if (granted === '*' || granted === required) return true
+  if (required.startsWith(granted + ':')) return true
+  if (granted.endsWith(':*') && required.startsWith(granted.slice(0, -1))) return true
+  return false
+}
+
+export interface NarrowingParent { scope: string; spend_limit: number | null; spend_used?: number | null; max_depth: number }
+export interface NarrowingChild { scope: string[]; spend_limit: number | null; max_depth: number }
+
+/**
+ * Enforce monotonic narrowing on delegation CREATION. A child delegation minted from a parent
+ * delegation may only narrow it: scope must be a subset, spend_limit may not exceed the parent's
+ * remaining budget, and the depth ceiling may not increase. parent === null means the grantor is a
+ * tenant root principal that received no delegation, so it may grant freely (the tenant owns it).
+ * Previously creation enforced none of this, so a delegatee could mint a child with broader scope,
+ * higher spend, or a deeper ceiling than it was granted (privilege escalation).
+ */
+export function checkDelegationNarrowing(parent: NarrowingParent | null, child: NarrowingChild): { ok: boolean; violations: string[] } {
+  const violations: string[] = []
+  if (!parent) return { ok: true, violations }
+  const parentScopes = parent.scope.split(',').map((s) => s.trim()).filter(Boolean)
+  for (const cs of child.scope) {
+    if (!parentScopes.some((ps) => scopeCovers(ps, cs))) {
+      violations.push(`scope "${cs}" is not within the parent delegation scope`)
+    }
+  }
+  if (child.spend_limit != null && parent.spend_limit != null) {
+    const remaining = parent.spend_limit - (parent.spend_used || 0)
+    if (child.spend_limit > remaining) {
+      violations.push(`spend_limit ${child.spend_limit} exceeds parent remaining budget ${remaining}`)
+    }
+  }
+  if (typeof child.max_depth === 'number' && typeof parent.max_depth === 'number' && child.max_depth > parent.max_depth) {
+    violations.push(`max_depth ${child.max_depth} exceeds parent max_depth ${parent.max_depth}`)
+  }
+  return { ok: violations.length === 0, violations }
+}
+
 export const gatewayRouter = Router()
 
 // ═══════════════════════════════════════
@@ -539,7 +590,15 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
         verdict = 'deny'
         violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
       }
-      if (estimated_cost && delegation.spend_limit) {
+      // Reject a malformed or negative estimated_cost before any budget math. A negative cost would
+      // slip past `estimated_cost > remaining` (a negative is never greater than the remaining
+      // budget) AND, on permit, the spend_used update below would ADD a negative, refunding the
+      // budget. Either lets an agent spend without limit. Require a non-negative finite number.
+      if (estimated_cost !== undefined && estimated_cost !== null && !isNonNegativeFiniteCost(estimated_cost)) {
+        verdict = 'deny'
+        violations.push(`Invalid estimated_cost ${estimated_cost}: must be a non-negative finite number`)
+      }
+      if (estimated_cost && estimated_cost > 0 && delegation.spend_limit) {
         const remaining = delegation.spend_limit - (delegation.spend_used || 0)
         if (estimated_cost > remaining) {
           verdict = 'deny'
@@ -570,7 +629,10 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs, deriveTaskClass(action_type))
 
-    if (verdict === 'permit' && estimated_cost && delegation) {
+    if (verdict === 'permit' && estimated_cost && estimated_cost > 0 && delegation) {
+      // Defense in depth: only ever ADD a positive amount to spend_used. A non-positive cost is
+      // already denied above, so this never runs for one, but the guard makes a budget refund
+      // structurally impossible from this path.
       // C4 dual-write: REAL column (existing) + INTEGER cents (forward-compat).
       // COALESCE guards against rows that pre-date the cents column.
       const inc_cents = toCents(estimated_cost) || 0
@@ -1196,6 +1258,24 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // P3-6: verify agent exists (prevent phantom delegations)
   const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
   if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
+
+  // Monotonic narrowing: if parent_agent_id itself holds a delegation, the new child may only
+  // narrow it (subset scope, spend within the parent's remaining budget, non-increasing depth
+  // ceiling). A parent with no inbound delegation is a tenant root principal and may grant freely.
+  // Without this, a delegatee could mint a child broader than what it was granted (escalation).
+  const parentDel = db.prepare(
+    `SELECT scope, spend_limit, spend_used, max_depth FROM delegations
+     WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+  ).get(tenant.id, parent_agent_id) as any
+  const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
+  const narrow = checkDelegationNarrowing(
+    parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth } : null,
+    { scope: childScopeArr, spend_limit: (spend_limit ?? null) as number | null, max_depth: max_depth || 3 },
+  )
+  if (!narrow.ok) {
+    return res.status(403).json({ error: 'Delegation escalation rejected', violations: narrow.violations })
+  }
+
   const id = randomUUID()
   // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
   const spendLimitUsd = spend_limit || null
