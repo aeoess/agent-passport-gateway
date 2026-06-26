@@ -68,6 +68,7 @@ function createTables() {
       spend_limit REAL,
       spend_used REAL DEFAULT 0,
       max_depth INTEGER DEFAULT 3,
+      current_depth INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       revoked_at TEXT
@@ -540,6 +541,8 @@ function createTables() {
   try { db.exec(`ALTER TABLE policy_evaluations ADD COLUMN task_class TEXT DEFAULT ''`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_id TEXT DEFAULT NULL`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_verification_endpoint TEXT DEFAULT NULL`) } catch {}
+  // Round-3: track the real chain depth so a delegation chain cannot grow past max_depth.
+  try { db.exec(`ALTER TABLE delegations ADD COLUMN current_depth INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
 
   // Security triage 2026-04-11 fix 1: tenant role column.

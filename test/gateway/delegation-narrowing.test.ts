@@ -54,4 +54,18 @@ describe('checkDelegationNarrowing', () => {
     assert.equal(r.ok, false)
     assert.match(r.violations.join(' '), /max_depth 5 exceeds/)
   })
+
+  it('rejects a child whose running chain depth would exceed max_depth (the real depth bound)', () => {
+    // parent sits at current_depth 3 with a ceiling of 3; the child would be depth 4 -> reject.
+    const deep = { scope: 'commerce:checkout', spend_limit: 100, spend_used: 0, max_depth: 3, current_depth: 3 }
+    const r = checkDelegationNarrowing(deep, { scope: ['commerce:checkout'], spend_limit: 10, max_depth: 3 })
+    assert.equal(r.ok, false)
+    assert.match(r.violations.join(' '), /chain depth 4 exceeds max_depth 3/)
+  })
+
+  it('allows a child within the running depth bound', () => {
+    const shallow = { scope: 'commerce:checkout', spend_limit: 100, spend_used: 0, max_depth: 3, current_depth: 1 }
+    // child depth 2 <= 3
+    assert.equal(checkDelegationNarrowing(shallow, { scope: ['commerce:checkout'], spend_limit: 10, max_depth: 3 }).ok, true)
+  })
 })

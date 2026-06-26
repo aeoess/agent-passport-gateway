@@ -271,7 +271,7 @@ export function scopeCovers(granted: string, required: string): boolean {
   return false
 }
 
-export interface NarrowingParent { scope: string; spend_limit: number | null; spend_used?: number | null; max_depth: number }
+export interface NarrowingParent { scope: string; spend_limit: number | null; spend_used?: number | null; max_depth: number; current_depth?: number | null }
 export interface NarrowingChild { scope: string[]; spend_limit: number | null; max_depth: number }
 
 /**
@@ -299,6 +299,13 @@ export function checkDelegationNarrowing(parent: NarrowingParent | null, child: 
   }
   if (typeof child.max_depth === 'number' && typeof parent.max_depth === 'number' && child.max_depth > parent.max_depth) {
     violations.push(`max_depth ${child.max_depth} exceeds parent max_depth ${parent.max_depth}`)
+  }
+  // Running chain depth: a child sits one hop below the parent. The chain may not grow past the
+  // child's max_depth ceiling (already <= the parent's). This is the actual depth BOUND, not just
+  // the non-increasing ceiling above, so a long chain at a flat ceiling cannot grow unbounded.
+  const childDepth = (parent.current_depth ?? 0) + 1
+  if (typeof child.max_depth === 'number' && childDepth > child.max_depth) {
+    violations.push(`chain depth ${childDepth} exceeds max_depth ${child.max_depth}`)
   }
   return { ok: violations.length === 0, violations }
 }
@@ -1264,24 +1271,26 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // ceiling). A parent with no inbound delegation is a tenant root principal and may grant freely.
   // Without this, a delegatee could mint a child broader than what it was granted (escalation).
   const parentDel = db.prepare(
-    `SELECT scope, spend_limit, spend_used, max_depth FROM delegations
+    `SELECT scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
   ).get(tenant.id, parent_agent_id) as any
   const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
   const narrow = checkDelegationNarrowing(
-    parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth } : null,
+    parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth, current_depth: parentDel.current_depth } : null,
     { scope: childScopeArr, spend_limit: (spend_limit ?? null) as number | null, max_depth: max_depth || 3 },
   )
   if (!narrow.ok) {
     return res.status(403).json({ error: 'Delegation escalation rejected', violations: narrow.violations })
   }
+  // Real chain depth: root (no inbound delegation) is 0; each hop is parent.current_depth + 1.
+  const childDepth = parentDel ? ((parentDel.current_depth ?? 0) + 1) : 0
 
   const id = randomUUID()
   // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
   const spendLimitUsd = spend_limit || null
   const spendLimitCents = toCents(spendLimitUsd)
-  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3)
+  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3, childDepth)
   try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
   res.status(201).json({ id, status: 'active' })
 })
