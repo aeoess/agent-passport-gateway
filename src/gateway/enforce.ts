@@ -574,7 +574,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     const delegation = db.prepare(`
       SELECT * FROM delegations
       WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-      ORDER BY created_at DESC LIMIT 1
+      ORDER BY created_at DESC, id DESC LIMIT 1
     `).get(tenant.id, agent_id) as any
 
     let verdict = 'permit'
@@ -1084,7 +1084,7 @@ gatewayRouter.post('/agents', (req: any, res) => {
   res.status(201).json({ id, agent_id, status: 'active' })
 })
 
-// POST /api/v1/root-designations — Consilium policy: designate an agent as a root grantor.
+// POST /api/v1/root-designations - Consilium policy: designate an agent as a root grantor.
 // Admin-only and AUDITED. This is the ONLY way to set is_root=1 (POST /agents ignores a client
 // is_root). Every designation writes a root_designations row (who, when, agent, tenant), atomically
 // with the is_root flip. Existing roots are preserved by the B1 history backfill; this handles NEW
@@ -1421,13 +1421,28 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
   if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
 
+  // Consilium hostile-panel B1/B2 F1: the GRANTOR's own liveness. The gate below keys on is_root and
+  // inbound-delegation liveness but must ALSO check the granting agent's own posture. A revoked or
+  // suspended agent (including a designated root, which revocation does not un-root) must not
+  // originate or narrow authority. /evaluate applies this posture to the ACTING agent; the grant path
+  // applies it to the GRANTOR principal (a different agent). Fetched once here and reused below.
+  const parentAgentRow = db.prepare(`SELECT is_root, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, parent_agent_id) as any
+  if (!parentAgentRow) return res.status(404).json({ error: `Parent agent "${parent_agent_id}" not found in this tenant` })
+  if (parentAgentRow.status !== 'active') {
+    return res.status(403).json({ error: `Delegation rejected: the granting agent "${parent_agent_id}" is not active (status: ${parentAgentRow.status}). A suspended or revoked agent cannot grant, even a designated root.` })
+  }
+
   // Monotonic narrowing: if parent_agent_id itself holds a delegation, the new child may only
   // narrow it (subset scope, spend within the parent's remaining budget, non-increasing depth
   // ceiling). A parent with no inbound delegation is a tenant root principal and may grant freely.
   // Without this, a delegatee could mint a child broader than what it was granted (escalation).
+  // Panel B1/B2 F2: `id DESC` is a deterministic secondary sort. created_at has 1s resolution, so
+  // among same-instant active inbounds SQLite's pick was arbitrary, making WHICH inbound bounds the
+  // child (and, on /evaluate, which is charged) nondeterministic. (Reconciling MULTIPLE simultaneous
+  // active inbounds into an aggregate budget remains an open design item; see REMEDIATION-MEMO.md.)
   const parentDel = db.prepare(
     `SELECT scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
-     WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+     WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1`
   ).get(tenant.id, parent_agent_id) as any
 
   // Audit item 3 (HIGH money): fake-root gate. A parent with NO inbound delegation (parentDel null)
@@ -1441,10 +1456,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
     // now revoked/expired -- a severed delegatee, never a root) from ABSENT (never delegated to -- may
     // originate only if a designated root). The prior code collapsed DEAD into ABSENT, so revoking an
     // inbound routed the parent to the fresh-budget root path (spend/depth reset).
-    const parentAgent = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, parent_agent_id) as any
-    if (!parentAgent) {
-      return res.status(404).json({ error: `Parent agent "${parent_agent_id}" not found in this tenant` })
-    }
+    // parentAgentRow (fetched + existence-checked + status-checked above) carries is_root.
     const everInbound = db.prepare(
       `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`,
     ).get(tenant.id, parent_agent_id) as any
@@ -1452,7 +1464,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
       // DEAD: defense-in-depth beyond B1's origin is_root (a severed child is already is_root=0).
       return res.status(403).json({ error: 'Delegation rejected: the parent had an inbound delegation that is no longer active (revoked or expired). A severed delegatee cannot originate a fresh-budget delegation as a root.' })
     }
-    if (!parentAgent.is_root) {
+    if (!parentAgentRow.is_root) {
       // ABSENT and not a designated root.
       return res.status(403).json({ error: 'Delegation rejected: the parent has no inbound delegation and is not a designated root. Only a designated root (agents.is_root=1) may grant a fresh-budget delegation.' })
     }
