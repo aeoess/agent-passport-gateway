@@ -137,9 +137,15 @@ function createTables() {
       revoked_at TEXT,
       -- B6 (Consilium): DB-level money invariants, defense in depth behind the app cost guard.
       -- A negative cost or a refund below zero is structurally impossible at the row level.
+      -- The ceiling CHECK carries a sub-cent (0.005) tolerance: spend is tracked in float dollars, so a
+      -- legitimate spend-to-the-limit can land a few ULPs above spend_limit by IEEE-754 rounding
+      -- (2.14 + 5.07 = 7.210000000000001). The tolerance is below money granularity (1 cent), so it
+      -- absorbs that noise without masking any real over-limit (which is always >= 1 cent). The
+      -- authoritative ceiling is the app-layer overspend guard (deny); this CHECK is a corruption
+      -- backstop. Panel B6 F1: the exact form here 500'd on a legitimate at-limit spend.
       CHECK (spend_used >= 0),
       CHECK (spend_limit IS NULL OR spend_limit >= 0),
-      CHECK (spend_limit IS NULL OR spend_used <= spend_limit)
+      CHECK (spend_limit IS NULL OR spend_used <= spend_limit + 0.005)
     );
 
     -- Policy Evaluations (the billable unit)

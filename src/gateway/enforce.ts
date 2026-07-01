@@ -609,7 +609,10 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
         verdict = 'deny'
         violations.push(`Invalid estimated_cost ${estimated_cost}: must be a non-negative finite number`)
       }
-      if (estimated_cost && estimated_cost > 0 && delegation.spend_limit) {
+      // Panel B6 F1: gate on `!= null`, not truthiness. A spend_limit of 0 (a zero-budget grant) is
+      // falsy, so the old check skipped it, permitted the spend, and then the spend_used UPDATE tripped
+      // the DB CHECK -> 500. `!= null` means a 0 limit denies any positive cost (remaining 0), cleanly.
+      if (estimated_cost && estimated_cost > 0 && delegation.spend_limit != null) {
         const remaining = delegation.spend_limit - (delegation.spend_used || 0)
         if (estimated_cost > remaining) {
           verdict = 'deny'
