@@ -134,7 +134,12 @@ function createTables() {
       current_depth INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      revoked_at TEXT
+      revoked_at TEXT,
+      -- B6 (Consilium): DB-level money invariants, defense in depth behind the app cost guard.
+      -- A negative cost or a refund below zero is structurally impossible at the row level.
+      CHECK (spend_used >= 0),
+      CHECK (spend_limit IS NULL OR spend_limit >= 0),
+      CHECK (spend_limit IS NULL OR spend_used <= spend_limit)
     );
 
     -- Policy Evaluations (the billable unit)
