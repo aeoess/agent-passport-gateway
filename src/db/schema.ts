@@ -49,15 +49,21 @@ export const IS_ROOT_MIGRATION_ID = 'is_root_origin_backfill_v1'
  * (busy_timeout), then sees the marker complete and skips. Idempotent and safe to re-run.
  * Requires the schema_migrations table to already exist (created in the schema block above).
  */
-export function runIsRootOriginBackfill(database: Database.Database): 'applied' | 'already' {
-  try { database.pragma('busy_timeout = 5000') } catch {}
-  const done = database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
-  if (done) return 'already'
+export function runIsRootOriginBackfill(
+  database: Database.Database,
+  opts: { maxAttempts?: number; busyMs?: number } = {},
+): 'applied' | 'already' {
+  const maxAttempts = Number.isFinite(opts.maxAttempts as number) ? Math.max(1, opts.maxAttempts as number) : 12
+  const busyMs = Number.isFinite(opts.busyMs as number) ? Math.max(0, opts.busyMs as number) : 5000
+  try { database.pragma(`busy_timeout = ${busyMs}`) } catch {}
+
+  const markerComplete = () =>
+    database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
+
   const txn = database.transaction(() => {
     // Re-check inside the write lock: a concurrent boot may have completed it between the read above
     // and acquiring the lock here.
-    const inside = database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
-    if (inside) return false
+    if (markerComplete()) return false
     backfillAgentRoots(database)
     database.prepare(
       `INSERT INTO schema_migrations (id, status, applied_at) VALUES (?, 'complete', ?)
@@ -65,8 +71,27 @@ export function runIsRootOriginBackfill(database: Database.Database): 'applied' 
     ).run(IS_ROOT_MIGRATION_ID, new Date().toISOString())
     return true
   })
-  const applied = txn.immediate() // BEGIN IMMEDIATE: take the write lock up front
-  return applied ? 'applied' : 'already'
+
+  // B5 panel F3: on a multi-replica boot (Railway rolling restart), a concurrent replica may hold the
+  // write lock while it runs a large-fleet backfill for LONGER than busy_timeout, so `.immediate()`
+  // can throw SQLITE_BUSY. The prior code let that propagate uncaught and CRASH the booting replica.
+  // Instead, re-check the marker each round (the winner may have committed -> 'already') and retry a
+  // bounded number of times; each attempt itself waits up to busy_timeout for the lock, so the total
+  // wait rides out a slow winner. Only a genuinely stuck lock (marker never appears) surfaces an error,
+  // fail-closed: better to crash-loop the boot than serve on an unmigrated DB.
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (markerComplete()) return 'already'
+    try {
+      const applied = txn.immediate() // BEGIN IMMEDIATE: take the write lock up front
+      return applied ? 'applied' : 'already'
+    } catch (e: any) {
+      const busy = e && (e.code === 'SQLITE_BUSY' || /database is locked|SQLITE_BUSY/i.test(String(e.message || '')))
+      if (busy && attempt < maxAttempts) continue
+      throw e
+    }
+  }
+  if (markerComplete()) return 'already'
+  throw new Error('is_root migration could not acquire the write lock after retries; another process may be stuck holding it')
 }
 
 export function initDB(path: string = './gateway.db'): Database.Database {

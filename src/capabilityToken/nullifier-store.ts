@@ -69,10 +69,24 @@ export class SqliteNullifierStore implements NullifierStore {
     this.db.exec(`DELETE FROM capability_nullifiers`)
   }
 
-  /** Remove nullifiers whose expires_at has passed. Returns the number swept. */
+  /**
+   * Remove nullifiers whose expires_at has passed. Returns the number swept.
+   *
+   * Panel B4 F1/F2: compare EPOCHS, not raw strings. expires_at is supplied by the caller (the token's
+   * own exp) and may be any valid ISO-8601 form -- 'Z', a numeric offset ('-05:00'), or no milliseconds.
+   * A lexicographic `expires_at < now` mis-sorts those forms: an offset expiry ('...-05:00') sorts
+   * before a 'Z' now, so a STILL-VALID nullifier would be swept early and its token could be replayed.
+   * julianday(...) normalizes the timezone to a UTC instant (sub-second precise) on both sides. A
+   * value SQLite cannot parse yields NULL, so `< ?` is NULL and the row is NOT deleted -- fail-safe
+   * (keep the nullifier; never reopen replay). Sweeping late is harmless; only sweeping EARLY (the
+   * lexicographic bug) could reopen replay.
+   */
   sweepExpired(nowIso: string = new Date().toISOString()): number {
     return this.db.prepare(
-      `DELETE FROM capability_nullifiers WHERE expires_at IS NOT NULL AND expires_at < ?`,
+      `DELETE FROM capability_nullifiers
+       WHERE expires_at IS NOT NULL
+         AND julianday(expires_at) IS NOT NULL
+         AND julianday(expires_at) < julianday(?)`,
     ).run(nowIso).changes
   }
 }
