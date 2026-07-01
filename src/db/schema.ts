@@ -9,6 +9,34 @@ import { randomUUID } from 'node:crypto'
 
 let db: Database.Database
 
+/**
+ * ONE-TIME backfill for audit item 3: promote exactly the agents that are CURRENTLY, ACTIVELY
+ * acting as roots -- an active grantor (a parent of at least one active delegation) that itself has
+ * NO inbound active delegation. Everything else stays is_root=0. This preserves every existing valid
+ * root-granting relationship at migration time while closing the fake-root escape for everyone else.
+ *
+ * Assumptions (documented for the deploy review): a "root" is inferred purely from the live
+ * delegation graph at migration time. An agent that has not yet granted anything is NOT promoted;
+ * designating a NEW root after the migration is an explicit tenant action (POST /agents is_root, or
+ * a manual UPDATE). Scoped per tenant. Idempotent (the `is_root = 0` guard means a re-run is a no-op;
+ * the migration also only calls this on the first column-add). Returns the number of agents promoted.
+ */
+export function backfillAgentRoots(database: Database.Database): number {
+  const info = database.prepare(`
+    UPDATE agents SET is_root = 1
+    WHERE is_root = 0
+      AND EXISTS (
+        SELECT 1 FROM delegations d
+        WHERE d.tenant_id = agents.tenant_id AND d.status = 'active' AND d.parent_agent_id = agents.agent_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM delegations d2
+        WHERE d2.tenant_id = agents.tenant_id AND d2.status = 'active' AND d2.child_agent_id = agents.agent_id
+      )
+  `).run()
+  return info.changes
+}
+
 export function initDB(path: string = './gateway.db'): Database.Database {
   db = new Database(path)
   db.pragma('journal_mode = WAL')
@@ -54,6 +82,9 @@ function createTables() {
       did TEXT,
       name TEXT,
       status TEXT NOT NULL DEFAULT 'active',
+      -- Audit item 3: a DESIGNATED root grantor. Only is_root=1 agents may create a delegation
+      -- with no inbound delegation (a fresh-budget root grant). Default 0 (not a root).
+      is_root INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(tenant_id, agent_id)
     );
@@ -544,6 +575,16 @@ function createTables() {
   // Round-3: track the real chain depth so a delegation chain cannot grow past max_depth.
   try { db.exec(`ALTER TABLE delegations ADD COLUMN current_depth INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
+
+  // Audit item 3 (HIGH money): designated root grantors. Only is_root=1 agents may grant a
+  // delegation with no inbound delegation; without this any no-inbound agent could be named a
+  // fresh-budget root and reset an exhausted child's spend. The ALTER succeeds exactly ONCE (when
+  // the column is first added to an existing DB), and only then do we run the ONE-TIME backfill
+  // that promotes the agents already acting as de-facto roots. On a fresh DB the column exists from
+  // CREATE TABLE, the ALTER throws, and the backfill is skipped (no data to backfill).
+  let isRootColumnAdded = false
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`); isRootColumnAdded = true } catch {}
+  if (isRootColumnAdded) backfillAgentRoots(db)
 
   // Security triage 2026-04-11 fix 1: tenant role column.
   // Decouples admin authorization from the `plan` billing concept.

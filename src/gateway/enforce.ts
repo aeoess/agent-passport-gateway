@@ -949,10 +949,13 @@ gatewayRouter.get('/agents', (req: any, res) => {
 gatewayRouter.post('/agents', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata } = req.body
+  const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root } = req.body
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
+  // Audit item 3: the authenticated tenant may designate this agent as a root grantor (is_root=1),
+  // the only kind of agent allowed to grant a delegation with no inbound delegation. Default 0.
+  const isRoot = (is_root === true || is_root === 1 || is_root === '1') ? 1 : 0
   // Security triage 2026-04-11 fix 4: validate entity_verification_endpoint
   // against the SSRF guard at registration time. Rejecting here is the
   // primary defense; the policy evaluation path has defense-in-depth.
@@ -972,8 +975,8 @@ gatewayRouter.post('/agents', (req: any, res) => {
     return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
-  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null)
+  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null, isRoot)
   // Wallet → agent reverse index: pick up bound_wallets at enrollment time
   // so /public/trust/by-wallet/:address resolves immediately without a
   // boot rebuild. Promised to douglasborthwick-crypto on insumer-examples#1.
@@ -1309,6 +1312,23 @@ gatewayRouter.post('/delegations', (req: any, res) => {
     `SELECT scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
   ).get(tenant.id, parent_agent_id) as any
+
+  // Audit item 3 (HIGH money): fake-root gate. A parent with NO inbound delegation (parentDel null)
+  // is treated by checkDelegationNarrowing as a free-granting root with spend_used=0 and
+  // current_depth=0. Without a server-side root notion, any no-inbound agent could be named as a
+  // fresh-budget root, resetting an exhausted child's spend and the chain depth. So a no-inbound
+  // parent may grant ONLY if it is a DESIGNATED root (agents.is_root=1). This also closes item 2's
+  // depth-reset coupling: a non-root no-inbound parent can no longer reset current_depth to 0.
+  if (!parentDel) {
+    const parentAgent = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, parent_agent_id) as any
+    if (!parentAgent) {
+      return res.status(404).json({ error: `Parent agent "${parent_agent_id}" not found in this tenant` })
+    }
+    if (!parentAgent.is_root) {
+      return res.status(403).json({ error: 'Delegation rejected: the parent has no inbound delegation and is not a designated root. Only a designated root (agents.is_root=1) may grant a fresh-budget delegation.' })
+    }
+  }
+
   const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
   const narrow = checkDelegationNarrowing(
     parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth, current_depth: parentDel.current_depth } : null,
