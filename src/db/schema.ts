@@ -10,31 +10,63 @@ import { randomUUID } from 'node:crypto'
 let db: Database.Database
 
 /**
- * ONE-TIME backfill for audit item 3: promote exactly the agents that are CURRENTLY, ACTIVELY
- * acting as roots -- an active grantor (a parent of at least one active delegation) that itself has
- * NO inbound active delegation. Everything else stays is_root=0. This preserves every existing valid
- * root-granting relationship at migration time while closing the fake-root escape for everyone else.
+ * ONE-TIME backfill for is_root (B1, Consilium): is_root is an ORIGIN property derived from HISTORY,
+ * never from current edges. An agent is a root iff it has NEVER appeared as `child_agent_id` in
+ * delegations under ANY status (active, revoked, expired, pending, suspended). Any agent that has
+ * ever received a delegation -- even one now revoked or expired -- is is_root=0.
  *
- * Assumptions (documented for the deploy review): a "root" is inferred purely from the live
- * delegation graph at migration time. An agent that has not yet granted anything is NOT promoted;
- * designating a NEW root after the migration is an explicit tenant action (POST /agents is_root, or
- * a manual UPDATE). Scoped per tenant. Idempotent (the `is_root = 0` guard means a re-run is a no-op;
- * the migration also only calls this on the first column-add). Returns the number of agents promoted.
+ * Why the origin rule (and not "active grantor with no active inbound", the prior version):
+ *   - it refuses a SEVERED child: a revoked/expired inbound plus an active outbound must NOT become a
+ *     fresh-budget root (the prior rule promoted it, because the inbound was no longer active);
+ *   - it preserves an IDLE real root: an origin principal that has not granted anything yet stays a
+ *     root (the prior rule left it is_root=0, so its first grant 403'd).
+ * A self-delegation A->A makes A appear as its own child, so A is correctly is_root=0.
+ *
+ * Scoped per tenant. Idempotent (the `is_root = 0` guard makes a re-run a no-op). Returns the number
+ * of agents promoted. New roots created after migration require the audited admin designation path
+ * (client-supplied is_root at POST /agents is ignored -- Consilium policy change).
  */
 export function backfillAgentRoots(database: Database.Database): number {
   const info = database.prepare(`
     UPDATE agents SET is_root = 1
     WHERE is_root = 0
-      AND EXISTS (
-        SELECT 1 FROM delegations d
-        WHERE d.tenant_id = agents.tenant_id AND d.status = 'active' AND d.parent_agent_id = agents.agent_id
-      )
       AND NOT EXISTS (
-        SELECT 1 FROM delegations d2
-        WHERE d2.tenant_id = agents.tenant_id AND d2.status = 'active' AND d2.child_agent_id = agents.agent_id
+        SELECT 1 FROM delegations d
+        WHERE d.tenant_id = agents.tenant_id AND d.child_agent_id = agents.agent_id
       )
   `).run()
   return info.changes
+}
+
+export const IS_ROOT_MIGRATION_ID = 'is_root_origin_backfill_v1'
+
+/**
+ * B5 (Consilium): run the is_root origin backfill exactly once, TRANSACTIONALLY and versioned.
+ * Gated on a schema_migrations `complete` row written in the SAME transaction as the backfill, NOT
+ * on column presence. So a crash after the ALTER but before the backfill commits rolls back and
+ * re-runs correctly on the next boot (the prior column-presence gate would skip it forever). The
+ * IMMEDIATE lock plus a re-check inside the transaction serialize concurrent boots: the loser waits
+ * (busy_timeout), then sees the marker complete and skips. Idempotent and safe to re-run.
+ * Requires the schema_migrations table to already exist (created in the schema block above).
+ */
+export function runIsRootOriginBackfill(database: Database.Database): 'applied' | 'already' {
+  try { database.pragma('busy_timeout = 5000') } catch {}
+  const done = database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
+  if (done) return 'already'
+  const txn = database.transaction(() => {
+    // Re-check inside the write lock: a concurrent boot may have completed it between the read above
+    // and acquiring the lock here.
+    const inside = database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
+    if (inside) return false
+    backfillAgentRoots(database)
+    database.prepare(
+      `INSERT INTO schema_migrations (id, status, applied_at) VALUES (?, 'complete', ?)
+       ON CONFLICT(id) DO UPDATE SET status = 'complete', applied_at = excluded.applied_at`,
+    ).run(IS_ROOT_MIGRATION_ID, new Date().toISOString())
+    return true
+  })
+  const applied = txn.immediate() // BEGIN IMMEDIATE: take the write lock up front
+  return applied ? 'applied' : 'already'
 }
 
 export function initDB(path: string = './gateway.db'): Database.Database {
@@ -226,7 +258,17 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_evals_agent ON policy_evaluations(tenant_id, agent_id);
     CREATE INDEX IF NOT EXISTS idx_receipts_tenant ON receipts(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_delegations_tenant ON delegations(tenant_id, status);
+    -- B5 (Consilium): index the delegation-graph lookups the authz path and the backfill run.
+    CREATE INDEX IF NOT EXISTS idx_delegations_parent ON delegations(tenant_id, status, parent_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_delegations_child ON delegations(tenant_id, status, child_agent_id);
     CREATE INDEX IF NOT EXISTS idx_usage_tenant ON usage(tenant_id, period);
+    -- B5 (Consilium): versioned migration ledger. A migration is gated on its complete-status row
+    -- here, written in the SAME transaction as its data change, so a crash mid-migration re-runs.
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      applied_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
     CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);
@@ -582,9 +624,12 @@ function createTables() {
   // the column is first added to an existing DB), and only then do we run the ONE-TIME backfill
   // that promotes the agents already acting as de-facto roots. On a fresh DB the column exists from
   // CREATE TABLE, the ALTER throws, and the backfill is skipped (no data to backfill).
-  let isRootColumnAdded = false
-  try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`); isRootColumnAdded = true } catch {}
-  if (isRootColumnAdded) backfillAgentRoots(db)
+  // B1/B5: ensure the is_root column (idempotent ALTER), then run the origin backfill
+  // TRANSACTIONALLY, gated on a schema_migrations marker (not on column presence) so a crash between
+  // the ALTER and the backfill commit re-runs correctly on the next boot. Runs at initDB, i.e. before
+  // the server calls app.listen() (server.ts), so it completes before any traffic is accepted.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`) } catch {}
+  runIsRootOriginBackfill(db)
 
   // Audit item 5 (HIGH replay): durable capability-token nullifier set. A consumed token preimage
   // must survive restarts and be shared across processes; the reference MCP store is per-process.

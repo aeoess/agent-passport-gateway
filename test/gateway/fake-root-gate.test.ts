@@ -95,11 +95,13 @@ describe('fake-root gate (audit item 3)', () => {
     del.run('mid', 'leaf')      // mid grants but HAS inbound -> not a root
     const promoted = backfillAgentRoots(tdb)
     const rootOf = (a: string) => (tdb.prepare(`SELECT is_root FROM agents WHERE agent_id = ?`).get(a) as any).is_root
-    assert.equal(promoted, 1)
+    // B1 origin rule: is_root iff NEVER appeared as child_agent_id. trueRoot and orphan (never
+    // children) are roots; mid/leaf (ever a child) are not. Superseded the prior active-edges rule.
+    assert.equal(promoted, 2)
     assert.equal(rootOf('trueRoot'), 1)
-    assert.equal(rootOf('mid'), 0)   // has inbound
-    assert.equal(rootOf('leaf'), 0)  // only receives
-    assert.equal(rootOf('orphan'), 0) // no delegations at all
+    assert.equal(rootOf('mid'), 0)   // has inbound -> ever a child
+    assert.equal(rootOf('leaf'), 0)  // only receives -> ever a child
+    assert.equal(rootOf('orphan'), 1) // never a child -> origin root
     // idempotent: a second run promotes nobody
     assert.equal(backfillAgentRoots(tdb), 0)
     tdb.close()
