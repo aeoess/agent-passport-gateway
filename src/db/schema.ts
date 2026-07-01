@@ -284,6 +284,27 @@ function createTables() {
       designated_at TEXT NOT NULL,
       revoked_at TEXT
     );
+    -- B3 (Consilium): bilateral interaction receipts. A row is stored only after BOTH the requesting
+    -- and serving signatures are checked against BOTH agents' REGISTERED keys (via the SDK
+    -- verifyBilateralReceipt primitive). status is 'attested' (both sides valid) or
+    -- 'partial_attestation' (exactly one valid side, e.g. a dumb Web2 sink that cannot countersign).
+    -- A forged/mismatched present signature is rejected at the route and never reaches this table.
+    CREATE TABLE IF NOT EXISTS bilateral_receipts (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      receipt_id TEXT NOT NULL,
+      requesting_agent_id TEXT NOT NULL,
+      serving_agent_id TEXT NOT NULL,
+      delegation_id TEXT,
+      status TEXT NOT NULL,
+      requesting_sig_valid INTEGER NOT NULL,
+      serving_sig_valid INTEGER NOT NULL,
+      outcome_consistent INTEGER NOT NULL,
+      timing_valid INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_bilateral_receipts_tenant ON bilateral_receipts(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
     CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);

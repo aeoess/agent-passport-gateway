@@ -16,7 +16,7 @@ import { randomUUID, createHash } from 'node:crypto'
 // Receipt-ingest signature verification (audit item 6). Same SDK canonicalize/verify the
 // proxy-gateway already depends on; the ActionReceipt preimage is canonicalize(receipt minus
 // signature) verified against the signer's registered agents.public_key.
-import { verify as apsVerify, canonicalize as apsCanonicalize } from 'agent-passport-system'
+import { verify as apsVerify, canonicalize as apsCanonicalize, verifyBilateralReceipt } from 'agent-passport-system'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
@@ -857,6 +857,90 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   try { getEventBus().emit(tenant.id, { type: 'receipt_stored', agentId: agent_id, data: { receiptId, evaluationId: evaluation_id, action_type, verdict } }) } catch {}
 
   res.status(201).json({ receipt_id: receiptId, stored: true })
+})
+
+// ═══════════════════════════════════════
+// POST /api/v1/receipts/bilateral - Bilateral interaction receipt (B3, Consilium)
+// ═══════════════════════════════════════
+//
+// An APS interaction receipt is BILATERAL: a requesting agent and a serving agent
+// BOTH sign the same canonical body. The unilateral POST /receipt above checks a
+// SINGLE signature against a SINGLE key and cannot attest a two-party interaction.
+// This route verifies BOTH signatures against BOTH agents' REGISTERED keys (looked
+// up by tenant + agent_id) using the SDK's verifyBilateralReceipt primitive, so the
+// gateway consumes the protocol primitive and never reimplements it.
+//
+// Fail-closed rules:
+//   * both agents MUST be registered in THIS tenant (agent_id + tenant bound); an
+//     unknown or cross-tenant counterparty is a 404, never stored.
+//   * a PRESENT signature that does not verify against the registered key is a
+//     forgery/tamper -> 400, never stored.
+//   * status is 'attested' only when BOTH sides verify; a legitimately one-sided
+//     receipt (exactly one present-and-valid signature, the other absent) stores
+//     'partial_attestation'; a receipt with no valid signature is rejected.
+gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const receipt = req.body?.receipt
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+    return res.status(400).json({ error: 'Required: receipt (a bilateral receipt object)' })
+  }
+  const { requestingAgentId, servingAgentId, requestingAgentSignature, servingAgentSignature } = receipt
+  if (!requestingAgentId || !servingAgentId) {
+    return res.status(400).json({ error: 'Receipt must name requestingAgentId and servingAgentId' })
+  }
+
+  const db = getDB()
+  // agent_id + tenant binding: BOTH counterparties must be registered in THIS tenant.
+  const reqRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, requestingAgentId) as any
+  if (!reqRow || !reqRow.public_key) {
+    return res.status(404).json({ error: `Requesting agent "${requestingAgentId}" not registered in this tenant; cannot verify receipt` })
+  }
+  const srvRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, servingAgentId) as any
+  if (!srvRow || !srvRow.public_key) {
+    return res.status(404).json({ error: `Serving agent "${servingAgentId}" not registered in this tenant; cannot verify receipt` })
+  }
+
+  // Which sides even claim a signature (a present signature must verify; an absent one is one-sided).
+  const hasReq = typeof requestingAgentSignature === 'string' && requestingAgentSignature.length > 0
+  const hasSrv = typeof servingAgentSignature === 'string' && servingAgentSignature.length > 0
+
+  let v
+  try {
+    v = verifyBilateralReceipt(receipt, String(reqRow.public_key), String(srvRow.public_key))
+  } catch {
+    return res.status(400).json({ error: 'Bilateral receipt verification failed (unparseable or malformed receipt); rejected' })
+  }
+
+  // A PRESENT signature that does not verify is a forgery/tamper. Fail closed, never store.
+  if (hasReq && !v.requestingAgentSignatureValid) {
+    return res.status(400).json({ error: 'Requesting agent signature invalid; receipt rejected (forged, tampered, or wrong registered key)' })
+  }
+  if (hasSrv && !v.servingAgentSignatureValid) {
+    return res.status(400).json({ error: 'Serving agent signature invalid; receipt rejected (forged, tampered, or wrong registered key)' })
+  }
+
+  const reqValid = hasReq && v.requestingAgentSignatureValid
+  const srvValid = hasSrv && v.servingAgentSignatureValid
+  let status: 'attested' | 'partial_attestation'
+  if (reqValid && srvValid) status = 'attested'
+  else if (reqValid || srvValid) status = 'partial_attestation'
+  else return res.status(400).json({ error: 'Receipt carries no valid signature; rejected' })
+
+  const rowId = randomUUID()
+  db.prepare(`INSERT INTO bilateral_receipts (id, tenant_id, receipt_id, requesting_agent_id, serving_agent_id, delegation_id, status, requesting_sig_valid, serving_sig_valid, outcome_consistent, timing_valid, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(rowId, tenant.id, String(receipt.receiptId || rowId), requestingAgentId, servingAgentId, receipt.delegationId || null, status, reqValid ? 1 : 0, srvValid ? 1 : 0, v.outcomeConsistent ? 1 : 0, v.timingValid ? 1 : 0, JSON.stringify(receipt))
+
+  try { getEventBus().emit(tenant.id, { type: 'bilateral_receipt_stored', agentId: requestingAgentId, data: { rowId, receiptId: receipt.receiptId, servingAgentId, status } }) } catch {}
+
+  res.status(201).json({
+    receipt_id: rowId,
+    status,
+    requesting_signature_valid: reqValid,
+    serving_signature_valid: srvValid,
+    outcome_consistent: v.outcomeConsistent,
+    timing_valid: v.timingValid,
+    stored: true,
+  })
 })
 
 // ═══════════════════════════════════════

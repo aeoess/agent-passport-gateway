@@ -1,0 +1,46 @@
+{
+  "_provenance": {
+    "generator": "agent-passport-system createBilateralReceipt (real Ed25519 signer)",
+    "sdk_version": "2.6.0-alpha.3",
+    "generated_at": "2026-07-01T00:00:00.000Z",
+    "note": "Throwaway test keys. Frozen vector; the gateway re-verifies it via verifyBilateralReceipt. Do not regenerate casually - the receipt bytes are the golden preimage.",
+    "self_check": {
+      "valid": true,
+      "requestingAgentSignatureValid": true,
+      "servingAgentSignatureValid": true,
+      "gatewaySignatureValid": null,
+      "outcomeConsistent": true,
+      "timingValid": true,
+      "errors": []
+    }
+  },
+  "requestingAgentId": "golden-requester",
+  "servingAgentId": "golden-server",
+  "requestingPublicKey": "6ed16dc19ee092842bab8cd276a5ae42011deb248062e4b514af1826c5c6dec3",
+  "servingPublicKey": "d8a013ebe9b126745be2acc75d75e63d21b56be25acb2c62d640409c3c5dc736",
+  "requestingPrivateKey": "31d63b1cfe43dacaae08633a0d0ffb30b369e727ef3c3300cb2d98b4f0b3e5da",
+  "servingPrivateKey": "4c74762a1fe7bf3b2c1222b2656d6ee3c68463b6f6b479955905e023ee965097",
+  "receipt": {
+    "receiptId": "a9c5da56-7f70-4cf7-a233-057bf21e0918",
+    "version": "1.0",
+    "requestingAgentId": "golden-requester",
+    "servingAgentId": "golden-server",
+    "delegationId": "del-golden-1",
+    "outcome": {
+      "toolName": "commerce:checkout",
+      "requestHash": "req-hash-8f3a",
+      "responseHash": "resp-hash-2b7c",
+      "status": "success",
+      "summary": "checkout completed",
+      "spend": {
+        "amount": 12.5,
+        "currency": "USD"
+      }
+    },
+    "requestedAt": "2026-06-01T12:00:00.000Z",
+    "completedAt": "2026-06-01T12:00:03.000Z",
+    "agreedAt": "2026-07-01T21:38:18.859Z",
+    "requestingAgentSignature": "d3239bb684d848592961bdd3e9528f6125b72f4cd9276e162c463124f1a67aacb0571e0c32e1c654754d31f1f35550ed9ed9a3d56655a21dbb84605cb6cd6002",
+    "servingAgentSignature": "7790e0e5307198359557bb985b889f24bfabd34410cb40526e7466784e8b7abe9b73ea8cae8b560d94a801e8bf954609985859b7240a0c1fd98aff39bcf64808"
+  }
+}
