@@ -27,6 +27,7 @@ import type { Server } from 'node:http'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { createBilateralReceipt } from 'agent-passport-system'
 import { initDB, getDB } from '../../src/db/schema.js'
 import { initGatewayIdentity } from '../../src/gateway/identity.js'
 import { gatewayRouter } from '../../src/gateway/enforce.js'
@@ -100,7 +101,15 @@ describe('B3 bilateral receipt verification', () => {
   })
 
   it('a legitimately one-sided receipt stores partial_attestation (not full)', async () => {
-    const oneSided = { ...GOLDEN.receipt, servingAgentSignature: '' }
+    // Freshly signed by the golden keys so it has a DISTINCT receiptId (the golden receiptId was
+    // already stored by the first test; replay dedup would otherwise 409). Blank the serving sig.
+    const fresh = createBilateralReceipt({
+      requestingAgentId: GOLDEN.requestingAgentId, servingAgentId: GOLDEN.servingAgentId,
+      outcome: { toolName: 't', requestHash: 'rq', responseHash: 'rs', status: 'success', summary: 'ok' },
+      requestedAt: '2026-06-01T00:00:00.000Z', completedAt: '2026-06-01T00:00:01.000Z',
+      requestingAgentPrivateKey: GOLDEN.requestingPrivateKey, servingAgentPrivateKey: GOLDEN.servingPrivateKey,
+    })
+    const oneSided = { ...fresh, servingAgentSignature: '' }
     const r = await post('/receipts/bilateral', { receipt: oneSided })
     const body = await r.json() as any
     assert.equal(r.status, 201, JSON.stringify(body))

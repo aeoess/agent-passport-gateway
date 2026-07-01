@@ -302,7 +302,11 @@ function createTables() {
       outcome_consistent INTEGER NOT NULL,
       timing_valid INTEGER NOT NULL,
       payload TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- B3 panel F1: a receipt_id is stored at most once per tenant. receipt_id is inside the signed
+      -- body (verifyBilateralReceipt strips only the signature fields), so it cannot be altered without
+      -- breaking a signature; a replay of the same signed receipt hits this and is rejected 409.
+      UNIQUE (tenant_id, receipt_id)
     );
     CREATE INDEX IF NOT EXISTS idx_bilateral_receipts_tenant ON bilateral_receipts(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);

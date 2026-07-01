@@ -879,6 +879,7 @@ gatewayRouter.post('/receipt', (req: any, res) => {
 //     receipt (exactly one present-and-valid signature, the other absent) stores
 //     'partial_attestation'; a receipt with no valid signature is rejected.
 gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
+ try {
   const tenant: Tenant = req.tenant
   const receipt = req.body?.receipt
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
@@ -888,16 +889,36 @@ gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
   if (!requestingAgentId || !servingAgentId) {
     return res.status(400).json({ error: 'Receipt must name requestingAgentId and servingAgentId' })
   }
+  // Panel F1: a stable, signed receipt_id is the dedup key. It is inside the signed body, so a
+  // replay cannot alter it without breaking a signature. Absent it, replays could not be detected.
+  if (!receipt.receiptId || typeof receipt.receiptId !== 'string') {
+    return res.status(400).json({ error: 'Receipt must carry a receiptId (replay-dedup key)' })
+  }
+  // Panel F3: a bilateral receipt is between TWO DISTINCT parties. requester===server is a
+  // self-interaction, not a two-party attestation.
+  if (requestingAgentId === servingAgentId) {
+    return res.status(400).json({ error: 'A bilateral receipt requires two distinct agents; requestingAgentId equals servingAgentId' })
+  }
 
   const db = getDB()
-  // agent_id + tenant binding: BOTH counterparties must be registered in THIS tenant.
-  const reqRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, requestingAgentId) as any
+  // agent_id + tenant binding: BOTH counterparties must be registered in THIS tenant, and (panel F5)
+  // BOTH must be active. A revoked/suspended key must not mint an attestation.
+  const reqRow = db.prepare(`SELECT public_key, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, requestingAgentId) as any
   if (!reqRow || !reqRow.public_key) {
     return res.status(404).json({ error: `Requesting agent "${requestingAgentId}" not registered in this tenant; cannot verify receipt` })
   }
-  const srvRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, servingAgentId) as any
+  const srvRow = db.prepare(`SELECT public_key, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, servingAgentId) as any
   if (!srvRow || !srvRow.public_key) {
     return res.status(404).json({ error: `Serving agent "${servingAgentId}" not registered in this tenant; cannot verify receipt` })
+  }
+  if (reqRow.status !== 'active' || srvRow.status !== 'active') {
+    const bad = reqRow.status !== 'active' ? requestingAgentId : servingAgentId
+    return res.status(403).json({ error: `Agent "${bad}" is not active; a suspended or revoked agent cannot attest a receipt` })
+  }
+  // Panel F4: two distinct ids sharing ONE key is a single party masquerading as two. A genuine
+  // bilateral attestation is signed by two DISTINCT keys.
+  if (String(reqRow.public_key) === String(srvRow.public_key)) {
+    return res.status(400).json({ error: 'Both agents present the same public key; a bilateral attestation requires two distinct keys' })
   }
 
   // Which sides even claim a signature (a present signature must verify; an absent one is one-sided).
@@ -918,6 +939,11 @@ gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
   if (hasSrv && !v.servingAgentSignatureValid) {
     return res.status(400).json({ error: 'Serving agent signature invalid; receipt rejected (forged, tampered, or wrong registered key)' })
   }
+  // Panel F6: an attested outcome must be temporally possible. completedAt/agreedAt before
+  // requestedAt (verifyBilateralReceipt.timingValid=false) is not a valid attestation.
+  if (!v.timingValid) {
+    return res.status(400).json({ error: 'Receipt timing is invalid (completed or agreed before requested); rejected' })
+  }
 
   const reqValid = hasReq && v.requestingAgentSignatureValid
   const srvValid = hasSrv && v.servingAgentSignatureValid
@@ -926,9 +952,23 @@ gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
   else if (reqValid || srvValid) status = 'partial_attestation'
   else return res.status(400).json({ error: 'Receipt carries no valid signature; rejected' })
 
+  // Panel F1: replay dedup. A receipt_id already stored for this tenant is a replay. The pre-check
+  // gives a clean 409; the UNIQUE(tenant_id, receipt_id) constraint is the race backstop below.
+  const dup = db.prepare(`SELECT 1 FROM bilateral_receipts WHERE tenant_id = ? AND receipt_id = ?`).get(tenant.id, String(receipt.receiptId)) as any
+  if (dup) {
+    return res.status(409).json({ error: `Receipt "${receipt.receiptId}" already recorded for this tenant; replay rejected` })
+  }
+
   const rowId = randomUUID()
-  db.prepare(`INSERT INTO bilateral_receipts (id, tenant_id, receipt_id, requesting_agent_id, serving_agent_id, delegation_id, status, requesting_sig_valid, serving_sig_valid, outcome_consistent, timing_valid, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(rowId, tenant.id, String(receipt.receiptId || rowId), requestingAgentId, servingAgentId, receipt.delegationId || null, status, reqValid ? 1 : 0, srvValid ? 1 : 0, v.outcomeConsistent ? 1 : 0, v.timingValid ? 1 : 0, JSON.stringify(receipt))
+  try {
+    db.prepare(`INSERT INTO bilateral_receipts (id, tenant_id, receipt_id, requesting_agent_id, serving_agent_id, delegation_id, status, requesting_sig_valid, serving_sig_valid, outcome_consistent, timing_valid, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(rowId, tenant.id, String(receipt.receiptId), requestingAgentId, servingAgentId, receipt.delegationId || null, status, reqValid ? 1 : 0, srvValid ? 1 : 0, v.outcomeConsistent ? 1 : 0, v.timingValid ? 1 : 0, JSON.stringify(receipt))
+  } catch (e: any) {
+    if (String(e?.message || '').includes('UNIQUE')) {
+      return res.status(409).json({ error: `Receipt "${receipt.receiptId}" already recorded for this tenant; replay rejected` })
+    }
+    throw e
+  }
 
   try { getEventBus().emit(tenant.id, { type: 'bilateral_receipt_stored', agentId: requestingAgentId, data: { rowId, receiptId: receipt.receiptId, servingAgentId, status } }) } catch {}
 
@@ -941,6 +981,9 @@ gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
     timing_valid: v.timingValid,
     stored: true,
   })
+ } catch (e) {
+    res.status(500).json(safeError(e, 'receipts-bilateral'))
+ }
 })
 
 // ═══════════════════════════════════════
