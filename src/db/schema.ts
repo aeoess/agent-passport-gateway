@@ -147,6 +147,12 @@ function createTables() {
     );
 
     -- Delegations
+    -- R3-5 (round-2 Consilium) APPEND-ONLY invariant: rows here are NEVER hard-deleted. Revocation and
+    -- expiry are status updates (status='revoked', revoked_at set); the row persists. The B1 origin rule
+    -- (is_root iff the agent has NEVER been a child_agent_id under ANY status) depends on this: deleting
+    -- a revoked delegation would erase the history that proves an agent was once a delegatee and could
+    -- silently re-root it. No DELETE FROM delegations exists in the codebase (grep-verified); /revoke and
+    -- the cascade paths only UPDATE status. The same holds for agents (revocation is a status update).
     CREATE TABLE IF NOT EXISTS delegations (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id),
@@ -307,12 +313,18 @@ function createTables() {
     );
     -- Consilium policy: root designation is an explicit, audited admin action, never self-service at
     -- POST /agents. Every designation writes a row here (who designated, when, which agent/tenant).
+    -- R3-1 (round-2 Consilium): re_root + reason record the deliberate re-rooting of an agent that has
+    -- a delegation history (ever a child). Designating such an agent is the audited override that lets
+    -- it originate despite the DEAD path; it requires an explicit re_root:true and a reason, both stored
+    -- here for the audit trail.
     CREATE TABLE IF NOT EXISTS root_designations (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL,
       agent_id TEXT NOT NULL,
       designated_by TEXT NOT NULL,
       designated_at TEXT NOT NULL,
+      re_root INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
       revoked_at TEXT
     );
     -- B3 (Consilium): bilateral interaction receipts. A row is stored only after BOTH the requesting
@@ -694,6 +706,9 @@ function createTables() {
   // Round-3: track the real chain depth so a delegation chain cannot grow past max_depth.
   try { db.exec(`ALTER TABLE delegations ADD COLUMN current_depth INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
+  // R3-1: re-root audit fields on an existing root_designations table (additive, idempotent).
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN re_root INTEGER NOT NULL DEFAULT 0`) } catch {}
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN reason TEXT`) } catch {}
 
   // Audit item 3 (HIGH money): designated root grantors. Only is_root=1 agents may grant a
   // delegation with no inbound delegation; without this any no-inbound agent could be named a
@@ -863,6 +878,30 @@ function createTables() {
     `)
   } catch (e: any) {
     console.error('[migration] enum-trigger install failed:', e?.message || e)
+  }
+
+  // R3-2 (round-2 Consilium): pin agents.status to its value domain at the DB layer, the same
+  // BEFORE INSERT/UPDATE trigger pattern used for tenants above. The authz path branches on literal
+  // status values (active / restricted / suspended / revoked / frozen); an out-of-domain value written
+  // by a typo or a validation-skipping path would be mis-read. The legitimate set is every value the
+  // code writes: 'active' (register default, thaw restore), 'restricted' + 'suspended' (posture route),
+  // 'revoked' (revoke cascade, panic zero_authority), 'frozen' (panic read_only). Additive and
+  // idempotent (CREATE TRIGGER IF NOT EXISTS); safe on the existing agents table.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS check_agents_status_insert
+        BEFORE INSERT ON agents
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'restricted', 'suspended', 'revoked', 'frozen')
+        BEGIN SELECT RAISE(ABORT, 'invalid agent status value (allowed: active, restricted, suspended, revoked, frozen)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_agents_status_update
+        BEFORE UPDATE OF status ON agents
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'restricted', 'suspended', 'revoked', 'frozen')
+        BEGIN SELECT RAISE(ABORT, 'invalid agent status value (allowed: active, restricted, suspended, revoked, frozen)'); END;
+    `)
+  } catch (e: any) {
+    console.error('[migration] agents-status-trigger install failed:', e?.message || e)
   }
 
   // ═══════════════════════════════════════

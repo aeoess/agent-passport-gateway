@@ -883,6 +883,15 @@ gatewayRouter.post('/receipt', (req: any, res) => {
 //     'partial_attestation'; a receipt with no valid signature is rejected.
 gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
  try {
+  // R3-0 (round-2 Consilium): OFF by default. The signed BilateralReceipt body carries no audience/
+  // tenant field, so a valid receipt from tenant A replays into tenant B (F2 cross-tenant; per-tenant
+  // dedup cannot see it). Nothing reads bilateral_receipts today (grep-verified), but the route must
+  // stay dark until BOTH land: (a) the SDK BilateralReceipt binds an audience/tenant INSIDE the signed
+  // body and this route verifies it, and (b) an independent, hand-computed RFC 8785 golden vector (NOT
+  // SDK-generated) is added to the conformance suite. Enable only then, via BILATERAL_RECEIPTS_ENABLED=1.
+  if (process.env.BILATERAL_RECEIPTS_ENABLED !== '1') {
+    return res.status(404).json({ error: 'Bilateral receipt endpoint is not enabled' })
+  }
   const tenant: Tenant = req.tenant
   const receipt = req.body?.receipt
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
@@ -1144,16 +1153,30 @@ gatewayRouter.post('/root-designations', (req: any, res) => {
   const targetTenant = req.body.tenant_id || tenant.id
   const { agent_id } = req.body
   if (!agent_id) return res.status(400).json({ error: 'Required: agent_id' })
-  const agent = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
+  const agent = db.prepare(`SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
   if (!agent) return res.status(404).json({ error: `Agent "${agent_id}" not found in tenant "${targetTenant}"` })
+  // R3-1 (a): a root grantor must be a live principal. Refuse designating a non-active target; a
+  // revoked/suspended/frozen agent must not be handed fresh-budget origination authority.
+  if (agent.status !== 'active') {
+    return res.status(400).json({ error: `Cannot designate agent "${agent_id}" as root: status is "${agent.status}", not active.` })
+  }
+  // R3-1 (b): re-rooting an agent that has a delegation history (ever a child) is the deliberate,
+  // audited override of the DEAD path. It requires an explicit re_root:true and a non-empty reason,
+  // both recorded in the audit row. A never-inbound agent is a plain origin root (no re_root needed).
+  const everInbound = db.prepare(`SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`).get(targetTenant, agent_id) as any
+  const reRoot = req.body.re_root === true
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : ''
+  if (everInbound && (!reRoot || reason.length === 0)) {
+    return res.status(400).json({ error: `Agent "${agent_id}" has a delegation history (it was previously a delegatee). Re-rooting it requires re_root:true and a non-empty reason.` })
+  }
   const designatedAt = new Date().toISOString()
   const txn = db.transaction(() => {
     db.prepare(`UPDATE agents SET is_root = 1 WHERE tenant_id = ? AND agent_id = ?`).run(targetTenant, agent_id)
-    db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at) VALUES (?, ?, ?, ?, ?)`)
-      .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt)
+    db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt, everInbound && reRoot ? 1 : 0, everInbound ? reason : (reason || null))
   })
   txn()
-  res.status(200).json({ tenant_id: targetTenant, agent_id, is_root: true, designated_by: tenant.id, designated_at: designatedAt })
+  res.status(200).json({ tenant_id: targetTenant, agent_id, is_root: true, designated_by: tenant.id, designated_at: designatedAt, re_root: !!(everInbound && reRoot), reason: everInbound ? reason : (reason || null) })
 })
 
 // ═══════════════════════════════════════
@@ -1498,22 +1521,28 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // parent may grant ONLY if it is a DESIGNATED root (agents.is_root=1). This also closes item 2's
   // depth-reset coupling: a non-root no-inbound parent can no longer reset current_depth to 0.
   if (!parentDel) {
-    // B2 three-valued liveness. No LIVE inbound. Distinguish DEAD (the parent had an inbound that is
-    // now revoked/expired -- a severed delegatee, never a root) from ABSENT (never delegated to -- may
-    // originate only if a designated root). The prior code collapsed DEAD into ABSENT, so revoking an
-    // inbound routed the parent to the fresh-budget root path (spend/depth reset).
+    // B2 three-valued liveness with the R3-1 gate order. No LIVE inbound.
+    // R3-1 (round-2 Consilium): check is_root FIRST. A DESIGNATED root originates regardless of
+    // delegation history; designation is the deliberate, audited override (POST /root-designations
+    // records who/when and, for an ex-child, re_root:true + a reason). The prior order checked the DEAD
+    // branch first, so an admin-designated ex-child still 403'd DEAD and the audited override was
+    // silently ineffective for exactly the re-rooting topology (R2 defeated R8).
     // parentAgentRow (fetched + existence-checked + status-checked above) carries is_root.
-    const everInbound = db.prepare(
-      `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`,
-    ).get(tenant.id, parent_agent_id) as any
-    if (everInbound) {
-      // DEAD: defense-in-depth beyond B1's origin is_root (a severed child is already is_root=0).
-      return res.status(403).json({ error: 'Delegation rejected: the parent had an inbound delegation that is no longer active (revoked or expired). A severed delegatee cannot originate a fresh-budget delegation as a root.' })
-    }
     if (!parentAgentRow.is_root) {
+      // Not a designated root. Distinguish DEAD (had an inbound, now revoked/expired -- a severed
+      // delegatee) from ABSENT (never delegated to). Only a designated root may originate either way.
+      const everInbound = db.prepare(
+        `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`,
+      ).get(tenant.id, parent_agent_id) as any
+      if (everInbound) {
+        // DEAD: a severed child is is_root=0 and was not re-rooted, so it cannot originate.
+        return res.status(403).json({ error: 'Delegation rejected: the parent had an inbound delegation that is no longer active (revoked or expired) and is not a designated root. A severed delegatee cannot originate a fresh-budget delegation unless it is explicitly re-rooted (admin POST /root-designations with re_root).' })
+      }
       // ABSENT and not a designated root.
       return res.status(403).json({ error: 'Delegation rejected: the parent has no inbound delegation and is not a designated root. Only a designated root (agents.is_root=1) may grant a fresh-budget delegation.' })
     }
+    // is_root=1: a designated (or re-rooted) root originates freely; fall through to narrowing as a
+    // fresh-budget root.
   }
 
   const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)

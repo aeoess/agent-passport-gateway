@@ -46,6 +46,7 @@ function registerAgent(tenant: string, agentId: string, publicKey: string) {
 }
 
 before(async () => {
+  process.env.BILATERAL_RECEIPTS_ENABLED = '1' // R3-0: route is OFF by default; enable it for these tests
   initDB(':memory:')
   initGatewayIdentity()
   for (const t of [TENANT, OTHER]) getDB().prepare(`INSERT OR IGNORE INTO tenants (id, name, email) VALUES (?, ?, ?)`).run(t, t, `${t}@test.local`)

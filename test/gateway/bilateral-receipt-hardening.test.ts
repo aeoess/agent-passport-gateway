@@ -36,6 +36,7 @@ function reg(agentId: string, publicKey: string, status = 'active') {
 const goodOutcome = { toolName: 'commerce:checkout', requestHash: 'rq', responseHash: 'rs', status: 'success', summary: 'ok' }
 
 before(async () => {
+  process.env.BILATERAL_RECEIPTS_ENABLED = '1' // R3-0: route is OFF by default; enable it for these tests
   initDB(':memory:')
   initGatewayIdentity()
   getDB().prepare(`INSERT OR IGNORE INTO tenants (id, name, email) VALUES (?, ?, ?)`).run(TENANT, 'BLRH', 'blrh@test.local')

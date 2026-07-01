@@ -35,8 +35,15 @@ export interface NullifierStore {
  * grow without bound. Durable and shared: any process opening the same DB sees a
  * consumed nullifier, so replay is rejected across restarts and processes.
  */
+/** Default maximum capability-token lifetime the nullifier store will retain a row for (24h). */
+export const DEFAULT_MAX_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1000
+
 export class SqliteNullifierStore implements NullifierStore {
-  constructor(private readonly db: Database.Database) {
+  private readonly maxTtlMs: number
+  constructor(private readonly db: Database.Database, opts: { maxCapabilityTtlMs?: number } = {}) {
+    this.maxTtlMs = Number.isFinite(opts.maxCapabilityTtlMs as number) && (opts.maxCapabilityTtlMs as number) > 0
+      ? (opts.maxCapabilityTtlMs as number)
+      : DEFAULT_MAX_CAPABILITY_TTL_MS
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS capability_nullifiers (
         nullifier  TEXT PRIMARY KEY,
@@ -50,12 +57,29 @@ export class SqliteNullifierStore implements NullifierStore {
     return !!this.db.prepare(`SELECT 1 FROM capability_nullifiers WHERE nullifier = ?`).get(preimage)
   }
 
-  /** Atomic check-and-consume. Throws on replay, mirroring InMemoryNullifierSet.consume. */
+  /**
+   * Atomic check-and-consume. Throws on replay, mirroring InMemoryNullifierSet.consume.
+   *
+   * R3-3: clamp the STORED expires_at to now + MAX_CAPABILITY_TTL. sweepExpired can never evict a
+   * far-future expiry, so an attacker minting tokens with expires_at=9999 would grow this table
+   * unbounded (disk DoS). MAX is the maximum capability-token lifetime; a token cannot be validly
+   * presented after now+MAX, so clamping the nullifier to now+MAX keeps full replay protection for the
+   * entire window the token can be honored while bounding growth. An unparseable expiry is left as-is
+   * (sweepExpired keeps it, fail-safe); a null expiry (no declared TTL) is unchanged.
+   */
   consume(preimage: string, expiresAt: string | null = null): void {
+    let effectiveExpiresAt = expiresAt
+    if (expiresAt != null) {
+      const parsed = Date.parse(expiresAt)
+      if (Number.isFinite(parsed)) {
+        const horizon = Date.now() + this.maxTtlMs
+        if (parsed > horizon) effectiveExpiresAt = new Date(horizon).toISOString()
+      }
+    }
     const info = this.db.prepare(
       `INSERT INTO capability_nullifiers (nullifier, expires_at, created_at) VALUES (?, ?, ?)
        ON CONFLICT(nullifier) DO NOTHING`,
-    ).run(preimage, expiresAt, new Date().toISOString())
+    ).run(preimage, effectiveExpiresAt, new Date().toISOString())
     if (info.changes === 0) {
       throw new Error(`nullifier replay: token preimage ${preimage.slice(0, 12)}... already consumed`)
     }
