@@ -1320,11 +1320,23 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // parent may grant ONLY if it is a DESIGNATED root (agents.is_root=1). This also closes item 2's
   // depth-reset coupling: a non-root no-inbound parent can no longer reset current_depth to 0.
   if (!parentDel) {
+    // B2 three-valued liveness. No LIVE inbound. Distinguish DEAD (the parent had an inbound that is
+    // now revoked/expired -- a severed delegatee, never a root) from ABSENT (never delegated to -- may
+    // originate only if a designated root). The prior code collapsed DEAD into ABSENT, so revoking an
+    // inbound routed the parent to the fresh-budget root path (spend/depth reset).
     const parentAgent = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, parent_agent_id) as any
     if (!parentAgent) {
       return res.status(404).json({ error: `Parent agent "${parent_agent_id}" not found in this tenant` })
     }
+    const everInbound = db.prepare(
+      `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`,
+    ).get(tenant.id, parent_agent_id) as any
+    if (everInbound) {
+      // DEAD: defense-in-depth beyond B1's origin is_root (a severed child is already is_root=0).
+      return res.status(403).json({ error: 'Delegation rejected: the parent had an inbound delegation that is no longer active (revoked or expired). A severed delegatee cannot originate a fresh-budget delegation as a root.' })
+    }
     if (!parentAgent.is_root) {
+      // ABSENT and not a designated root.
       return res.status(403).json({ error: 'Delegation rejected: the parent has no inbound delegation and is not a designated root. Only a designated root (agents.is_root=1) may grant a fresh-budget delegation.' })
     }
   }
