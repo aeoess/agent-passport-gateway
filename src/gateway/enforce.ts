@@ -1560,8 +1560,23 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
   const spendLimitUsd = spend_limit || null
   const spendLimitCents = toCents(spendLimitUsd)
-  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3, childDepth)
+  // R4-1 (round-3 Consilium): audited demotion on subordination. If the CHILD is a designated root,
+  // receiving this inbound delegation subordinates it, so it must lose is_root. Silent clearing was
+  // rejected (any grantor could then destroy an admin's designation); instead demote AND write an
+  // audited auto_demotion row, in the SAME transaction as the delegation insert so the two are atomic
+  // (a failed audit rolls back the grant). Restoration is the existing audited POST /root-designations
+  // (which, because the agent now has an ever-inbound, correctly requires re_root:true + a reason).
+  const txn = db.transaction(() => {
+    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3, childDepth)
+    const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
+    if (childRoot && childRoot.is_root) {
+      db.prepare(`UPDATE agents SET is_root = 0 WHERE tenant_id = ? AND agent_id = ?`).run(tenant.id, child_agent_id)
+      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason, action, caused_by_delegation_id) VALUES (?, ?, ?, ?, ?, 0, ?, 'auto_demotion', ?)`)
+        .run(randomUUID(), tenant.id, child_agent_id, parent_agent_id, new Date().toISOString(), `auto-demotion: subordinated by inbound delegation ${id} from ${parent_agent_id}`, id)
+    }
+  })
+  txn()
   try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
   res.status(201).json({ id, status: 'active' })
 })
@@ -2585,6 +2600,10 @@ gatewayRouter.post('/agents/:agentId/posture', (req: any, res) => {
   if (!status || !reason) {
     return res.status(400).json({ error: 'Required: status, reason' })
   }
+  // R4-3 CROSS-POINT: this posture route sets agents.status to one of active/restricted/suspended.
+  // The full agents.status domain (also revoked from /revoke + panic zero_authority, and frozen from
+  // panic read_only) is pinned by a DB trigger in src/db/schema.ts (check_agents_status_insert/update).
+  // Changing the allowed status set requires updating BOTH this enum AND that trigger together.
   if (!['active', 'restricted', 'suspended'].includes(status)) {
     return res.status(400).json({ error: 'status must be active, restricted, or suspended' })
   }

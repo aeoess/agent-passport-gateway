@@ -34,7 +34,8 @@ describe('B4 panel F1/F2: sweepExpired is timezone-correct (epoch, not lexicogra
   })
 
   it('a normal Z-form expiry sweeps only after it passes (control)', () => {
-    const store = new SqliteNullifierStore(new Database(':memory:'))
+    // Large horizon: fixed 2030 exp means "live" here; R4-2 TTL reject is covered in nullifier-ttl-cap.test.ts.
+    const store = new SqliteNullifierStore(new Database(':memory:'), { maxCapabilityTtlMs: 100 * 365 * 24 * 60 * 60 * 1000 })
     store.consume('live', '2030-01-01T00:00:00.000Z')
     store.consume('dead', '2020-01-01T00:00:00.000Z')
     assert.equal(store.sweepExpired('2026-06-01T00:00:00.000Z'), 1, 'only the past-expiry one is swept')

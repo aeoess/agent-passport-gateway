@@ -60,8 +60,11 @@ describe('B4 nullifier replay guarantees (store contract for the live wire)', ()
 
   it('[HAZARD] an expires_at SHORTER than the token exp re-opens replay after a sweep', () => {
     // Model a token whose VERIFIED exp is 2030, consumed with a WRONG (too-short) exp of 2026.
+    // Large horizon: this test uses a fixed 2030 "verified exp"; the R4-2 TTL reject is covered in
+    // nullifier-ttl-cap.test.ts, not here.
     const db = new Database(':memory:')
-    const store = new SqliteNullifierStore(db)
+    const FAR = { maxCapabilityTtlMs: 100 * 365 * 24 * 60 * 60 * 1000 }
+    const store = new SqliteNullifierStore(db, FAR)
     const tokenVerifiedExp = '2030-01-01T00:00:00.000Z'
     const wrongShortExp = '2026-02-01T00:00:00.000Z'
     store.consume('replayable', wrongShortExp)
@@ -73,7 +76,7 @@ describe('B4 nullifier replay guarantees (store contract for the live wire)', ()
     assert.doesNotThrow(() => store.consume('replayable', tokenVerifiedExp), 'replay re-opened by the premature sweep')
 
     // Control: bound correctly to the verified exp, the same sweep does NOT remove it, so replay stays shut.
-    const store2 = new SqliteNullifierStore(new Database(':memory:'))
+    const store2 = new SqliteNullifierStore(new Database(':memory:'), FAR)
     store2.consume('safe', tokenVerifiedExp)
     assert.equal(store2.sweepExpired('2026-06-01T00:00:00.000Z'), 0, 'correctly-bound exp survives the sweep')
     assert.throws(() => store2.consume('safe', tokenVerifiedExp), /replay|already consumed/i, 'replay stays rejected')

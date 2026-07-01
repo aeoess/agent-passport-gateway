@@ -38,6 +38,14 @@ export interface NullifierStore {
 /** Default maximum capability-token lifetime the nullifier store will retain a row for (24h). */
 export const DEFAULT_MAX_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1000
 
+/** Thrown by consume() when a token's expires_at exceeds now + MAX_CAPABILITY_TTL. */
+export class CapabilityTtlExceededError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CapabilityTtlExceededError'
+  }
+}
+
 export class SqliteNullifierStore implements NullifierStore {
   private readonly maxTtlMs: number
   constructor(private readonly db: Database.Database, opts: { maxCapabilityTtlMs?: number } = {}) {
@@ -60,26 +68,35 @@ export class SqliteNullifierStore implements NullifierStore {
   /**
    * Atomic check-and-consume. Throws on replay, mirroring InMemoryNullifierSet.consume.
    *
-   * R3-3: clamp the STORED expires_at to now + MAX_CAPABILITY_TTL. sweepExpired can never evict a
-   * far-future expiry, so an attacker minting tokens with expires_at=9999 would grow this table
-   * unbounded (disk DoS). MAX is the maximum capability-token lifetime; a token cannot be validly
-   * presented after now+MAX, so clamping the nullifier to now+MAX keeps full replay protection for the
-   * entire window the token can be honored while bounding growth. An unparseable expiry is left as-is
-   * (sweepExpired keeps it, fail-safe); a null expiry (no declared TTL) is unchanged.
+   * R4-2 (round-3 Consilium): REJECT (do not clamp) a token whose expires_at exceeds now +
+   * MAX_CAPABILITY_TTL. A token the store cannot protect for its full claimed lifetime is refused
+   * service (fail-closed, loud). The R3-3 clamp was rejected: silent clamping under-protects quietly
+   * and turns sweepExpired into a replay-enabler if the accept-time MAX is ever missing (the nullifier
+   * is swept at now+MAX while the token is still cryptographically valid). Refusing surfaces the
+   * misconfiguration instead of hiding it, and nothing is stored so a far-future expiry cannot grow the
+   * table. An unparseable expiry is left as-is (sweepExpired keeps it, fail-safe); a null expiry (no
+   * declared TTL) is unchanged.
+   *
+   * MATCHED-PAIR precondition: before ANY code wires consume() into a live redemption path (the MCP),
+   * that path MUST enforce the same MAX at token-accept time (reject exp - now > MAX, and exp - iat >
+   * MAX where iat is trustworthy), sharing ONE config value with this store. The store's reject here is
+   * a backstop, not the primary gate; if accept-time and store-time MAX disagree, tokens either fail
+   * unexpectedly or (worse) the store rejects tokens the accept path let through.
    */
   consume(preimage: string, expiresAt: string | null = null): void {
-    let effectiveExpiresAt = expiresAt
     if (expiresAt != null) {
       const parsed = Date.parse(expiresAt)
-      if (Number.isFinite(parsed)) {
-        const horizon = Date.now() + this.maxTtlMs
-        if (parsed > horizon) effectiveExpiresAt = new Date(horizon).toISOString()
+      if (Number.isFinite(parsed) && parsed > Date.now() + this.maxTtlMs) {
+        throw new CapabilityTtlExceededError(
+          `capability token expires_at is beyond the max horizon (now + ${this.maxTtlMs}ms); refused`,
+        )
       }
+      // unparseable expiry: leave as-is; sweepExpired keeps it (fail-safe), never sweeps it early.
     }
     const info = this.db.prepare(
       `INSERT INTO capability_nullifiers (nullifier, expires_at, created_at) VALUES (?, ?, ?)
        ON CONFLICT(nullifier) DO NOTHING`,
-    ).run(preimage, effectiveExpiresAt, new Date().toISOString())
+    ).run(preimage, expiresAt, new Date().toISOString())
     if (info.changes === 0) {
       throw new Error(`nullifier replay: token preimage ${preimage.slice(0, 12)}... already consumed`)
     }

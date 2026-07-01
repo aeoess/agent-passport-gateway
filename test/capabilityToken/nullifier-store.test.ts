@@ -65,7 +65,9 @@ describe('SqliteNullifierStore persistence (audit item 5)', () => {
   })
 
   it('sweepExpired removes past-TTL nullifiers so they can be re-issued; keeps live ones', () => {
-    const store = new SqliteNullifierStore(new Database(':memory:'))
+    // Large horizon: this test uses fixed far-future exps to mean "live"; the R4-2 TTL reject is
+    // covered by nullifier-ttl-cap.test.ts, not here.
+    const store = new SqliteNullifierStore(new Database(':memory:'), { maxCapabilityTtlMs: 100 * 365 * 24 * 60 * 60 * 1000 })
     store.consume('expired-token', '2020-01-01T00:00:00.000Z')
     store.consume('live-token', '2099-01-01T00:00:00.000Z')
     const swept = store.sweepExpired('2026-06-30T00:00:00.000Z')

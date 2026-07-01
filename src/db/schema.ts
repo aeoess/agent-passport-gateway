@@ -317,6 +317,13 @@ function createTables() {
     -- a delegation history (ever a child). Designating such an agent is the audited override that lets
     -- it originate despite the DEAD path; it requires an explicit re_root:true and a reason, both stored
     -- here for the audit trail.
+    -- R4-1 (round-3 Consilium): this table is the ONE coherent designation history per agent. The action
+    -- column discriminates 'designation' (an admin act via POST /root-designations) from 'auto_demotion'
+    -- (an automatic, audited demotion when a designated root RECEIVES an inbound delegation and thereby
+    -- becomes subordinate). An auto_demotion row carries caused_by_delegation_id (the delegation that
+    -- subordinated the root) and designated_by = the grantor who caused it. Demotion is not silent
+    -- (silent clearing was rejected: any grantor could then destroy an admin's designation); it is
+    -- recorded, and restoration is the existing audited POST /root-designations (re_root:true + reason).
     CREATE TABLE IF NOT EXISTS root_designations (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL,
@@ -325,6 +332,8 @@ function createTables() {
       designated_at TEXT NOT NULL,
       re_root INTEGER NOT NULL DEFAULT 0,
       reason TEXT,
+      action TEXT NOT NULL DEFAULT 'designation',
+      caused_by_delegation_id TEXT,
       revoked_at TEXT
     );
     -- B3 (Consilium): bilateral interaction receipts. A row is stored only after BOTH the requesting
@@ -709,6 +718,9 @@ function createTables() {
   // R3-1: re-root audit fields on an existing root_designations table (additive, idempotent).
   try { db.exec(`ALTER TABLE root_designations ADD COLUMN re_root INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE root_designations ADD COLUMN reason TEXT`) } catch {}
+  // R4-1: audited auto-demotion fields (additive, idempotent).
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN action TEXT NOT NULL DEFAULT 'designation'`) } catch {}
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN caused_by_delegation_id TEXT`) } catch {}
 
   // Audit item 3 (HIGH money): designated root grantors. Only is_root=1 agents may grant a
   // delegation with no inbound delegation; without this any no-inbound agent could be named a
@@ -887,6 +899,12 @@ function createTables() {
   // code writes: 'active' (register default, thaw restore), 'restricted' + 'suspended' (posture route),
   // 'revoked' (revoke cascade, panic zero_authority), 'frozen' (panic read_only). Additive and
   // idempotent (CREATE TRIGGER IF NOT EXISTS); safe on the existing agents table.
+  // R4-3 CROSS-POINT: this enum MUST stay in sync with the app-level status writers. Adding or removing
+  // a status value requires updating BOTH this trigger AND every write site: the posture route enum in
+  // src/gateway/enforce.ts (the ['active','restricted','suspended'] validation), the panic-freeze paths
+  // in src/gateway/revocation/freeze.ts ('revoked' | 'frozen' | 'active'), and the /revoke cascade
+  // ('revoked'). A live volume must also have NO pre-existing out-of-domain rows before this trigger can
+  // be trusted (an existing bad row would abort its next legitimate UPDATE); see the runbook invariant.
   try {
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS check_agents_status_insert
