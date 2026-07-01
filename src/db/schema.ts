@@ -340,6 +340,12 @@ function createTables() {
       UNIQUE (tenant_id, receipt_id)
     );
     CREATE INDEX IF NOT EXISTS idx_bilateral_receipts_tenant ON bilateral_receipts(tenant_id, created_at);
+    -- B3 F1 (re-verification): the table-level UNIQUE above is applied only when the table is CREATED.
+    -- On a DB that already has bilateral_receipts (created before the constraint), CREATE TABLE IF NOT
+    -- EXISTS is a no-op and the constraint is silently absent, reopening the concurrent-replay backstop.
+    -- A CREATE UNIQUE INDEX IF NOT EXISTS DOES apply to an existing table, so the replay backstop holds
+    -- on fresh and upgraded DBs alike (it fails loudly only if pre-existing duplicate rows exist).
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_bilateral_receipts_tenant_receipt ON bilateral_receipts(tenant_id, receipt_id);
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
     CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);
