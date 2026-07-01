@@ -13,6 +13,10 @@
 import { Router } from 'express'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { randomUUID, createHash } from 'node:crypto'
+// Receipt-ingest signature verification (audit item 6). Same SDK canonicalize/verify the
+// proxy-gateway already depends on; the ActionReceipt preimage is canonicalize(receipt minus
+// signature) verified against the signer's registered agents.public_key.
+import { verify as apsVerify, canonicalize as apsCanonicalize } from 'agent-passport-system'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
@@ -815,6 +819,37 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   }
 
   const db = getDB()
+
+  // Audit item 6 (HIGH, money/audit): verify the receipt signature BEFORE storing. Previously any
+  // caller could store a forged or tampered receipt under any agent_id. The SDK ActionReceipt
+  // preimage is canonicalize(receipt MINUS its signature field), verified against the signer's
+  // REGISTERED public key (agents.public_key, looked up by tenant + agent_id). Fail closed: an
+  // unknown agent, an unparseable payload, or a bad/missing signature is rejected, never stored.
+  const agentRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agent_id) as any
+  if (!agentRow || !agentRow.public_key) {
+    return res.status(404).json({ error: `Agent "${agent_id}" not registered in this tenant; cannot verify receipt signature` })
+  }
+  let receiptObj: any
+  try {
+    receiptObj = typeof payload === 'string' ? JSON.parse(payload) : payload
+  } catch {
+    return res.status(400).json({ error: 'Receipt payload is not valid JSON; cannot verify signature' })
+  }
+  if (!receiptObj || typeof receiptObj !== 'object' || Array.isArray(receiptObj)) {
+    return res.status(400).json({ error: 'Receipt payload must be a JSON object; cannot verify signature' })
+  }
+  // The signed preimage excludes the receipt's own signature field (matches SDK signing).
+  const { signature: _embeddedSig, ...unsigned } = receiptObj
+  let sigOk = false
+  try {
+    sigOk = apsVerify(apsCanonicalize(unsigned), String(signature), String(agentRow.public_key))
+  } catch {
+    sigOk = false // fail closed on any canonicalize/verify error
+  }
+  if (!sigOk) {
+    return res.status(400).json({ error: 'Receipt signature verification failed; receipt rejected (tampered, forged, or wrong signing key)' })
+  }
+
   const receiptId = randomUUID()
   db.prepare(`INSERT INTO receipts (id, tenant_id, evaluation_id, agent_id, action_type, verdict, execution_result, signature, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(receiptId, tenant.id, evaluation_id || null, agent_id, action_type || '', verdict || '', execution_result || '', signature, typeof payload === 'string' ? payload : JSON.stringify(payload))
