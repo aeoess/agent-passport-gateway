@@ -269,6 +269,16 @@ function createTables() {
       status TEXT NOT NULL,
       applied_at TEXT
     );
+    -- Consilium policy: root designation is an explicit, audited admin action, never self-service at
+    -- POST /agents. Every designation writes a row here (who designated, when, which agent/tenant).
+    CREATE TABLE IF NOT EXISTS root_designations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      designated_by TEXT NOT NULL,
+      designated_at TEXT NOT NULL,
+      revoked_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
     CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);

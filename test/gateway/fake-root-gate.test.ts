@@ -72,16 +72,12 @@ describe('fake-root gate (audit item 3)', () => {
     assert.equal(r.status, 404)
   })
 
-  it('POST /agents can designate a root; a default agent cannot grant with no inbound', async () => {
+  it('POST /agents IGNORES a client-supplied is_root (Consilium policy: no self-service root)', async () => {
     const rr = await post('/agents', { agent_id: 'reg-root', public_key: 'pk-root', is_root: true })
     assert.equal(rr.status, 201, await rr.text())
-    const rn = await post('/agents', { agent_id: 'reg-plain', public_key: 'pk-plain' })
-    assert.equal(rn.status, 201)
-    seedAgent('child-d', 0); seedAgent('child-e', 0)
-    // designated root grants
-    assert.equal((await post('/delegations', { parent_agent_id: 'reg-root', child_agent_id: 'child-d', scope: 'x', spend_limit: 5 })).status, 201)
-    // default (non-root) no-inbound parent rejected
-    assert.equal((await post('/delegations', { parent_agent_id: 'reg-plain', child_agent_id: 'child-e', scope: 'x', spend_limit: 5 })).status, 403)
+    seedAgent('child-d', 0)
+    // is_root was ignored -> reg-root is is_root=0 -> cannot originate with no inbound.
+    assert.equal((await post('/delegations', { parent_agent_id: 'reg-root', child_agent_id: 'child-d', scope: 'x', spend_limit: 5 })).status, 403)
   })
 
   it('[BACKFILL unit] promotes exactly the active grantors with no inbound delegation', () => {

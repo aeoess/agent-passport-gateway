@@ -949,13 +949,20 @@ gatewayRouter.get('/agents', (req: any, res) => {
 gatewayRouter.post('/agents', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root } = req.body
+  const { agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata } = req.body
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
-  // Audit item 3: the authenticated tenant may designate this agent as a root grantor (is_root=1),
-  // the only kind of agent allowed to grant a delegation with no inbound delegation. Default 0.
-  const isRoot = (is_root === true || is_root === 1 || is_root === '1') ? 1 : 0
+  // Consilium policy: is_root is NEVER self-service. A client-supplied `is_root` is ignored here;
+  // root designation is the audited admin action POST /api/v1/root-designations. New agents are
+  // is_root=0; existing roots are preserved by the B1 history backfill.
+  // B8 immutability: an agent_id is immutable. A duplicate registration is a 409 (no upsert), so the
+  // public_key cannot be swapped by re-registering (which would rebind authority). Key rotation is a
+  // separate, recorded operation (not this path).
+  const existing = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agent_id) as any
+  if (existing) {
+    return res.status(409).json({ error: `Agent "${agent_id}" already exists in this tenant; agent_id and public_key are immutable (rotate keys via the recorded rotation path).` })
+  }
   // Security triage 2026-04-11 fix 4: validate entity_verification_endpoint
   // against the SSRF guard at registration time. Rejecting here is the
   // primary defense; the policy evaluation path has defense-in-depth.
@@ -975,8 +982,8 @@ gatewayRouter.post('/agents', (req: any, res) => {
     return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
-  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null, isRoot)
+  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`)
+    .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null)
   // Wallet → agent reverse index: pick up bound_wallets at enrollment time
   // so /public/trust/by-wallet/:address resolves immediately without a
   // boot rebuild. Promised to douglasborthwick-crypto on insumer-examples#1.
@@ -991,6 +998,32 @@ gatewayRouter.post('/agents', (req: any, res) => {
   } catch { /* index hygiene must not block enrollment */ }
   try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType, entity_id } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
+})
+
+// POST /api/v1/root-designations — Consilium policy: designate an agent as a root grantor.
+// Admin-only and AUDITED. This is the ONLY way to set is_root=1 (POST /agents ignores a client
+// is_root). Every designation writes a root_designations row (who, when, agent, tenant), atomically
+// with the is_root flip. Existing roots are preserved by the B1 history backfill; this handles NEW
+// roots after migration.
+gatewayRouter.post('/root-designations', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  if ((tenant as any).role !== 'admin') {
+    return res.status(403).json({ error: 'Root designation requires an admin key. is_root is not self-service.' })
+  }
+  const db = getDB()
+  const targetTenant = req.body.tenant_id || tenant.id
+  const { agent_id } = req.body
+  if (!agent_id) return res.status(400).json({ error: 'Required: agent_id' })
+  const agent = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
+  if (!agent) return res.status(404).json({ error: `Agent "${agent_id}" not found in tenant "${targetTenant}"` })
+  const designatedAt = new Date().toISOString()
+  const txn = db.transaction(() => {
+    db.prepare(`UPDATE agents SET is_root = 1 WHERE tenant_id = ? AND agent_id = ?`).run(targetTenant, agent_id)
+    db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt)
+  })
+  txn()
+  res.status(200).json({ tenant_id: targetTenant, agent_id, is_root: true, designated_by: tenant.id, designated_at: designatedAt })
 })
 
 // ═══════════════════════════════════════
