@@ -1,0 +1,92 @@
+// Copyright 2024-2026 Tymofii Pidlisnyi. Apache-2.0 license. See LICENSE.
+// ══════════════════════════════════════════════════════════════════
+// Persistent capability-token nullifier store (audit item 5, HIGH replay)
+// ══════════════════════════════════════════════════════════════════
+// The MCP capability-token sink consults a NullifierStore on every M3 redemption
+// to reject a replayed token preimage. The reference store (InMemoryNullifierSet
+// in agent-passport-mcp) is process-local, so on the remote deployment -- where
+// each /mcp request may spawn a fresh subprocess and the server can restart --
+// the nullifier set is always empty and replay always passes.
+//
+// This is the durable store the audit specified: backed by the gateway's
+// better-sqlite3 DB, so a consumed nullifier survives restarts and is shared
+// across processes that open the same DB. It implements the SAME NullifierStore
+// interface shape the MCP defines (isConsumed / consume / size / clear), so a
+// co-located deployment injects it behind the existing interface without changing
+// the MCP redemption logic. The in-memory impl below stays for the stateless
+// reference path and for tests.
+//
+// GATEWAY-ONLY: this adds a gateway store. Wiring the MCP subprocess to inject it
+// (when co-located with the gateway) is a deploy-time step documented in the memo.
+import type Database from 'better-sqlite3'
+
+/** Same shape as agent-passport-mcp's NullifierStore. `consume` throws on replay. */
+export interface NullifierStore {
+  isConsumed(preimage: string): boolean
+  consume(preimage: string, expiresAt?: string | null): void
+  size(): number
+  clear(): void
+}
+
+/**
+ * SQLite-backed nullifier store. Check-and-consume is a single atomic statement
+ * (INSERT ... ON CONFLICT DO NOTHING; changes()===0 means the preimage was already
+ * present -> replay). Optional expires_at enables a TTL sweep so the table does not
+ * grow without bound. Durable and shared: any process opening the same DB sees a
+ * consumed nullifier, so replay is rejected across restarts and processes.
+ */
+export class SqliteNullifierStore implements NullifierStore {
+  constructor(private readonly db: Database.Database) {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS capability_nullifiers (
+        nullifier  TEXT PRIMARY KEY,
+        expires_at TEXT,
+        created_at TEXT NOT NULL
+      )
+    `)
+  }
+
+  isConsumed(preimage: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM capability_nullifiers WHERE nullifier = ?`).get(preimage)
+  }
+
+  /** Atomic check-and-consume. Throws on replay, mirroring InMemoryNullifierSet.consume. */
+  consume(preimage: string, expiresAt: string | null = null): void {
+    const info = this.db.prepare(
+      `INSERT INTO capability_nullifiers (nullifier, expires_at, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(nullifier) DO NOTHING`,
+    ).run(preimage, expiresAt, new Date().toISOString())
+    if (info.changes === 0) {
+      throw new Error(`nullifier replay: token preimage ${preimage.slice(0, 12)}... already consumed`)
+    }
+  }
+
+  size(): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS c FROM capability_nullifiers`).get() as { c: number }).c
+  }
+
+  clear(): void {
+    this.db.exec(`DELETE FROM capability_nullifiers`)
+  }
+
+  /** Remove nullifiers whose expires_at has passed. Returns the number swept. */
+  sweepExpired(nowIso: string = new Date().toISOString()): number {
+    return this.db.prepare(
+      `DELETE FROM capability_nullifiers WHERE expires_at IS NOT NULL AND expires_at < ?`,
+    ).run(nowIso).changes
+  }
+}
+
+/** Process-local store for tests and the stateless stdio reference path. */
+export class InMemoryNullifierStore implements NullifierStore {
+  private readonly seen = new Set<string>()
+  isConsumed(preimage: string): boolean { return this.seen.has(preimage) }
+  consume(preimage: string): void {
+    if (this.seen.has(preimage)) {
+      throw new Error(`nullifier replay: token preimage ${preimage.slice(0, 12)}... already consumed`)
+    }
+    this.seen.add(preimage)
+  }
+  size(): number { return this.seen.size }
+  clear(): void { this.seen.clear() }
+}

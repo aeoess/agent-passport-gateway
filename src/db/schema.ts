@@ -586,6 +586,18 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`); isRootColumnAdded = true } catch {}
   if (isRootColumnAdded) backfillAgentRoots(db)
 
+  // Audit item 5 (HIGH replay): durable capability-token nullifier set. A consumed token preimage
+  // must survive restarts and be shared across processes; the reference MCP store is per-process.
+  // Backed here so a co-located MCP injects the DB-backed SqliteNullifierStore (src/capabilityToken/
+  // nullifier-store.ts) behind the existing NullifierStore interface.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS capability_nullifiers (
+      nullifier  TEXT PRIMARY KEY,
+      expires_at TEXT,
+      created_at TEXT NOT NULL
+    )`)
+  } catch {}
+
   // Security triage 2026-04-11 fix 1: tenant role column.
   // Decouples admin authorization from the `plan` billing concept.
   // role = 'admin'  → platform operator (can access /api/v1/admin/* routes)
