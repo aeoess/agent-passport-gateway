@@ -44,8 +44,12 @@ describe('B4 panel F1/F2: sweepExpired is timezone-correct (epoch, not lexicogra
   })
 
   it('an unparseable stored expiry is never swept (fail-safe: keep, do not reopen replay)', () => {
-    const store = new SqliteNullifierStore(new Database(':memory:'))
-    store.consume('weird', 'not-a-timestamp')
+    // consume() now REJECTS an unparseable expiry (R4-2b), so a bad row cannot enter through it. This
+    // asserts sweepExpired's keep-unparseable rule as belt-and-suspenders: even a directly-inserted bad
+    // row (e.g. legacy data) is kept, never swept early. Insert raw, bypassing consume.
+    const db = new Database(':memory:')
+    const store = new SqliteNullifierStore(db)
+    db.prepare(`INSERT INTO capability_nullifiers (nullifier, expires_at, created_at) VALUES ('weird', 'not-a-timestamp', ?)`).run(new Date().toISOString())
     assert.equal(store.sweepExpired('2030-01-01T00:00:00.000Z'), 0, 'a value SQLite cannot parse is kept, never swept')
     assert.equal(store.isConsumed('weird'), true)
   })

@@ -74,8 +74,16 @@ export class SqliteNullifierStore implements NullifierStore {
    * and turns sweepExpired into a replay-enabler if the accept-time MAX is ever missing (the nullifier
    * is swept at now+MAX while the token is still cryptographically valid). Refusing surfaces the
    * misconfiguration instead of hiding it, and nothing is stored so a far-future expiry cannot grow the
-   * table. An unparseable expiry is left as-is (sweepExpired keeps it, fail-safe); a null expiry (no
-   * declared TTL) is unchanged.
+   * table.
+   *
+   * R4-2b: a non-null expiresAt that does NOT parse to a finite timestamp is ALSO refused. sweepExpired
+   * can never evict an unparseable expiry, so allowing one through consume() would bypass the TTL cap
+   * and grow the table unbounded, the exact vector the cap closes: the store refuses what it cannot
+   * bound. sweepExpired's keep-unparseable rule is now belt-and-suspenders (an unparseable row can no
+   * longer enter through consume; only legacy/raw rows could).
+   *
+   * A NULL / undefined expiresAt is allowed (the caller's explicit "no declared TTL"). NOTE: a NULL row
+   * is NEVER swept, so a live redemption path MUST always pass the VERIFIED token exp, never null.
    *
    * MATCHED-PAIR precondition: before ANY code wires consume() into a live redemption path (the MCP),
    * that path MUST enforce the same MAX at token-accept time (reject exp - now > MAX, and exp - iat >
@@ -86,12 +94,17 @@ export class SqliteNullifierStore implements NullifierStore {
   consume(preimage: string, expiresAt: string | null = null): void {
     if (expiresAt != null) {
       const parsed = Date.parse(expiresAt)
-      if (Number.isFinite(parsed) && parsed > Date.now() + this.maxTtlMs) {
+      if (!Number.isFinite(parsed)) {
+        // R4-2b: the store cannot bound (or ever sweep) a timestamp it cannot parse; refuse it.
+        throw new CapabilityTtlExceededError(
+          `capability token expires_at is not a parseable timestamp; refused (the store refuses what it cannot bound)`,
+        )
+      }
+      if (parsed > Date.now() + this.maxTtlMs) {
         throw new CapabilityTtlExceededError(
           `capability token expires_at is beyond the max horizon (now + ${this.maxTtlMs}ms); refused`,
         )
       }
-      // unparseable expiry: leave as-is; sweepExpired keeps it (fail-safe), never sweeps it early.
     }
     const info = this.db.prepare(
       `INSERT INTO capability_nullifiers (nullifier, expires_at, created_at) VALUES (?, ?, ?)

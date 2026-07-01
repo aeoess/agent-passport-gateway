@@ -49,11 +49,12 @@ describe('R4-2 nullifier TTL: reject, do not clamp', () => {
     assert.doesNotThrow(() => store.consume('within', iso(500))) // 0.5s < 1s horizon
   })
 
-  it('an unparseable expiry is left as-is (kept, never swept), not rejected', () => {
+  it('[R4-2b] a non-null UNPARSEABLE expiry throws and stores nothing (cannot bound -> refuse)', () => {
     const store = new SqliteNullifierStore(new Database(':memory:'))
-    assert.doesNotThrow(() => store.consume('weird', 'not-a-timestamp'))
-    assert.equal(store.sweepExpired(iso(48 * H)), 0, 'kept, never swept')
-    assert.equal(store.isConsumed('weird'), true)
+    for (const bad of ['not-a-date', '', '99:99']) {
+      assert.throws(() => store.consume(`garbage-${bad}`, bad), CapabilityTtlExceededError, `"${bad}" must be refused`)
+    }
+    assert.equal(store.size(), 0, 'nothing stored for an unparseable expiry')
   })
 
   it('a null expiry (no declared TTL) is unchanged', () => {
