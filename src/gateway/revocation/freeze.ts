@@ -143,6 +143,9 @@ export function panicFreeze(opts: {
   const bump = bumpEpoch(tenantId, 'agent', agentId, { reason: `panic_freeze: ${reason}`, bumpedBy: frozenBy })
 
   // Flip agent status. zero_authority -> revoked; read_only -> frozen.
+  // R4-3 CROSS-POINT: 'revoked' and 'frozen' are part of the agents.status domain pinned by the
+  // check_agents_status_insert/update trigger in src/db/schema.ts. Changing these values requires
+  // updating that trigger too (and the posture route enum in enforce.ts).
   const newStatus = mode === 'zero_authority' ? 'revoked' : 'frozen'
   db.prepare(`UPDATE agents SET status = ? WHERE tenant_id = ? AND agent_id = ?`)
     .run(newStatus, tenantId, agentId)

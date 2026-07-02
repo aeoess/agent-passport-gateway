@@ -16,7 +16,7 @@ import type { Tenant } from '../auth/api-keys.js'
 
 export interface GatewayEvent {
   id: string
-  type: 'evaluation' | 'denial' | 'receipt_stored' | 'revocation' | 'alert'
+  type: 'evaluation' | 'denial' | 'receipt_stored' | 'bilateral_receipt_stored' | 'root_auto_demotion' | 'revocation' | 'alert'
     | 'epoch_bump' | 'panic_freeze' | 'multisig_thaw'
     | 'agent_registered' | 'delegation_created' | 'spend_update' | 'tenant_created'
     | 'data_source_registered' | 'access_receipt' | 'posture_update'

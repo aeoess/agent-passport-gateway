@@ -120,9 +120,11 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
     if (delegation && evalCount >= 10 && receiptCount >= 5) grade = 3
   }
 
-  // Risk — simple denial rate only (no internal metrics)
+  // Risk — simple denial rate only (no internal metrics). Verdicts are stored lowercase
+  // ('permit' / 'deny') by the evaluate path, so this MUST match 'deny'. It previously queried
+  // 'DENY', so deniedCount was always 0 and every agent graded low-risk regardless of denials.
   const deniedCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'DENY'`
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny'`
   ).get(tenantId, agentId) as any).c
   const evalTotal = (db.prepare(
     `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ?`

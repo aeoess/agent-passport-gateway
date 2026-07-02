@@ -11,8 +11,13 @@
  */
 
 import { Router } from 'express'
+import type Database from 'better-sqlite3'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { randomUUID, createHash } from 'node:crypto'
+// Receipt-ingest signature verification (audit item 6). Same SDK canonicalize/verify the
+// proxy-gateway already depends on; the ActionReceipt preimage is canonicalize(receipt minus
+// signature) verified against the signer's registered agents.public_key.
+import { verify as apsVerify, canonicalize as apsCanonicalize, verifyBilateralReceipt } from 'agent-passport-system'
 import { getDB, PLAN_LIMITS } from '../db/schema.js'
 import { getGatewayIdentity } from './identity.js'
 import type { Tenant } from '../auth/api-keys.js'
@@ -250,6 +255,64 @@ function mapFailureType(violations: string[]): string {
   if (joined.includes('delegation')) return 'delegation_revoked'
   if (joined.includes('key')) return 'policy_violation'
   return 'unknown'
+}
+
+/**
+ * True iff x is a finite number >= 0. Used to reject a malformed or negative estimated_cost before
+ * any budget math: a negative cost slips past the `cost > remaining` overspend check (a negative is
+ * never greater than the remaining budget) and, on permit, would be ADDED to spend_used, refunding
+ * the budget. Both let an agent spend without limit.
+ */
+export function isNonNegativeFiniteCost(x: unknown): boolean {
+  return typeof x === 'number' && Number.isFinite(x) && x >= 0
+}
+
+/** True iff the granted scope token covers the required one: exact, global '*', hierarchical
+ *  prefix ('a' or 'a:b' covers 'a:b...'), or wildcard suffix ('a:*' covers 'a:b'). */
+export function scopeCovers(granted: string, required: string): boolean {
+  if (granted === '*' || granted === required) return true
+  if (required.startsWith(granted + ':')) return true
+  if (granted.endsWith(':*') && required.startsWith(granted.slice(0, -1))) return true
+  return false
+}
+
+export interface NarrowingParent { scope: string; spend_limit: number | null; spend_used?: number | null; max_depth: number; current_depth?: number | null }
+export interface NarrowingChild { scope: string[]; spend_limit: number | null; max_depth: number }
+
+/**
+ * Enforce monotonic narrowing on delegation CREATION. A child delegation minted from a parent
+ * delegation may only narrow it: scope must be a subset, spend_limit may not exceed the parent's
+ * remaining budget, and the depth ceiling may not increase. parent === null means the grantor is a
+ * tenant root principal that received no delegation, so it may grant freely (the tenant owns it).
+ * Previously creation enforced none of this, so a delegatee could mint a child with broader scope,
+ * higher spend, or a deeper ceiling than it was granted (privilege escalation).
+ */
+export function checkDelegationNarrowing(parent: NarrowingParent | null, child: NarrowingChild): { ok: boolean; violations: string[] } {
+  const violations: string[] = []
+  if (!parent) return { ok: true, violations }
+  const parentScopes = parent.scope.split(',').map((s) => s.trim()).filter(Boolean)
+  for (const cs of child.scope) {
+    if (!parentScopes.some((ps) => scopeCovers(ps, cs))) {
+      violations.push(`scope "${cs}" is not within the parent delegation scope`)
+    }
+  }
+  if (child.spend_limit != null && parent.spend_limit != null) {
+    const remaining = parent.spend_limit - (parent.spend_used || 0)
+    if (child.spend_limit > remaining) {
+      violations.push(`spend_limit ${child.spend_limit} exceeds parent remaining budget ${remaining}`)
+    }
+  }
+  if (typeof child.max_depth === 'number' && typeof parent.max_depth === 'number' && child.max_depth > parent.max_depth) {
+    violations.push(`max_depth ${child.max_depth} exceeds parent max_depth ${parent.max_depth}`)
+  }
+  // Running chain depth: a child sits one hop below the parent. The chain may not grow past the
+  // child's max_depth ceiling (already <= the parent's). This is the actual depth BOUND, not just
+  // the non-increasing ceiling above, so a long chain at a flat ceiling cannot grow unbounded.
+  const childDepth = (parent.current_depth ?? 0) + 1
+  if (typeof child.max_depth === 'number' && childDepth > child.max_depth) {
+    violations.push(`chain depth ${childDepth} exceeds max_depth ${child.max_depth}`)
+  }
+  return { ok: violations.length === 0, violations }
 }
 
 export const gatewayRouter = Router()
@@ -512,7 +575,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     const delegation = db.prepare(`
       SELECT * FROM delegations
       WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-      ORDER BY created_at DESC LIMIT 1
+      ORDER BY created_at DESC, id DESC LIMIT 1
     `).get(tenant.id, agent_id) as any
 
     let verdict = 'permit'
@@ -539,7 +602,18 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
         verdict = 'deny'
         violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
       }
-      if (estimated_cost && delegation.spend_limit) {
+      // Reject a malformed or negative estimated_cost before any budget math. A negative cost would
+      // slip past `estimated_cost > remaining` (a negative is never greater than the remaining
+      // budget) AND, on permit, the spend_used update below would ADD a negative, refunding the
+      // budget. Either lets an agent spend without limit. Require a non-negative finite number.
+      if (estimated_cost !== undefined && estimated_cost !== null && !isNonNegativeFiniteCost(estimated_cost)) {
+        verdict = 'deny'
+        violations.push(`Invalid estimated_cost ${estimated_cost}: must be a non-negative finite number`)
+      }
+      // Panel B6 F1: gate on `!= null`, not truthiness. A spend_limit of 0 (a zero-budget grant) is
+      // falsy, so the old check skipped it, permitted the spend, and then the spend_used UPDATE tripped
+      // the DB CHECK -> 500. `!= null` means a 0 limit denies any positive cost (remaining 0), cleanly.
+      if (estimated_cost && estimated_cost > 0 && delegation.spend_limit != null) {
         const remaining = delegation.spend_limit - (delegation.spend_used || 0)
         if (estimated_cost > remaining) {
           verdict = 'deny'
@@ -570,7 +644,10 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
     db.prepare(`INSERT INTO policy_evaluations (id, tenant_id, agent_id, action_type, action_target, scope_required, verdict, reason, duration_ms, task_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(evalId, tenant.id, agent_id, action_type, action_target || '', scope_required, verdict, reason, durationMs, deriveTaskClass(action_type))
 
-    if (verdict === 'permit' && estimated_cost && delegation) {
+    if (verdict === 'permit' && estimated_cost && estimated_cost > 0 && delegation) {
+      // Defense in depth: only ever ADD a positive amount to spend_used. A non-positive cost is
+      // already denied above, so this never runs for one, but the guard makes a budget refund
+      // structurally impossible from this path.
       // C4 dual-write: REAL column (existing) + INTEGER cents (forward-compat).
       // COALESCE guards against rows that pre-date the cents column.
       const inc_cents = toCents(estimated_cost) || 0
@@ -746,6 +823,37 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   }
 
   const db = getDB()
+
+  // Audit item 6 (HIGH, money/audit): verify the receipt signature BEFORE storing. Previously any
+  // caller could store a forged or tampered receipt under any agent_id. The SDK ActionReceipt
+  // preimage is canonicalize(receipt MINUS its signature field), verified against the signer's
+  // REGISTERED public key (agents.public_key, looked up by tenant + agent_id). Fail closed: an
+  // unknown agent, an unparseable payload, or a bad/missing signature is rejected, never stored.
+  const agentRow = db.prepare(`SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agent_id) as any
+  if (!agentRow || !agentRow.public_key) {
+    return res.status(404).json({ error: `Agent "${agent_id}" not registered in this tenant; cannot verify receipt signature` })
+  }
+  let receiptObj: any
+  try {
+    receiptObj = typeof payload === 'string' ? JSON.parse(payload) : payload
+  } catch {
+    return res.status(400).json({ error: 'Receipt payload is not valid JSON; cannot verify signature' })
+  }
+  if (!receiptObj || typeof receiptObj !== 'object' || Array.isArray(receiptObj)) {
+    return res.status(400).json({ error: 'Receipt payload must be a JSON object; cannot verify signature' })
+  }
+  // The signed preimage excludes the receipt's own signature field (matches SDK signing).
+  const { signature: _embeddedSig, ...unsigned } = receiptObj
+  let sigOk = false
+  try {
+    sigOk = apsVerify(apsCanonicalize(unsigned), String(signature), String(agentRow.public_key))
+  } catch {
+    sigOk = false // fail closed on any canonicalize/verify error
+  }
+  if (!sigOk) {
+    return res.status(400).json({ error: 'Receipt signature verification failed; receipt rejected (tampered, forged, or wrong signing key)' })
+  }
+
   const receiptId = randomUUID()
   db.prepare(`INSERT INTO receipts (id, tenant_id, evaluation_id, agent_id, action_type, verdict, execution_result, signature, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(receiptId, tenant.id, evaluation_id || null, agent_id, action_type || '', verdict || '', execution_result || '', signature, typeof payload === 'string' ? payload : JSON.stringify(payload))
@@ -753,6 +861,142 @@ gatewayRouter.post('/receipt', (req: any, res) => {
   try { getEventBus().emit(tenant.id, { type: 'receipt_stored', agentId: agent_id, data: { receiptId, evaluationId: evaluation_id, action_type, verdict } }) } catch {}
 
   res.status(201).json({ receipt_id: receiptId, stored: true })
+})
+
+// ═══════════════════════════════════════
+// POST /api/v1/receipts/bilateral - Bilateral interaction receipt (B3, Consilium)
+// ═══════════════════════════════════════
+//
+// An APS interaction receipt is BILATERAL: a requesting agent and a serving agent
+// BOTH sign the same canonical body. The unilateral POST /receipt above checks a
+// SINGLE signature against a SINGLE key and cannot attest a two-party interaction.
+// This route verifies BOTH signatures against BOTH agents' REGISTERED keys (looked
+// up by tenant + agent_id) using the SDK's verifyBilateralReceipt primitive, so the
+// gateway consumes the protocol primitive and never reimplements it.
+//
+// Fail-closed rules:
+//   * both agents MUST be registered in THIS tenant (agent_id + tenant bound); an
+//     unknown or cross-tenant counterparty is a 404, never stored.
+//   * a PRESENT signature that does not verify against the registered key is a
+//     forgery/tamper -> 400, never stored.
+//   * status is 'attested' only when BOTH sides verify; a legitimately one-sided
+//     receipt (exactly one present-and-valid signature, the other absent) stores
+//     'partial_attestation'; a receipt with no valid signature is rejected.
+gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
+ try {
+  // R3-0 (round-2 Consilium): OFF by default. The signed BilateralReceipt body carries no audience/
+  // tenant field, so a valid receipt from tenant A replays into tenant B (F2 cross-tenant; per-tenant
+  // dedup cannot see it). Nothing reads bilateral_receipts today (grep-verified), but the route must
+  // stay dark until BOTH land: (a) the SDK BilateralReceipt binds an audience/tenant INSIDE the signed
+  // body and this route verifies it, and (b) an independent, hand-computed RFC 8785 golden vector (NOT
+  // SDK-generated) is added to the conformance suite. Enable only then, via BILATERAL_RECEIPTS_ENABLED=1.
+  if (process.env.BILATERAL_RECEIPTS_ENABLED !== '1') {
+    return res.status(404).json({ error: 'Bilateral receipt endpoint is not enabled' })
+  }
+  const tenant: Tenant = req.tenant
+  const receipt = req.body?.receipt
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+    return res.status(400).json({ error: 'Required: receipt (a bilateral receipt object)' })
+  }
+  const { requestingAgentId, servingAgentId, requestingAgentSignature, servingAgentSignature } = receipt
+  if (!requestingAgentId || !servingAgentId) {
+    return res.status(400).json({ error: 'Receipt must name requestingAgentId and servingAgentId' })
+  }
+  // Panel F1: a stable, signed receipt_id is the dedup key. It is inside the signed body, so a
+  // replay cannot alter it without breaking a signature. Absent it, replays could not be detected.
+  if (!receipt.receiptId || typeof receipt.receiptId !== 'string') {
+    return res.status(400).json({ error: 'Receipt must carry a receiptId (replay-dedup key)' })
+  }
+  // Panel F3: a bilateral receipt is between TWO DISTINCT parties. requester===server is a
+  // self-interaction, not a two-party attestation.
+  if (requestingAgentId === servingAgentId) {
+    return res.status(400).json({ error: 'A bilateral receipt requires two distinct agents; requestingAgentId equals servingAgentId' })
+  }
+
+  const db = getDB()
+  // agent_id + tenant binding: BOTH counterparties must be registered in THIS tenant, and (panel F5)
+  // BOTH must be active. A revoked/suspended key must not mint an attestation.
+  const reqRow = db.prepare(`SELECT public_key, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, requestingAgentId) as any
+  if (!reqRow || !reqRow.public_key) {
+    return res.status(404).json({ error: `Requesting agent "${requestingAgentId}" not registered in this tenant; cannot verify receipt` })
+  }
+  const srvRow = db.prepare(`SELECT public_key, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, servingAgentId) as any
+  if (!srvRow || !srvRow.public_key) {
+    return res.status(404).json({ error: `Serving agent "${servingAgentId}" not registered in this tenant; cannot verify receipt` })
+  }
+  if (reqRow.status !== 'active' || srvRow.status !== 'active') {
+    const bad = reqRow.status !== 'active' ? requestingAgentId : servingAgentId
+    return res.status(403).json({ error: `Agent "${bad}" is not active; a suspended or revoked agent cannot attest a receipt` })
+  }
+  // Panel F4: two distinct ids sharing ONE key is a single party masquerading as two. A genuine
+  // bilateral attestation is signed by two DISTINCT keys.
+  if (String(reqRow.public_key) === String(srvRow.public_key)) {
+    return res.status(400).json({ error: 'Both agents present the same public key; a bilateral attestation requires two distinct keys' })
+  }
+
+  // Which sides even claim a signature (a present signature must verify; an absent one is one-sided).
+  const hasReq = typeof requestingAgentSignature === 'string' && requestingAgentSignature.length > 0
+  const hasSrv = typeof servingAgentSignature === 'string' && servingAgentSignature.length > 0
+
+  let v
+  try {
+    v = verifyBilateralReceipt(receipt, String(reqRow.public_key), String(srvRow.public_key))
+  } catch {
+    return res.status(400).json({ error: 'Bilateral receipt verification failed (unparseable or malformed receipt); rejected' })
+  }
+
+  // A PRESENT signature that does not verify is a forgery/tamper. Fail closed, never store.
+  if (hasReq && !v.requestingAgentSignatureValid) {
+    return res.status(400).json({ error: 'Requesting agent signature invalid; receipt rejected (forged, tampered, or wrong registered key)' })
+  }
+  if (hasSrv && !v.servingAgentSignatureValid) {
+    return res.status(400).json({ error: 'Serving agent signature invalid; receipt rejected (forged, tampered, or wrong registered key)' })
+  }
+  // Panel F6: an attested outcome must be temporally possible. completedAt/agreedAt before
+  // requestedAt (verifyBilateralReceipt.timingValid=false) is not a valid attestation.
+  if (!v.timingValid) {
+    return res.status(400).json({ error: 'Receipt timing is invalid (completed or agreed before requested); rejected' })
+  }
+
+  const reqValid = hasReq && v.requestingAgentSignatureValid
+  const srvValid = hasSrv && v.servingAgentSignatureValid
+  let status: 'attested' | 'partial_attestation'
+  if (reqValid && srvValid) status = 'attested'
+  else if (reqValid || srvValid) status = 'partial_attestation'
+  else return res.status(400).json({ error: 'Receipt carries no valid signature; rejected' })
+
+  // Panel F1: replay dedup. A receipt_id already stored for this tenant is a replay. The pre-check
+  // gives a clean 409; the UNIQUE(tenant_id, receipt_id) constraint is the race backstop below.
+  const dup = db.prepare(`SELECT 1 FROM bilateral_receipts WHERE tenant_id = ? AND receipt_id = ?`).get(tenant.id, String(receipt.receiptId)) as any
+  if (dup) {
+    return res.status(409).json({ error: `Receipt "${receipt.receiptId}" already recorded for this tenant; replay rejected` })
+  }
+
+  const rowId = randomUUID()
+  try {
+    db.prepare(`INSERT INTO bilateral_receipts (id, tenant_id, receipt_id, requesting_agent_id, serving_agent_id, delegation_id, status, requesting_sig_valid, serving_sig_valid, outcome_consistent, timing_valid, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(rowId, tenant.id, String(receipt.receiptId), requestingAgentId, servingAgentId, receipt.delegationId || null, status, reqValid ? 1 : 0, srvValid ? 1 : 0, v.outcomeConsistent ? 1 : 0, v.timingValid ? 1 : 0, JSON.stringify(receipt))
+  } catch (e: any) {
+    if (String(e?.message || '').includes('UNIQUE')) {
+      return res.status(409).json({ error: `Receipt "${receipt.receiptId}" already recorded for this tenant; replay rejected` })
+    }
+    throw e
+  }
+
+  try { getEventBus().emit(tenant.id, { type: 'bilateral_receipt_stored', agentId: requestingAgentId, data: { rowId, receiptId: receipt.receiptId, servingAgentId, status } }) } catch {}
+
+  res.status(201).json({
+    receipt_id: rowId,
+    status,
+    requesting_signature_valid: reqValid,
+    serving_signature_valid: srvValid,
+    outcome_consistent: v.outcomeConsistent,
+    timing_valid: v.timingValid,
+    stored: true,
+  })
+ } catch (e) {
+    res.status(500).json(safeError(e, 'receipts-bilateral'))
+ }
 })
 
 // ═══════════════════════════════════════
@@ -849,6 +1093,16 @@ gatewayRouter.post('/agents', (req: any, res) => {
   if (!agent_id || !public_key) {
     return res.status(400).json({ error: 'Required: agent_id, public_key' })
   }
+  // Consilium policy: is_root is NEVER self-service. A client-supplied `is_root` is ignored here;
+  // root designation is the audited admin action POST /api/v1/root-designations. New agents are
+  // is_root=0; existing roots are preserved by the B1 history backfill.
+  // B8 immutability: an agent_id is immutable. A duplicate registration is a 409 (no upsert), so the
+  // public_key cannot be swapped by re-registering (which would rebind authority). Key rotation is a
+  // separate, recorded operation (not this path).
+  const existing = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, agent_id) as any
+  if (existing) {
+    return res.status(409).json({ error: `Agent "${agent_id}" already exists in this tenant; agent_id and public_key are immutable (rotate keys via the recorded rotation path).` })
+  }
   // Security triage 2026-04-11 fix 4: validate entity_verification_endpoint
   // against the SSRF guard at registration time. Rejecting here is the
   // primary defense; the policy evaluation path has defense-in-depth.
@@ -868,7 +1122,7 @@ gatewayRouter.post('/agents', (req: any, res) => {
     return res.status(403).json({ error: limitCheck.reason, current: limitCheck.current, limit: limitCheck.limit })
   }
   const id = randomUUID()
-  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  db.prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, did, name, agent_type, entity_id, entity_verification_endpoint, metadata, is_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`)
     .run(id, tenant.id, agent_id, public_key, did || null, name || null, safeType, entity_id || null, entity_verification_endpoint || null, metadata ? JSON.stringify(metadata) : null)
   // Wallet → agent reverse index: pick up bound_wallets at enrollment time
   // so /public/trust/by-wallet/:address resolves immediately without a
@@ -884,6 +1138,63 @@ gatewayRouter.post('/agents', (req: any, res) => {
   } catch { /* index hygiene must not block enrollment */ }
   try { getEventBus().emit(tenant.id, { type: 'agent_registered', agentId: agent_id, data: { public_key, name, did, agent_type: safeType, entity_id } }) } catch {}
   res.status(201).json({ id, agent_id, status: 'active' })
+})
+
+// POST /api/v1/root-designations - Consilium policy: designate an agent as a root grantor.
+// Admin-only and AUDITED. This is the ONLY way to set is_root=1 (POST /agents ignores a client
+// is_root). Every designation writes a root_designations row (who, when, agent, tenant), atomically
+// with the is_root flip. Existing roots are preserved by the B1 history backfill; this handles NEW
+// roots after migration.
+gatewayRouter.post('/root-designations', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  if ((tenant as any).role !== 'admin') {
+    return res.status(403).json({ error: 'Root designation requires an admin key. is_root is not self-service.' })
+  }
+  const db = getDB()
+  const targetTenant = req.body.tenant_id || tenant.id
+  const { agent_id } = req.body
+  if (!agent_id) return res.status(400).json({ error: 'Required: agent_id' })
+  const agent = db.prepare(`SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
+  if (!agent) return res.status(404).json({ error: `Agent "${agent_id}" not found in tenant "${targetTenant}"` })
+  // R3-1 (a): a root grantor must be a live principal. Refuse designating a non-active target; a
+  // revoked/suspended/frozen agent must not be handed fresh-budget origination authority.
+  if (agent.status !== 'active') {
+    return res.status(400).json({ error: `Cannot designate agent "${agent_id}" as root: status is "${agent.status}", not active.` })
+  }
+  // R3-1 (b): re-rooting an agent that has a delegation history (ever a child) is the deliberate,
+  // audited override of the DEAD path. It requires an explicit re_root:true and a non-empty reason,
+  // both recorded in the audit row. A never-inbound agent is a plain origin root (no re_root needed).
+  const everInbound = db.prepare(`SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`).get(targetTenant, agent_id) as any
+  const reRoot = req.body.re_root === true
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : ''
+  if (everInbound && (!reRoot || reason.length === 0)) {
+    return res.status(400).json({ error: `Agent "${agent_id}" has a delegation history (it was previously a delegatee). Re-rooting it requires re_root:true and a non-empty reason.` })
+  }
+  const designatedAt = new Date().toISOString()
+  // R5-1 (final Consilium): same TOCTOU shape as POST /delegations. The target-status read above is an
+  // autocommit read outside the write txn; across processes the target could be revoked/suspended
+  // between that read and the promotion. Run the promotion in a BEGIN IMMEDIATE txn and re-verify the
+  // target is STILL active inside it; a mismatch is a 409 (retry). (Grant-time is already protected by
+  // the R5-1 grant re-verify, but designating a just-revoked agent as root would still write a stale
+  // flag + audit row, so close it here too.)
+  try {
+    const txn = db.transaction(() => {
+      const now = db.prepare(`SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
+      if (!now || now.status !== 'active') {
+        throw new AuthorityChangedError(`target agent "${agent_id}" is no longer active`)
+      }
+      db.prepare(`UPDATE agents SET is_root = 1 WHERE tenant_id = ? AND agent_id = ?`).run(targetTenant, agent_id)
+      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt, everInbound && reRoot ? 1 : 0, everInbound ? reason : (reason || null))
+    })
+    txn.immediate()
+  } catch (e) {
+    if (e instanceof AuthorityChangedError) {
+      return res.status(409).json({ error: `${(e as Error).message}; state changed between evaluation and commit, retry the request` })
+    }
+    throw e
+  }
+  res.status(200).json({ tenant_id: targetTenant, agent_id, is_root: true, designated_by: tenant.id, designated_at: designatedAt, re_root: !!(everInbound && reRoot), reason: everInbound ? reason : (reason || null) })
 })
 
 // ═══════════════════════════════════════
@@ -1185,6 +1496,72 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
   })
 })
 
+/** R5-1: thrown when a grantor's authority changed between the gate read and the insert commit. */
+export class AuthorityChangedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AuthorityChangedError'
+  }
+}
+
+/**
+ * R5-1 (final Consilium): apply a delegation grant inside a single BEGIN IMMEDIATE transaction that
+ * RE-VERIFIES the grantor's authority against the CURRENT rows before inserting, closing the
+ * cross-process TOCTOU on POST /delegations. The route's gate reads grantor authority (status, is_root,
+ * the parent delegation) as autocommit reads OUTSIDE this txn; in-process the handler is synchronous so
+ * there is no race, but across processes (Railway rolling restart, multi-replica) a demotion,
+ * suspension, or revocation can commit between that read and this insert, and the prior deferred txn
+ * never re-read. BEGIN IMMEDIATE takes the write lock up front (exactly one writer in WAL), so the
+ * re-read here is serialized against any concurrent authority-change commit. On a mismatch it throws
+ * AuthorityChangedError (the route maps it to 409; the caller retries and gets the correct 403 from the
+ * gate). Also carries the R4-1 audited demotion in the same transaction. Returns { demoted }.
+ */
+export function applyGrantWithReverify(
+  db: Database.Database,
+  opts: {
+    tenantId: string
+    grantorId: string
+    childId: string
+    delegationId: string
+    scope: string
+    spendLimit: number | null
+    spendLimitCents: number | null
+    maxDepth: number
+    childDepth: number
+    wasOrigination: boolean
+    parentDelId: string | null
+  },
+): { demoted: boolean } {
+  let demoted = false
+  const txn = db.transaction(() => {
+    // R5-1 re-verify against CURRENT rows (inside the write lock).
+    const gNow = db.prepare(`SELECT is_root, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.grantorId) as any
+    if (!gNow || gNow.status !== 'active') {
+      throw new AuthorityChangedError(`grantor "${opts.grantorId}" is no longer active`)
+    }
+    if (opts.wasOrigination) {
+      // Origination branch: the grantor must STILL be a designated root (not demoted since the gate read).
+      if (!gNow.is_root) throw new AuthorityChangedError(`grantor "${opts.grantorId}" is no longer a designated root`)
+    } else {
+      // Narrowing branch: the specific inbound delegation the gate bounded against must STILL be active.
+      const pd = db.prepare(`SELECT 1 FROM delegations WHERE tenant_id = ? AND id = ? AND status = 'active'`).get(opts.tenantId, opts.parentDelId)
+      if (!pd) throw new AuthorityChangedError(`the grantor's inbound delegation is no longer active`)
+    }
+    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope, opts.spendLimit, opts.spendLimitCents, opts.maxDepth, opts.childDepth)
+    // R4-1 audited demotion: if the CHILD is a designated root, receiving this inbound subordinates it.
+    const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.childId) as any
+    if (childRoot && childRoot.is_root) {
+      db.prepare(`UPDATE agents SET is_root = 0 WHERE tenant_id = ? AND agent_id = ?`).run(opts.tenantId, opts.childId)
+      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason, action, caused_by_delegation_id) VALUES (?, ?, ?, ?, ?, 0, ?, 'auto_demotion', ?)`)
+        .run(randomUUID(), opts.tenantId, opts.childId, opts.grantorId, new Date().toISOString(), `auto-demotion: subordinated by inbound delegation ${opts.delegationId} from ${opts.grantorId}`, opts.delegationId)
+      demoted = true
+    }
+  })
+  txn.immediate() // BEGIN IMMEDIATE: take the write lock up front so the re-read is serialized.
+  return { demoted }
+}
+
 // POST /api/v1/delegations — Create Delegation
 gatewayRouter.post('/delegations', (req: any, res) => {
   const tenant: Tenant = req.tenant
@@ -1196,14 +1573,100 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // P3-6: verify agent exists (prevent phantom delegations)
   const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
   if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
+
+  // Consilium hostile-panel B1/B2 F1: the GRANTOR's own liveness. The gate below keys on is_root and
+  // inbound-delegation liveness but must ALSO check the granting agent's own posture. A revoked or
+  // suspended agent (including a designated root, which revocation does not un-root) must not
+  // originate or narrow authority. /evaluate applies this posture to the ACTING agent; the grant path
+  // applies it to the GRANTOR principal (a different agent). Fetched once here and reused below.
+  const parentAgentRow = db.prepare(`SELECT is_root, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, parent_agent_id) as any
+  if (!parentAgentRow) return res.status(404).json({ error: `Parent agent "${parent_agent_id}" not found in this tenant` })
+  if (parentAgentRow.status !== 'active') {
+    return res.status(403).json({ error: `Delegation rejected: the granting agent "${parent_agent_id}" is not active (status: ${parentAgentRow.status}). A suspended or revoked agent cannot grant, even a designated root.` })
+  }
+
+  // Monotonic narrowing: if parent_agent_id itself holds a delegation, the new child may only
+  // narrow it (subset scope, spend within the parent's remaining budget, non-increasing depth
+  // ceiling). A parent with no inbound delegation is a tenant root principal and may grant freely.
+  // Without this, a delegatee could mint a child broader than what it was granted (escalation).
+  // Panel B1/B2 F2: `id DESC` is a deterministic secondary sort. created_at has 1s resolution, so
+  // among same-instant active inbounds SQLite's pick was arbitrary, making WHICH inbound bounds the
+  // child (and, on /evaluate, which is charged) nondeterministic. (Reconciling MULTIPLE simultaneous
+  // active inbounds into an aggregate budget remains an open design item; see REMEDIATION-MEMO.md.)
+  const parentDel = db.prepare(
+    `SELECT id, scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
+     WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1`
+  ).get(tenant.id, parent_agent_id) as any
+
+  // Audit item 3 (HIGH money): fake-root gate. A parent with NO inbound delegation (parentDel null)
+  // is treated by checkDelegationNarrowing as a free-granting root with spend_used=0 and
+  // current_depth=0. Without a server-side root notion, any no-inbound agent could be named as a
+  // fresh-budget root, resetting an exhausted child's spend and the chain depth. So a no-inbound
+  // parent may grant ONLY if it is a DESIGNATED root (agents.is_root=1). This also closes item 2's
+  // depth-reset coupling: a non-root no-inbound parent can no longer reset current_depth to 0.
+  if (!parentDel) {
+    // B2 three-valued liveness with the R3-1 gate order. No LIVE inbound.
+    // R3-1 (round-2 Consilium): check is_root FIRST. A DESIGNATED root originates regardless of
+    // delegation history; designation is the deliberate, audited override (POST /root-designations
+    // records who/when and, for an ex-child, re_root:true + a reason). The prior order checked the DEAD
+    // branch first, so an admin-designated ex-child still 403'd DEAD and the audited override was
+    // silently ineffective for exactly the re-rooting topology (R2 defeated R8).
+    // parentAgentRow (fetched + existence-checked + status-checked above) carries is_root.
+    if (!parentAgentRow.is_root) {
+      // Not a designated root. Distinguish DEAD (had an inbound, now revoked/expired -- a severed
+      // delegatee) from ABSENT (never delegated to). Only a designated root may originate either way.
+      const everInbound = db.prepare(
+        `SELECT 1 FROM delegations WHERE tenant_id = ? AND child_agent_id = ? LIMIT 1`,
+      ).get(tenant.id, parent_agent_id) as any
+      if (everInbound) {
+        // DEAD: a severed child is is_root=0 and was not re-rooted, so it cannot originate.
+        return res.status(403).json({ error: 'Delegation rejected: the parent had an inbound delegation that is no longer active (revoked or expired) and is not a designated root. A severed delegatee cannot originate a fresh-budget delegation unless it is explicitly re-rooted (admin POST /root-designations with re_root).' })
+      }
+      // ABSENT and not a designated root.
+      return res.status(403).json({ error: 'Delegation rejected: the parent has no inbound delegation and is not a designated root. Only a designated root (agents.is_root=1) may grant a fresh-budget delegation.' })
+    }
+    // is_root=1: a designated (or re-rooted) root originates freely; fall through to narrowing as a
+    // fresh-budget root.
+  }
+
+  const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
+  const narrow = checkDelegationNarrowing(
+    parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth, current_depth: parentDel.current_depth } : null,
+    { scope: childScopeArr, spend_limit: (spend_limit ?? null) as number | null, max_depth: max_depth || 3 },
+  )
+  if (!narrow.ok) {
+    return res.status(403).json({ error: 'Delegation escalation rejected', violations: narrow.violations })
+  }
+  // Real chain depth: root (no inbound delegation) is 0; each hop is parent.current_depth + 1.
+  const childDepth = parentDel ? ((parentDel.current_depth ?? 0) + 1) : 0
+
   const id = randomUUID()
   // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
   const spendLimitUsd = spend_limit || null
   const spendLimitCents = toCents(spendLimitUsd)
-  db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3)
-  try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
-  res.status(201).json({ id, status: 'active' })
+  // R5-1 (final Consilium): apply the grant inside a BEGIN IMMEDIATE transaction that RE-VERIFIES the
+  // grantor's authority against the CURRENT rows (the gate above read them as autocommit reads outside
+  // this txn; across processes a demotion/suspension/revocation can commit in between). On a stale-read
+  // mismatch it throws AuthorityChangedError, mapped to 409 here so the caller retries and gets the
+  // correct 403 from the gate. Also carries the R4-1 audited demotion (same transaction).
+  try {
+    const { demoted } = applyGrantWithReverify(db, {
+      tenantId: tenant.id, grantorId: parent_agent_id, childId: child_agent_id, delegationId: id,
+      scope: Array.isArray(scope) ? scope.join(',') : scope, spendLimit: spendLimitUsd, spendLimitCents,
+      maxDepth: max_depth || 3, childDepth, wasOrigination: !parentDel, parentDelId: parentDel ? parentDel.id : null,
+    })
+    try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
+    // R5-2: surface the audited auto-demotion operationally (mirrors delegation_created).
+    if (demoted) {
+      try { getEventBus().emit(tenant.id, { type: 'root_auto_demotion', data: { tenant: tenant.id, agent: child_agent_id, caused_by_delegation_id: id, grantor: parent_agent_id } }) } catch {}
+    }
+    res.status(201).json({ id, status: 'active' })
+  } catch (e) {
+    if (e instanceof AuthorityChangedError) {
+      return res.status(409).json({ error: `${(e as Error).message}; grantor authority changed between evaluation and commit, retry the request` })
+    }
+    throw e
+  }
 })
 
 // GET /api/v1/delegations — List Delegations
@@ -2225,6 +2688,10 @@ gatewayRouter.post('/agents/:agentId/posture', (req: any, res) => {
   if (!status || !reason) {
     return res.status(400).json({ error: 'Required: status, reason' })
   }
+  // R4-3 CROSS-POINT: this posture route sets agents.status to one of active/restricted/suspended.
+  // The full agents.status domain (also revoked from /revoke + panic zero_authority, and frozen from
+  // panic read_only) is pinned by a DB trigger in src/db/schema.ts (check_agents_status_insert/update).
+  // Changing the allowed status set requires updating BOTH this enum AND that trigger together.
   if (!['active', 'restricted', 'suspended'].includes(status)) {
     return res.status(400).json({ error: 'status must be active, restricted, or suspended' })
   }

@@ -9,6 +9,91 @@ import { randomUUID } from 'node:crypto'
 
 let db: Database.Database
 
+/**
+ * ONE-TIME backfill for is_root (B1, Consilium): is_root is an ORIGIN property derived from HISTORY,
+ * never from current edges. An agent is a root iff it has NEVER appeared as `child_agent_id` in
+ * delegations under ANY status (active, revoked, expired, pending, suspended). Any agent that has
+ * ever received a delegation -- even one now revoked or expired -- is is_root=0.
+ *
+ * Why the origin rule (and not "active grantor with no active inbound", the prior version):
+ *   - it refuses a SEVERED child: a revoked/expired inbound plus an active outbound must NOT become a
+ *     fresh-budget root (the prior rule promoted it, because the inbound was no longer active);
+ *   - it preserves an IDLE real root: an origin principal that has not granted anything yet stays a
+ *     root (the prior rule left it is_root=0, so its first grant 403'd).
+ * A self-delegation A->A makes A appear as its own child, so A is correctly is_root=0.
+ *
+ * Scoped per tenant. Idempotent (the `is_root = 0` guard makes a re-run a no-op). Returns the number
+ * of agents promoted. New roots created after migration require the audited admin designation path
+ * (client-supplied is_root at POST /agents is ignored -- Consilium policy change).
+ */
+export function backfillAgentRoots(database: Database.Database): number {
+  const info = database.prepare(`
+    UPDATE agents SET is_root = 1
+    WHERE is_root = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM delegations d
+        WHERE d.tenant_id = agents.tenant_id AND d.child_agent_id = agents.agent_id
+      )
+  `).run()
+  return info.changes
+}
+
+export const IS_ROOT_MIGRATION_ID = 'is_root_origin_backfill_v1'
+
+/**
+ * B5 (Consilium): run the is_root origin backfill exactly once, TRANSACTIONALLY and versioned.
+ * Gated on a schema_migrations `complete` row written in the SAME transaction as the backfill, NOT
+ * on column presence. So a crash after the ALTER but before the backfill commits rolls back and
+ * re-runs correctly on the next boot (the prior column-presence gate would skip it forever). The
+ * IMMEDIATE lock plus a re-check inside the transaction serialize concurrent boots: the loser waits
+ * (busy_timeout), then sees the marker complete and skips. Idempotent and safe to re-run.
+ * Requires the schema_migrations table to already exist (created in the schema block above).
+ */
+export function runIsRootOriginBackfill(
+  database: Database.Database,
+  opts: { maxAttempts?: number; busyMs?: number } = {},
+): 'applied' | 'already' {
+  const maxAttempts = Number.isFinite(opts.maxAttempts as number) ? Math.max(1, opts.maxAttempts as number) : 12
+  const busyMs = Number.isFinite(opts.busyMs as number) ? Math.max(0, opts.busyMs as number) : 5000
+  try { database.pragma(`busy_timeout = ${busyMs}`) } catch {}
+
+  const markerComplete = () =>
+    database.prepare(`SELECT 1 FROM schema_migrations WHERE id = ? AND status = 'complete'`).get(IS_ROOT_MIGRATION_ID)
+
+  const txn = database.transaction(() => {
+    // Re-check inside the write lock: a concurrent boot may have completed it between the read above
+    // and acquiring the lock here.
+    if (markerComplete()) return false
+    backfillAgentRoots(database)
+    database.prepare(
+      `INSERT INTO schema_migrations (id, status, applied_at) VALUES (?, 'complete', ?)
+       ON CONFLICT(id) DO UPDATE SET status = 'complete', applied_at = excluded.applied_at`,
+    ).run(IS_ROOT_MIGRATION_ID, new Date().toISOString())
+    return true
+  })
+
+  // B5 panel F3: on a multi-replica boot (Railway rolling restart), a concurrent replica may hold the
+  // write lock while it runs a large-fleet backfill for LONGER than busy_timeout, so `.immediate()`
+  // can throw SQLITE_BUSY. The prior code let that propagate uncaught and CRASH the booting replica.
+  // Instead, re-check the marker each round (the winner may have committed -> 'already') and retry a
+  // bounded number of times; each attempt itself waits up to busy_timeout for the lock, so the total
+  // wait rides out a slow winner. Only a genuinely stuck lock (marker never appears) surfaces an error,
+  // fail-closed: better to crash-loop the boot than serve on an unmigrated DB.
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (markerComplete()) return 'already'
+    try {
+      const applied = txn.immediate() // BEGIN IMMEDIATE: take the write lock up front
+      return applied ? 'applied' : 'already'
+    } catch (e: any) {
+      const busy = e && (e.code === 'SQLITE_BUSY' || /database is locked|SQLITE_BUSY/i.test(String(e.message || '')))
+      if (busy && attempt < maxAttempts) continue
+      throw e
+    }
+  }
+  if (markerComplete()) return 'already'
+  throw new Error('is_root migration could not acquire the write lock after retries; another process may be stuck holding it')
+}
+
 export function initDB(path: string = './gateway.db'): Database.Database {
   db = new Database(path)
   db.pragma('journal_mode = WAL')
@@ -54,11 +139,20 @@ function createTables() {
       did TEXT,
       name TEXT,
       status TEXT NOT NULL DEFAULT 'active',
+      -- Audit item 3: a DESIGNATED root grantor. Only is_root=1 agents may create a delegation
+      -- with no inbound delegation (a fresh-budget root grant). Default 0 (not a root).
+      is_root INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(tenant_id, agent_id)
     );
 
     -- Delegations
+    -- R3-5 (round-2 Consilium) APPEND-ONLY invariant: rows here are NEVER hard-deleted. Revocation and
+    -- expiry are status updates (status='revoked', revoked_at set); the row persists. The B1 origin rule
+    -- (is_root iff the agent has NEVER been a child_agent_id under ANY status) depends on this: deleting
+    -- a revoked delegation would erase the history that proves an agent was once a delegatee and could
+    -- silently re-root it. No DELETE FROM delegations exists in the codebase (grep-verified); /revoke and
+    -- the cascade paths only UPDATE status. The same holds for agents (revocation is a status update).
     CREATE TABLE IF NOT EXISTS delegations (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id),
@@ -68,9 +162,21 @@ function createTables() {
       spend_limit REAL,
       spend_used REAL DEFAULT 0,
       max_depth INTEGER DEFAULT 3,
+      current_depth INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      revoked_at TEXT
+      revoked_at TEXT,
+      -- B6 (Consilium): DB-level money invariants, defense in depth behind the app cost guard.
+      -- A negative cost or a refund below zero is structurally impossible at the row level.
+      -- The ceiling CHECK carries a sub-cent (0.005) tolerance: spend is tracked in float dollars, so a
+      -- legitimate spend-to-the-limit can land a few ULPs above spend_limit by IEEE-754 rounding
+      -- (2.14 + 5.07 = 7.210000000000001). The tolerance is below money granularity (1 cent), so it
+      -- absorbs that noise without masking any real over-limit (which is always >= 1 cent). The
+      -- authoritative ceiling is the app-layer overspend guard (deny); this CHECK is a corruption
+      -- backstop. Panel B6 F1: the exact form here 500'd on a legitimate at-limit spend.
+      CHECK (spend_used >= 0),
+      CHECK (spend_limit IS NULL OR spend_limit >= 0),
+      CHECK (spend_limit IS NULL OR spend_used <= spend_limit + 0.005)
     );
 
     -- Policy Evaluations (the billable unit)
@@ -194,7 +300,73 @@ function createTables() {
     CREATE INDEX IF NOT EXISTS idx_evals_agent ON policy_evaluations(tenant_id, agent_id);
     CREATE INDEX IF NOT EXISTS idx_receipts_tenant ON receipts(tenant_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_delegations_tenant ON delegations(tenant_id, status);
+    -- B5 (Consilium): index the delegation-graph lookups the authz path and the backfill run.
+    CREATE INDEX IF NOT EXISTS idx_delegations_parent ON delegations(tenant_id, status, parent_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_delegations_child ON delegations(tenant_id, status, child_agent_id);
     CREATE INDEX IF NOT EXISTS idx_usage_tenant ON usage(tenant_id, period);
+    -- B5 (Consilium): versioned migration ledger. A migration is gated on its complete-status row
+    -- here, written in the SAME transaction as its data change, so a crash mid-migration re-runs.
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      applied_at TEXT
+    );
+    -- Consilium policy: root designation is an explicit, audited admin action, never self-service at
+    -- POST /agents. Every designation writes a row here (who designated, when, which agent/tenant).
+    -- R3-1 (round-2 Consilium): re_root + reason record the deliberate re-rooting of an agent that has
+    -- a delegation history (ever a child). Designating such an agent is the audited override that lets
+    -- it originate despite the DEAD path; it requires an explicit re_root:true and a reason, both stored
+    -- here for the audit trail.
+    -- R4-1 (round-3 Consilium): this table is the ONE coherent designation history per agent. The action
+    -- column discriminates 'designation' (an admin act via POST /root-designations) from 'auto_demotion'
+    -- (an automatic, audited demotion when a designated root RECEIVES an inbound delegation and thereby
+    -- becomes subordinate). An auto_demotion row carries caused_by_delegation_id (the delegation that
+    -- subordinated the root) and designated_by = the grantor who caused it. Demotion is not silent
+    -- (silent clearing was rejected: any grantor could then destroy an admin's designation); it is
+    -- recorded, and restoration is the existing audited POST /root-designations (re_root:true + reason).
+    CREATE TABLE IF NOT EXISTS root_designations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      designated_by TEXT NOT NULL,
+      designated_at TEXT NOT NULL,
+      re_root INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
+      action TEXT NOT NULL DEFAULT 'designation',
+      caused_by_delegation_id TEXT,
+      revoked_at TEXT
+    );
+    -- B3 (Consilium): bilateral interaction receipts. A row is stored only after BOTH the requesting
+    -- and serving signatures are checked against BOTH agents' REGISTERED keys (via the SDK
+    -- verifyBilateralReceipt primitive). status is 'attested' (both sides valid) or
+    -- 'partial_attestation' (exactly one valid side, e.g. a dumb Web2 sink that cannot countersign).
+    -- A forged/mismatched present signature is rejected at the route and never reaches this table.
+    CREATE TABLE IF NOT EXISTS bilateral_receipts (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      receipt_id TEXT NOT NULL,
+      requesting_agent_id TEXT NOT NULL,
+      serving_agent_id TEXT NOT NULL,
+      delegation_id TEXT,
+      status TEXT NOT NULL,
+      requesting_sig_valid INTEGER NOT NULL,
+      serving_sig_valid INTEGER NOT NULL,
+      outcome_consistent INTEGER NOT NULL,
+      timing_valid INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- B3 panel F1: a receipt_id is stored at most once per tenant. receipt_id is inside the signed
+      -- body (verifyBilateralReceipt strips only the signature fields), so it cannot be altered without
+      -- breaking a signature; a replay of the same signed receipt hits this and is rejected 409.
+      UNIQUE (tenant_id, receipt_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_bilateral_receipts_tenant ON bilateral_receipts(tenant_id, created_at);
+    -- B3 F1 (re-verification): the table-level UNIQUE above is applied only when the table is CREATED.
+    -- On a DB that already has bilateral_receipts (created before the constraint), CREATE TABLE IF NOT
+    -- EXISTS is a no-op and the constraint is silently absent, reopening the concurrent-replay backstop.
+    -- A CREATE UNIQUE INDEX IF NOT EXISTS DOES apply to an existing table, so the replay backstop holds
+    -- on fresh and upgraded DBs alike (it fails loudly only if pre-existing duplicate rows exist).
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_bilateral_receipts_tenant_receipt ON bilateral_receipts(tenant_id, receipt_id);
     CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON alerts(tenant_id, acknowledged_at);
     CREATE INDEX IF NOT EXISTS idx_data_sources_tenant ON data_sources(tenant_id, status);
     CREATE INDEX IF NOT EXISTS idx_access_receipts_tenant ON access_receipts(tenant_id, created_at);
@@ -540,7 +712,40 @@ function createTables() {
   try { db.exec(`ALTER TABLE policy_evaluations ADD COLUMN task_class TEXT DEFAULT ''`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_id TEXT DEFAULT NULL`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_verification_endpoint TEXT DEFAULT NULL`) } catch {}
+  // Round-3: track the real chain depth so a delegation chain cannot grow past max_depth.
+  try { db.exec(`ALTER TABLE delegations ADD COLUMN current_depth INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
+  // R3-1: re-root audit fields on an existing root_designations table (additive, idempotent).
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN re_root INTEGER NOT NULL DEFAULT 0`) } catch {}
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN reason TEXT`) } catch {}
+  // R4-1: audited auto-demotion fields (additive, idempotent).
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN action TEXT NOT NULL DEFAULT 'designation'`) } catch {}
+  try { db.exec(`ALTER TABLE root_designations ADD COLUMN caused_by_delegation_id TEXT`) } catch {}
+
+  // Audit item 3 (HIGH money): designated root grantors. Only is_root=1 agents may grant a
+  // delegation with no inbound delegation; without this any no-inbound agent could be named a
+  // fresh-budget root and reset an exhausted child's spend. The ALTER succeeds exactly ONCE (when
+  // the column is first added to an existing DB), and only then do we run the ONE-TIME backfill
+  // that promotes the agents already acting as de-facto roots. On a fresh DB the column exists from
+  // CREATE TABLE, the ALTER throws, and the backfill is skipped (no data to backfill).
+  // B1/B5: ensure the is_root column (idempotent ALTER), then run the origin backfill
+  // TRANSACTIONALLY, gated on a schema_migrations marker (not on column presence) so a crash between
+  // the ALTER and the backfill commit re-runs correctly on the next boot. Runs at initDB, i.e. before
+  // the server calls app.listen() (server.ts), so it completes before any traffic is accepted.
+  try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`) } catch {}
+  runIsRootOriginBackfill(db)
+
+  // Audit item 5 (HIGH replay): durable capability-token nullifier set. A consumed token preimage
+  // must survive restarts and be shared across processes; the reference MCP store is per-process.
+  // Backed here so a co-located MCP injects the DB-backed SqliteNullifierStore (src/capabilityToken/
+  // nullifier-store.ts) behind the existing NullifierStore interface.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS capability_nullifiers (
+      nullifier  TEXT PRIMARY KEY,
+      expires_at TEXT,
+      created_at TEXT NOT NULL
+    )`)
+  } catch {}
 
   // Security triage 2026-04-11 fix 1: tenant role column.
   // Decouples admin authorization from the `plan` billing concept.
@@ -685,6 +890,36 @@ function createTables() {
     `)
   } catch (e: any) {
     console.error('[migration] enum-trigger install failed:', e?.message || e)
+  }
+
+  // R3-2 (round-2 Consilium): pin agents.status to its value domain at the DB layer, the same
+  // BEFORE INSERT/UPDATE trigger pattern used for tenants above. The authz path branches on literal
+  // status values (active / restricted / suspended / revoked / frozen); an out-of-domain value written
+  // by a typo or a validation-skipping path would be mis-read. The legitimate set is every value the
+  // code writes: 'active' (register default, thaw restore), 'restricted' + 'suspended' (posture route),
+  // 'revoked' (revoke cascade, panic zero_authority), 'frozen' (panic read_only). Additive and
+  // idempotent (CREATE TRIGGER IF NOT EXISTS); safe on the existing agents table.
+  // R4-3 CROSS-POINT: this enum MUST stay in sync with the app-level status writers. Adding or removing
+  // a status value requires updating BOTH this trigger AND every write site: the posture route enum in
+  // src/gateway/enforce.ts (the ['active','restricted','suspended'] validation), the panic-freeze paths
+  // in src/gateway/revocation/freeze.ts ('revoked' | 'frozen' | 'active'), and the /revoke cascade
+  // ('revoked'). A live volume must also have NO pre-existing out-of-domain rows before this trigger can
+  // be trusted (an existing bad row would abort its next legitimate UPDATE); see the runbook invariant.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS check_agents_status_insert
+        BEFORE INSERT ON agents
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'restricted', 'suspended', 'revoked', 'frozen')
+        BEGIN SELECT RAISE(ABORT, 'invalid agent status value (allowed: active, restricted, suspended, revoked, frozen)'); END;
+      CREATE TRIGGER IF NOT EXISTS check_agents_status_update
+        BEFORE UPDATE OF status ON agents
+        FOR EACH ROW
+        WHEN NEW.status NOT IN ('active', 'restricted', 'suspended', 'revoked', 'frozen')
+        BEGIN SELECT RAISE(ABORT, 'invalid agent status value (allowed: active, restricted, suspended, revoked, frozen)'); END;
+    `)
+  } catch (e: any) {
+    console.error('[migration] agents-status-trigger install failed:', e?.message || e)
   }
 
   // ═══════════════════════════════════════
