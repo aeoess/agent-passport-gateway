@@ -17,6 +17,7 @@ import type { Server } from 'node:http'
 import { initDB, getDB } from '../../src/db/schema.js'
 import { initGatewayIdentity } from '../../src/gateway/identity.js'
 import { gatewayRouter } from '../../src/gateway/enforce.js'
+import { getEventBus } from '../../src/gateway/events.js'
 
 const T = 'tnt_demote'
 let server: Server, baseUrl: string
@@ -98,6 +99,26 @@ describe('R4-1 audited auto-demotion on subordination', () => {
     seedAgent('plainChild', 0, 'active')
     await post('/delegations', { parent_agent_id: 'rootY', child_agent_id: 'plainChild', scope: 'commerce:checkout', spend_limit: 5 })
     assert.equal(demotionRows('plainChild').length, 0, 'no demotion for a non-root child')
+  })
+
+  it('[R5-2] a root_auto_demotion event is emitted on demotion and absent on a non-root grant', async () => {
+    const events: any[] = []
+    getEventBus().subscribe(T, (ev: any) => { if (ev.type === 'root_auto_demotion') events.push(ev) })
+    role = 'admin'; seedAgent('evRoot', 0, 'active')
+    await post('/root-designations', { agent_id: 'evRoot' })
+    role = 'user'
+    seedAgent('evGrantor', 1, 'active')
+    // Non-root grant first: must NOT emit a demotion event.
+    seedAgent('evPlain', 0, 'active')
+    await post('/delegations', { parent_agent_id: 'evGrantor', child_agent_id: 'evPlain', scope: 'commerce:checkout', spend_limit: 5 })
+    assert.equal(events.length, 0, 'no demotion event for a non-root child')
+    // Subordinate the designated root: must emit exactly one demotion event carrying the provenance.
+    const g = await post('/delegations', { parent_agent_id: 'evGrantor', child_agent_id: 'evRoot', scope: 'commerce:checkout', spend_limit: 5 })
+    const delId = (await g.json() as any).id
+    assert.equal(events.length, 1, 'one demotion event on subordinating a root')
+    assert.equal(events[0].data.agent, 'evRoot')
+    assert.equal(events[0].data.grantor, 'evGrantor')
+    assert.equal(events[0].data.caused_by_delegation_id, delId)
   })
 
   it('[ATOMIC] a failing demotion audit write rolls back the whole delegation', async () => {

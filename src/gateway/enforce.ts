@@ -11,6 +11,7 @@
  */
 
 import { Router } from 'express'
+import type Database from 'better-sqlite3'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { randomUUID, createHash } from 'node:crypto'
 // Receipt-ingest signature verification (audit item 6). Same SDK canonicalize/verify the
@@ -1170,12 +1171,29 @@ gatewayRouter.post('/root-designations', (req: any, res) => {
     return res.status(400).json({ error: `Agent "${agent_id}" has a delegation history (it was previously a delegatee). Re-rooting it requires re_root:true and a non-empty reason.` })
   }
   const designatedAt = new Date().toISOString()
-  const txn = db.transaction(() => {
-    db.prepare(`UPDATE agents SET is_root = 1 WHERE tenant_id = ? AND agent_id = ?`).run(targetTenant, agent_id)
-    db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt, everInbound && reRoot ? 1 : 0, everInbound ? reason : (reason || null))
-  })
-  txn()
+  // R5-1 (final Consilium): same TOCTOU shape as POST /delegations. The target-status read above is an
+  // autocommit read outside the write txn; across processes the target could be revoked/suspended
+  // between that read and the promotion. Run the promotion in a BEGIN IMMEDIATE txn and re-verify the
+  // target is STILL active inside it; a mismatch is a 409 (retry). (Grant-time is already protected by
+  // the R5-1 grant re-verify, but designating a just-revoked agent as root would still write a stale
+  // flag + audit row, so close it here too.)
+  try {
+    const txn = db.transaction(() => {
+      const now = db.prepare(`SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(targetTenant, agent_id) as any
+      if (!now || now.status !== 'active') {
+        throw new AuthorityChangedError(`target agent "${agent_id}" is no longer active`)
+      }
+      db.prepare(`UPDATE agents SET is_root = 1 WHERE tenant_id = ? AND agent_id = ?`).run(targetTenant, agent_id)
+      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(randomUUID(), targetTenant, agent_id, tenant.id, designatedAt, everInbound && reRoot ? 1 : 0, everInbound ? reason : (reason || null))
+    })
+    txn.immediate()
+  } catch (e) {
+    if (e instanceof AuthorityChangedError) {
+      return res.status(409).json({ error: `${(e as Error).message}; state changed between evaluation and commit, retry the request` })
+    }
+    throw e
+  }
   res.status(200).json({ tenant_id: targetTenant, agent_id, is_root: true, designated_by: tenant.id, designated_at: designatedAt, re_root: !!(everInbound && reRoot), reason: everInbound ? reason : (reason || null) })
 })
 
@@ -1478,6 +1496,72 @@ gatewayRouter.get('/trust/:agentId/profile', (req: any, res) => {
   })
 })
 
+/** R5-1: thrown when a grantor's authority changed between the gate read and the insert commit. */
+export class AuthorityChangedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AuthorityChangedError'
+  }
+}
+
+/**
+ * R5-1 (final Consilium): apply a delegation grant inside a single BEGIN IMMEDIATE transaction that
+ * RE-VERIFIES the grantor's authority against the CURRENT rows before inserting, closing the
+ * cross-process TOCTOU on POST /delegations. The route's gate reads grantor authority (status, is_root,
+ * the parent delegation) as autocommit reads OUTSIDE this txn; in-process the handler is synchronous so
+ * there is no race, but across processes (Railway rolling restart, multi-replica) a demotion,
+ * suspension, or revocation can commit between that read and this insert, and the prior deferred txn
+ * never re-read. BEGIN IMMEDIATE takes the write lock up front (exactly one writer in WAL), so the
+ * re-read here is serialized against any concurrent authority-change commit. On a mismatch it throws
+ * AuthorityChangedError (the route maps it to 409; the caller retries and gets the correct 403 from the
+ * gate). Also carries the R4-1 audited demotion in the same transaction. Returns { demoted }.
+ */
+export function applyGrantWithReverify(
+  db: Database.Database,
+  opts: {
+    tenantId: string
+    grantorId: string
+    childId: string
+    delegationId: string
+    scope: string
+    spendLimit: number | null
+    spendLimitCents: number | null
+    maxDepth: number
+    childDepth: number
+    wasOrigination: boolean
+    parentDelId: string | null
+  },
+): { demoted: boolean } {
+  let demoted = false
+  const txn = db.transaction(() => {
+    // R5-1 re-verify against CURRENT rows (inside the write lock).
+    const gNow = db.prepare(`SELECT is_root, status FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.grantorId) as any
+    if (!gNow || gNow.status !== 'active') {
+      throw new AuthorityChangedError(`grantor "${opts.grantorId}" is no longer active`)
+    }
+    if (opts.wasOrigination) {
+      // Origination branch: the grantor must STILL be a designated root (not demoted since the gate read).
+      if (!gNow.is_root) throw new AuthorityChangedError(`grantor "${opts.grantorId}" is no longer a designated root`)
+    } else {
+      // Narrowing branch: the specific inbound delegation the gate bounded against must STILL be active.
+      const pd = db.prepare(`SELECT 1 FROM delegations WHERE tenant_id = ? AND id = ? AND status = 'active'`).get(opts.tenantId, opts.parentDelId)
+      if (!pd) throw new AuthorityChangedError(`the grantor's inbound delegation is no longer active`)
+    }
+    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope, opts.spendLimit, opts.spendLimitCents, opts.maxDepth, opts.childDepth)
+    // R4-1 audited demotion: if the CHILD is a designated root, receiving this inbound subordinates it.
+    const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.childId) as any
+    if (childRoot && childRoot.is_root) {
+      db.prepare(`UPDATE agents SET is_root = 0 WHERE tenant_id = ? AND agent_id = ?`).run(opts.tenantId, opts.childId)
+      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason, action, caused_by_delegation_id) VALUES (?, ?, ?, ?, ?, 0, ?, 'auto_demotion', ?)`)
+        .run(randomUUID(), opts.tenantId, opts.childId, opts.grantorId, new Date().toISOString(), `auto-demotion: subordinated by inbound delegation ${opts.delegationId} from ${opts.grantorId}`, opts.delegationId)
+      demoted = true
+    }
+  })
+  txn.immediate() // BEGIN IMMEDIATE: take the write lock up front so the re-read is serialized.
+  return { demoted }
+}
+
 // POST /api/v1/delegations — Create Delegation
 gatewayRouter.post('/delegations', (req: any, res) => {
   const tenant: Tenant = req.tenant
@@ -1510,7 +1594,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // child (and, on /evaluate, which is charged) nondeterministic. (Reconciling MULTIPLE simultaneous
   // active inbounds into an aggregate budget remains an open design item; see REMEDIATION-MEMO.md.)
   const parentDel = db.prepare(
-    `SELECT scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
+    `SELECT id, scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1`
   ).get(tenant.id, parent_agent_id) as any
 
@@ -1560,25 +1644,29 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // C4 dual-write: spend_limit (REAL) + spend_limit_cents (INTEGER).
   const spendLimitUsd = spend_limit || null
   const spendLimitCents = toCents(spendLimitUsd)
-  // R4-1 (round-3 Consilium): audited demotion on subordination. If the CHILD is a designated root,
-  // receiving this inbound delegation subordinates it, so it must lose is_root. Silent clearing was
-  // rejected (any grantor could then destroy an admin's designation); instead demote AND write an
-  // audited auto_demotion row, in the SAME transaction as the delegation insert so the two are atomic
-  // (a failed audit rolls back the grant). Restoration is the existing audited POST /root-designations
-  // (which, because the agent now has an ever-inbound, correctly requires re_root:true + a reason).
-  const txn = db.transaction(() => {
-    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, tenant.id, parent_agent_id, child_agent_id, Array.isArray(scope) ? scope.join(',') : scope, spendLimitUsd, spendLimitCents, max_depth || 3, childDepth)
-    const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
-    if (childRoot && childRoot.is_root) {
-      db.prepare(`UPDATE agents SET is_root = 0 WHERE tenant_id = ? AND agent_id = ?`).run(tenant.id, child_agent_id)
-      db.prepare(`INSERT INTO root_designations (id, tenant_id, agent_id, designated_by, designated_at, re_root, reason, action, caused_by_delegation_id) VALUES (?, ?, ?, ?, ?, 0, ?, 'auto_demotion', ?)`)
-        .run(randomUUID(), tenant.id, child_agent_id, parent_agent_id, new Date().toISOString(), `auto-demotion: subordinated by inbound delegation ${id} from ${parent_agent_id}`, id)
+  // R5-1 (final Consilium): apply the grant inside a BEGIN IMMEDIATE transaction that RE-VERIFIES the
+  // grantor's authority against the CURRENT rows (the gate above read them as autocommit reads outside
+  // this txn; across processes a demotion/suspension/revocation can commit in between). On a stale-read
+  // mismatch it throws AuthorityChangedError, mapped to 409 here so the caller retries and gets the
+  // correct 403 from the gate. Also carries the R4-1 audited demotion (same transaction).
+  try {
+    const { demoted } = applyGrantWithReverify(db, {
+      tenantId: tenant.id, grantorId: parent_agent_id, childId: child_agent_id, delegationId: id,
+      scope: Array.isArray(scope) ? scope.join(',') : scope, spendLimit: spendLimitUsd, spendLimitCents,
+      maxDepth: max_depth || 3, childDepth, wasOrigination: !parentDel, parentDelId: parentDel ? parentDel.id : null,
+    })
+    try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
+    // R5-2: surface the audited auto-demotion operationally (mirrors delegation_created).
+    if (demoted) {
+      try { getEventBus().emit(tenant.id, { type: 'root_auto_demotion', data: { tenant: tenant.id, agent: child_agent_id, caused_by_delegation_id: id, grantor: parent_agent_id } }) } catch {}
     }
-  })
-  txn()
-  try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
-  res.status(201).json({ id, status: 'active' })
+    res.status(201).json({ id, status: 'active' })
+  } catch (e) {
+    if (e instanceof AuthorityChangedError) {
+      return res.status(409).json({ error: `${(e as Error).message}; grantor authority changed between evaluation and commit, retry the request` })
+    }
+    throw e
+  }
 })
 
 // GET /api/v1/delegations — List Delegations
