@@ -15,9 +15,39 @@ import { randomUUID } from 'node:crypto'
 import { getNanoRail, rawToXno, xnoToRaw } from './nano.js'
 import { getDB } from '../db/schema.js'
 import { getEventBus } from '../gateway/events.js'
+import { getGatewayIdentity } from '../gateway/identity.js'
 import type { Tenant } from '../auth/api-keys.js'
 
 export const paymentRouter = Router()
+
+// The unit the Nano rail pays in. A settlement line item denominated in
+// anything else (contributions default to 'usd') must never be sent on this
+// rail, and the gateway performs no conversion. Case-sensitive to match how
+// nano.ts labels its own amounts (`readonly currency = 'XNO'`).
+const RAIL_CURRENCY = 'XNO'
+
+// Gateway-signed receipt for one settlement payout decision (confirmed or
+// denied). This is a gateway attestation of what the payout path did, signed
+// with the same EdDSA identity used for evaluation receipts. It is NOT a
+// delegation- or authority-linked receipt: settle has no payer delegation
+// today (see the fail-closed gate below), so this records the decision and
+// its signer, not an authorization. A payer-authority-linked receipt belongs
+// with the treasury authority model that does not yet exist.
+function signSettlementPayoutReceipt(body: {
+  settlement_id: string
+  source_id: string
+  amount: number
+  currency: string
+  destination: string
+  decision: 'confirmed' | 'denied'
+  reason: string | null
+  tx_proof: string | null
+}): { kind: string; signature: string; kid: string; issued_at: string } {
+  const issued_at = new Date().toISOString()
+  const id = getGatewayIdentity()
+  const signature = id.sign({ kind: 'settlement_payout_receipt', ...body, issued_at })
+  return { kind: 'settlement_payout_receipt', signature, kid: id.kid, issued_at }
+}
 
 // ── POST /pay/nano/invoice — Create payment request ──
 
@@ -101,6 +131,27 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
 
+  // ── Authorization gate: fail closed until a payout authority model exists ──
+  // Settlement payout disburses gateway-held value to external nano addresses.
+  // Unlike the agent wallet send (wallet.ts), which is gated by an agent's own
+  // active delegation + commerce:send scope + spend_limit, a settlement payout
+  // is a TREASURY disbursement: there is no fromAgentId and no per-agent
+  // delegation to authorize it. The gateway currently has no treasury/tenant
+  // payout authority (no tenant spend cap, no payout delegation, no settlement
+  // approval), so there is no correct authorization to check here yet. Rather
+  // than disburse without authorization, this endpoint is disabled by default
+  // and refuses to send. An operator must set SETTLE_PAYOUT_ENABLED=true to
+  // enable it, and it should only be enabled once a real disbursement authority
+  // gates it. Read from process.env at request time (not module load) so the
+  // posture is explicit per deployment.
+  if (process.env.SETTLE_PAYOUT_ENABLED !== 'true') {
+    return res.status(503).json({
+      error: 'Settlement payout is disabled',
+      reason:
+        'No treasury payout authority is configured, so this endpoint is fail-closed and sends nothing (SETTLE_PAYOUT_ENABLED is not "true"). It must stay disabled until an authorized disbursement gate exists.',
+    })
+  }
+
   try {
     const nano = getNanoRail()
     const settlement = db.prepare(
@@ -136,6 +187,43 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
         continue
       }
 
+      // ── Currency gate (unconditional): the Nano rail pays XNO only ──
+      // A line item denominated in anything else (contributions default to
+      // 'usd', schema.ts) must never be paid out as XNO, and the gateway does
+      // no conversion. Fail closed: deny, record the denial with an explicit
+      // reason and a signed receipt, and never call sendPayment for it.
+      if (item.currency !== RAIL_CURRENCY) {
+        const reason = `currency mismatch: line item "${item.source_id}" is denominated in "${item.currency}", the Nano rail pays ${RAIL_CURRENCY}, and the gateway performs no conversion`
+        const receipt = signSettlementPayoutReceipt({
+          settlement_id: settlement.id, source_id: item.source_id, amount: item.amount,
+          currency: item.currency, destination, decision: 'denied', reason, tx_proof: null,
+        })
+        // Bind NOT-NULL-safe values for the denial ledger row. A structurally
+        // malformed line item (missing amount or currency) still lands here and
+        // must record cleanly, not throw a NOT NULL binding error mid-batch. The
+        // raw (possibly-bad) currency is preserved verbatim in `reason` and the
+        // signed receipt above; this is a denial record, not a relabel, and the
+        // item is never sent.
+        const deniedAmount = Number.isFinite(item.amount) ? item.amount : 0
+        const deniedCurrency = typeof item.currency === 'string' ? item.currency : String(item.currency)
+        db.prepare(`INSERT INTO payment_transactions
+          (id, tenant_id, settlement_id, rail, direction, amount, currency,
+           destination, status, invoice_data)
+          VALUES (?, ?, ?, 'nano', 'outbound', ?, ?, ?, 'denied', ?)`)
+          .run(randomUUID(), tenant.id, settlement.id,
+            deniedAmount, deniedCurrency, destination, JSON.stringify({ reason, receipt }))
+        results.push({
+          source_id: item.source_id,
+          status: 'denied',
+          reason,
+          currency: item.currency,
+          amount: item.amount,
+          destination,
+          receipt,
+        })
+        continue
+      }
+
       try {
         const confirmation = await nano.sendPayment({
           destination,
@@ -143,13 +231,20 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
           memo: `settlement:${settlement.id}:${item.source_id}`,
         })
 
-        // Record outbound transaction
+        const receipt = signSettlementPayoutReceipt({
+          settlement_id: settlement.id, source_id: item.source_id, amount: item.amount,
+          currency: item.currency, destination, decision: 'confirmed', reason: null,
+          tx_proof: confirmation.txProof,
+        })
+        // Record outbound transaction. currency is item.currency, which the
+        // gate above guarantees is XNO, so this records the true unit rather
+        // than a hardcoded label over a possibly-different currency.
         db.prepare(`INSERT INTO payment_transactions
           (id, tenant_id, settlement_id, rail, direction, amount, currency,
-           destination, tx_proof, status, confirmed_at)
-          VALUES (?, ?, ?, 'nano', 'outbound', ?, 'XNO', ?, ?, 'confirmed', datetime('now'))`)
+           destination, tx_proof, status, confirmed_at, invoice_data)
+          VALUES (?, ?, ?, 'nano', 'outbound', ?, ?, ?, ?, 'confirmed', datetime('now'), ?)`)
           .run(randomUUID(), tenant.id, settlement.id,
-            item.amount, destination, confirmation.txProof)
+            item.amount, item.currency, destination, confirmation.txProof, JSON.stringify({ receipt }))
         try { getEventBus().emit(tenant.id, { type: 'payment_created', data: { settlement_id: settlement.id, amount: item.amount, direction: 'outbound', status: 'confirmed' } }) } catch {}
 
         totalPaid += item.amount
@@ -160,6 +255,7 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
           amount_xno: item.amount,
           destination,
           confirmation_time_ms: confirmation.confirmationTimeMs,
+          receipt,
         })
       } catch (e: any) {
         results.push({
@@ -178,6 +274,7 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
       total_paid: Math.round(totalPaid * 10000) / 10000,
       line_items: results.length,
       confirmed: results.filter(r => r.status === 'confirmed').length,
+      denied: results.filter(r => r.status === 'denied').length,
       failed: results.filter(r => r.status === 'failed').length,
       skipped: results.filter(r => r.status === 'skipped').length,
       results,
