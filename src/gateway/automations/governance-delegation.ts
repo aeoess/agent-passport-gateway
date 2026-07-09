@@ -103,6 +103,8 @@ export interface AutomationSelfReceipt {
 interface SdkDelegationFns {
   createDelegation: (opts: any) => any
   subDelegate: (opts: any) => any
+  verifyDelegation: (delegation: any) => { valid: boolean; errors: string[] }
+  publicKeyFromPrivate: (privateKeyHex: string) => string
 }
 let _sdkFns: SdkDelegationFns | null | undefined
 
@@ -110,8 +112,14 @@ async function getSdkDelegationFns(): Promise<SdkDelegationFns | null> {
   if (_sdkFns !== undefined) return _sdkFns
   try {
     const sdk: any = await import('agent-passport-system')
-    if (typeof sdk.createDelegation === 'function' && typeof sdk.subDelegate === 'function') {
-      _sdkFns = { createDelegation: sdk.createDelegation, subDelegate: sdk.subDelegate }
+    const required = ['createDelegation', 'subDelegate', 'verifyDelegation', 'publicKeyFromPrivate']
+    if (required.every(fn => typeof sdk[fn] === 'function')) {
+      _sdkFns = {
+        createDelegation: sdk.createDelegation,
+        subDelegate: sdk.subDelegate,
+        verifyDelegation: sdk.verifyDelegation,
+        publicKeyFromPrivate: sdk.publicKeyFromPrivate,
+      }
     } else {
       _sdkFns = null
     }
@@ -152,9 +160,17 @@ export async function ensureGovernanceRoot(): Promise<{ delegationId: string; ra
   const fns = await getSdkDelegationFns()
   if (!fns) return null
   try {
+    // `delegatedBy` and `delegatedTo` MUST be the public key of the key that signs,
+    // not a human-readable label: the SDK's verifyDelegation checks the signature
+    // against `delegatedBy`, and subDelegate mints the child with
+    // `delegatedBy = parent.delegatedTo`. A label in either field yields a
+    // delegation whose own signature can never verify. The root is self-anchored:
+    // the gateway delegates the governance scopes to itself, then narrows to one
+    // scope per automation.
+    const rootPublicKey = fns.publicKeyFromPrivate(governanceRootKey())
     const raw = fns.createDelegation({
-      delegatedBy: `gateway-governance:${getGatewayIdentity().kid}`,
-      delegatedTo: 'gateway-governance-automations',
+      delegatedBy: rootPublicKey,
+      delegatedTo: rootPublicKey,
       scope: [...GOVERNANCE_ROOT_SCOPES],
       scopeInterpretation: 'hierarchical',
       maxDepth: 2,
@@ -166,6 +182,10 @@ export async function ensureGovernanceRoot(): Promise<{ delegationId: string; ra
       expiresInHours: 24,
       privateKey: governanceRootKey(),
     })
+    // Fail closed on a root we cannot verify, rather than discovering it only when
+    // some later subDelegate happens to check the parent.
+    const status = fns.verifyDelegation(raw)
+    if (!status.valid) return null
     const delegationId = raw?.id ?? raw?.delegationId ?? `gov-root-${getGatewayIdentity().kid}`
     _govRoot = { delegationId, raw }
     return _govRoot
@@ -196,6 +216,12 @@ export async function getAutomationDelegation(
       scope: [scope], // narrow to exactly one scope
       privateKey: governanceRootKey(),
     })
+    // The child is signed with the same governance root key, so its own
+    // `delegatedBy` (inherited from root.delegatedTo) must verify. Check it here:
+    // nothing downstream re-verifies this delegation, so an unverifiable child
+    // would otherwise circulate unnoticed.
+    const status = fns.verifyDelegation(raw)
+    if (!status.valid) return null
     const delegationId = raw?.id ?? raw?.delegationId ?? `${root.delegationId}:${automation}`
     return { automation, scope, delegationId, rootDelegationId: root.delegationId }
   } catch {
