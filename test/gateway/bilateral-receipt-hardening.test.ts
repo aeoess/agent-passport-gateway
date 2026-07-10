@@ -90,7 +90,7 @@ describe('B3 panel hardening', () => {
   it('a fresh, valid, distinct-party receipt still attests (control)', async () => {
     const rq = generateKeyPair(), sv = generateKeyPair()
     reg('cq', rq.publicKey); reg('cs', sv.publicKey)
-    const receipt = createBilateralReceipt({ requestingAgentId: 'cq', servingAgentId: 'cs', outcome: goodOutcome, requestedAt: '2026-06-01T00:00:00.000Z', completedAt: '2026-06-01T00:00:01.000Z', requestingAgentPrivateKey: rq.privateKey, servingAgentPrivateKey: sv.privateKey })
+    const receipt = createBilateralReceipt({ requestingAgentId: 'cq', servingAgentId: 'cs', outcome: goodOutcome, requestedAt: '2026-06-01T00:00:00.000Z', completedAt: '2026-06-01T00:00:01.000Z', requestingAgentPrivateKey: rq.privateKey, servingAgentPrivateKey: sv.privateKey, aud: { profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${TENANT}`] } })
     const r = await post('/receipts/bilateral', { receipt })
     const body = await r.json() as any
     assert.equal(r.status, 201, JSON.stringify(body))

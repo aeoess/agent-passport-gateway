@@ -1,46 +1,41 @@
 {
-  "_provenance": {
-    "generator": "agent-passport-system createBilateralReceipt (real Ed25519 signer)",
-    "sdk_version": "2.6.0-alpha.3",
-    "generated_at": "2026-07-01T00:00:00.000Z",
-    "note": "Throwaway test keys. Frozen vector; the gateway re-verifies it via verifyBilateralReceipt. Do not regenerate casually - the receipt bytes are the golden preimage.",
-    "self_check": {
-      "valid": true,
-      "requestingAgentSignatureValid": true,
-      "servingAgentSignatureValid": true,
-      "gatewaySignatureValid": null,
-      "outcomeConsistent": true,
-      "timingValid": true,
-      "errors": []
-    }
-  },
-  "requestingAgentId": "golden-requester",
-  "servingAgentId": "golden-server",
-  "requestingPublicKey": "6ed16dc19ee092842bab8cd276a5ae42011deb248062e4b514af1826c5c6dec3",
-  "servingPublicKey": "d8a013ebe9b126745be2acc75d75e63d21b56be25acb2c62d640409c3c5dc736",
-  "requestingPrivateKey": "31d63b1cfe43dacaae08633a0d0ffb30b369e727ef3c3300cb2d98b4f0b3e5da",
-  "servingPrivateKey": "4c74762a1fe7bf3b2c1222b2656d6ee3c68463b6f6b479955905e023ee965097",
+  "_provenance": "Generated 2026-07-10 by SDK branch feat/bilateral-pair (createBilateralReceipt with FREEZE-VWE F1 action_ref slot + audience binding). action_ref is the real computeActionRef over {agentId: requestingAgentId, actionType: outcome.toolName, scopeRequired: [commerce:read, commerce:write], timestamp: requestedAt}. aud recipients name the two test tenants (aps-tenant: + tenant_id, the F3 registry-derived recipient convention). Signable bytes carry no null values, no numbers, ASCII only: strict RFC 8785 serialization and the SDK canonicalize (which omits absent keys) coincide on this vector, verified independently by tools/verify-bilateral-independent.py. Test keys only; never production key material.",
+  "requestingAgentId": "did:aps:zGoldenRequester01",
+  "servingAgentId": "did:aps:zGoldenServer01",
+  "requestingPublicKey": "e09493e5185aa4723692ebafc1ca1b89f3a86f89b9cf503a311249cd98cb0549",
+  "servingPublicKey": "8897f2116a4b303a4fe17b3a762e51c13e7805a4f21df7648a706ae998f9d22a",
+  "requestingPrivateKey": "3754d266ba424b1ff55dc8ae8c89c1ad32b96caba21f01f518d2656b649dca66",
+  "servingPrivateKey": "da02bb705faf44e334b658c895cb4c8951bd590f1c0358d787cb9e3332ebd55f",
+  "recipientIds": [
+    "aps-tenant:tnt_blr",
+    "aps-tenant:tnt_blr_h"
+  ],
+  "canonical": "{\"action_ref\":\"f5d65096425efbf5d721e20fe35bc2e8c5146c3ff570a64c589f7b5f1eef3319\",\"agreedAt\":\"2026-07-10T07:54:13.636Z\",\"aud\":{\"profile\":\"aps:audience-binding:v1\",\"recipients\":[\"aps-tenant:tnt_blr\",\"aps-tenant:tnt_blr_h\"]},\"completedAt\":\"2026-07-10T03:00:01Z\",\"outcome\":{\"requestHash\":\"5f2d6c1a0b3e4d5c6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e\",\"responseHash\":\"9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d\",\"status\":\"success\",\"summary\":\"preflight authorized\",\"toolName\":\"commerce_preflight\"},\"receiptId\":\"311f7d08-b1b1-47a1-adee-f2860d263615\",\"requestedAt\":\"2026-07-10T03:00:00Z\",\"requestingAgentId\":\"did:aps:zGoldenRequester01\",\"servingAgentId\":\"did:aps:zGoldenServer01\",\"version\":\"1.0\"}",
+  "canonical_sha256": "a4da28e3868597816c9a5e87d2a4c7105e7f228355c41b31aeae2319f84805e4",
   "receipt": {
-    "receiptId": "a9c5da56-7f70-4cf7-a233-057bf21e0918",
+    "receiptId": "311f7d08-b1b1-47a1-adee-f2860d263615",
     "version": "1.0",
-    "requestingAgentId": "golden-requester",
-    "servingAgentId": "golden-server",
-    "delegationId": "del-golden-1",
+    "requestingAgentId": "did:aps:zGoldenRequester01",
+    "servingAgentId": "did:aps:zGoldenServer01",
     "outcome": {
-      "toolName": "commerce:checkout",
-      "requestHash": "req-hash-8f3a",
-      "responseHash": "resp-hash-2b7c",
+      "toolName": "commerce_preflight",
+      "requestHash": "5f2d6c1a0b3e4d5c6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e",
+      "responseHash": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d",
       "status": "success",
-      "summary": "checkout completed",
-      "spend": {
-        "amount": 12.5,
-        "currency": "USD"
-      }
+      "summary": "preflight authorized"
     },
-    "requestedAt": "2026-06-01T12:00:00.000Z",
-    "completedAt": "2026-06-01T12:00:03.000Z",
-    "agreedAt": "2026-07-01T21:38:18.859Z",
-    "requestingAgentSignature": "d3239bb684d848592961bdd3e9528f6125b72f4cd9276e162c463124f1a67aacb0571e0c32e1c654754d31f1f35550ed9ed9a3d56655a21dbb84605cb6cd6002",
-    "servingAgentSignature": "7790e0e5307198359557bb985b889f24bfabd34410cb40526e7466784e8b7abe9b73ea8cae8b560d94a801e8bf954609985859b7240a0c1fd98aff39bcf64808"
+    "requestedAt": "2026-07-10T03:00:00Z",
+    "completedAt": "2026-07-10T03:00:01Z",
+    "agreedAt": "2026-07-10T07:54:13.636Z",
+    "aud": {
+      "profile": "aps:audience-binding:v1",
+      "recipients": [
+        "aps-tenant:tnt_blr",
+        "aps-tenant:tnt_blr_h"
+      ]
+    },
+    "action_ref": "f5d65096425efbf5d721e20fe35bc2e8c5146c3ff570a64c589f7b5f1eef3319",
+    "requestingAgentSignature": "62dd7651b808b9aaca1f99ba1426557b50000cbba21ab9d398f5414b39f09e4ed55dc78be7a470b98583911e3cf8d68f2c221e9b684fb04bdb529e952f16980d",
+    "servingAgentSignature": "20fdeff5a65f3e3e688a27d1940780f417725ec4b81149022704a332849875ace3d9571991713c809b4b09898138908c220c371ae5adb756e2c6d9bd64212607"
   }
 }

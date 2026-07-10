@@ -109,6 +109,8 @@ describe('B3 bilateral receipt verification', () => {
       outcome: { toolName: 't', requestHash: 'rq', responseHash: 'rs', status: 'success', summary: 'ok' },
       requestedAt: '2026-06-01T00:00:00.000Z', completedAt: '2026-06-01T00:00:01.000Z',
       requestingAgentPrivateKey: GOLDEN.requestingPrivateKey, servingAgentPrivateKey: GOLDEN.servingPrivateKey,
+      // F3: the route requires an audience binding naming this tenant.
+      aud: { profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${TENANT}`] },
     })
     const oneSided = { ...fresh, servingAgentSignature: '' }
     const r = await post('/receipts/bilateral', { receipt: oneSided })
@@ -128,5 +130,64 @@ describe('B3 bilateral receipt verification', () => {
   it('rejects a missing or malformed receipt body', async () => {
     assert.equal((await post('/receipts/bilateral', {})).status, 400)
     assert.equal((await post('/receipts/bilateral', { receipt: 'not-an-object' })).status, 400)
+  })
+})
+
+// F3 (FREEZE-VWE): route-side audience evaluation, requireAudience true. The recipient
+// identifier is derived from the tenant key registry partition (agents.tenant_id via the
+// authenticated tenant), never from request input. Pass / mismatch / absent-when-required.
+describe('F3 route audience gate', () => {
+  const mint = (aud?: { profile: 'aps:audience-binding:v1'; recipients: string[] }) =>
+    createBilateralReceipt({
+      requestingAgentId: GOLDEN.requestingAgentId, servingAgentId: GOLDEN.servingAgentId,
+      outcome: { toolName: 't', requestHash: 'rq', responseHash: 'rs', status: 'success', summary: 'ok' },
+      requestedAt: '2026-06-02T00:00:00.000Z', completedAt: '2026-06-02T00:00:01.000Z',
+      requestingAgentPrivateKey: GOLDEN.requestingPrivateKey, servingAgentPrivateKey: GOLDEN.servingPrivateKey,
+      aud,
+    })
+
+  it('pass: a receipt audience-bound to THIS tenant stores attested', async () => {
+    const receipt = mint({ profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${TENANT}`] })
+    const r = await post('/receipts/bilateral', { receipt })
+    const body = await r.json() as any
+    assert.equal(r.status, 201, JSON.stringify(body))
+    assert.equal(body.status, 'attested')
+  })
+
+  it('[ATTACK] mismatch: a receipt bound to ANOTHER tenant is rejected 403 with a machine-readable code', async () => {
+    const before = countRows()
+    const receipt = mint({ profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${OTHER}`] })
+    const r = await post('/receipts/bilateral', { receipt })
+    const body = await r.json() as any
+    assert.equal(r.status, 403, JSON.stringify(body))
+    assert.equal(body.code, 'audience_mismatch')
+    assert.equal(body.facet, 'audience')
+    assert.equal(countRows(), before, 'a cross-tenant receipt must never be stored')
+  })
+
+  it('[ATTACK] absent-when-required: an audience-unbound receipt is rejected 403 fail-closed', async () => {
+    const before = countRows()
+    const receipt = mint(undefined)
+    const r = await post('/receipts/bilateral', { receipt })
+    const body = await r.json() as any
+    assert.equal(r.status, 403, JSON.stringify(body))
+    assert.equal(body.code, 'audience_required_absent')
+    assert.equal(body.facet, 'audience')
+    assert.equal(countRows(), before, 'an unbound receipt must never be stored')
+  })
+
+  it('[ATTACK] malformed: an empty recipients set is rejected 403, never treated as any-recipient', async () => {
+    const receipt = mint({ profile: 'aps:audience-binding:v1', recipients: [] as unknown as string[] })
+    const r = await post('/receipts/bilateral', { receipt })
+    const body = await r.json() as any
+    assert.equal(r.status, 403, JSON.stringify(body))
+    assert.equal(body.code, 'audience_malformed')
+  })
+
+  it('[ATTACK] re-targeting the aud after signing breaks the signatures (aud is in the signed body)', async () => {
+    const receipt = mint({ profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${OTHER}`] })
+    const retargeted = { ...receipt, aud: { profile: 'aps:audience-binding:v1', recipients: [`aps-tenant:${TENANT}`] } }
+    const r = await post('/receipts/bilateral', { receipt: retargeted })
+    assert.equal(r.status, 400, await r.text())
   })
 })

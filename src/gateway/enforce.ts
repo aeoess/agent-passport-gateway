@@ -882,6 +882,51 @@ gatewayRouter.post('/receipt', (req: any, res) => {
 //   * status is 'attested' only when BOTH sides verify; a legitimately one-sided
 //     receipt (exactly one present-and-valid signature, the other absent) stores
 //     'partial_attestation'; a receipt with no valid signature is rejected.
+//   * F3 (FREEZE-VWE): the signed body must carry an audience binding naming THIS
+//     tenant's recipient identifier; requireAudience is TRUE on this route. See
+//     checkReceiptAudienceForTenant below.
+
+// F3 (FREEZE-VWE) route-side audience evaluation, fail closed. Mirrors the SDK's
+// checkAudience mapping (agent-passport-system src/v2/audience-binding/verify.ts)
+// with requireAudience hardwired true. The SDK package export map does not expose
+// the audience module yet (index export lines are the T9 single-writer item, F8),
+// so this local mirror keeps the reason codes wire-compatible and is swapped for
+// the SDK import when the export lands. Reason codes are the SDK's own:
+// audience_required_absent | audience_malformed | audience_mismatch.
+function checkReceiptAudienceForTenant(
+  aud: unknown,
+  recipientId: string,
+): { ok: boolean; code: string; message: string } {
+  if (aud === undefined || aud === null) {
+    return {
+      ok: false,
+      code: 'audience_required_absent',
+      message: 'This route requires an audience binding naming this tenant; the receipt has none',
+    }
+  }
+  const a = aud as { profile?: unknown; recipients?: unknown }
+  if (
+    a.profile !== 'aps:audience-binding:v1' ||
+    !Array.isArray(a.recipients) ||
+    a.recipients.length === 0 ||
+    a.recipients.some((r: unknown) => typeof r !== 'string' || r.length === 0)
+  ) {
+    return {
+      ok: false,
+      code: 'audience_malformed',
+      message: 'Audience binding is present but malformed (wrong profile, empty, or ill-formed recipients)',
+    }
+  }
+  if (!(a.recipients as string[]).includes(recipientId)) {
+    return {
+      ok: false,
+      code: 'audience_mismatch',
+      message: 'Receipt is not audience-bound to this tenant',
+    }
+  }
+  return { ok: true, code: 'audience_match', message: 'ok' }
+}
+
 gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
  try {
   // R3-0 (round-2 Consilium): OFF by default. The signed BilateralReceipt body carries no audience/
@@ -956,6 +1001,22 @@ gatewayRouter.post('/receipts/bilateral', (req: any, res) => {
   // requestedAt (verifyBilateralReceipt.timingValid=false) is not a valid attestation.
   if (!v.timingValid) {
     return res.status(400).json({ error: 'Receipt timing is invalid (completed or agreed before requested); rejected' })
+  }
+
+  // F3 (FREEZE-VWE): audience gate, fail closed. The recipient identifier is DERIVED from the
+  // tenant key registry partition: agents.tenant_id, i.e. the authenticated tenant row id that
+  // already scopes every registry lookup above. It is NEVER read from request input, so a valid
+  // receipt minted for tenant A cannot replay into tenant B (the F2 cross-tenant gap that kept
+  // this route dark). The aud slot is inside the signed body: re-targeting it breaks the
+  // signatures checked above. Machine-readable code + facet in the rejection.
+  const audienceRecipientId = `aps-tenant:${tenant.id}`
+  const audCheck = checkReceiptAudienceForTenant(receipt.aud, audienceRecipientId)
+  if (!audCheck.ok) {
+    return res.status(403).json({
+      error: `Audience check failed: ${audCheck.message}`,
+      code: audCheck.code,
+      facet: 'audience',
+    })
   }
 
   const reqValid = hasReq && v.requestingAgentSignatureValid
