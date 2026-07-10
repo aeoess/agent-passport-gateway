@@ -1378,7 +1378,7 @@ gatewayRouter.get('/passport/:agentId/trust-profile', (req: any, res) => {
     `SELECT COUNT(*) as c FROM receipts WHERE tenant_id = ? AND agent_id = ?`
   ).get(tenant.id, agentId) as any).c
   const deniedCount = (db.prepare(
-    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'DENY'`
+    `SELECT COUNT(*) as c FROM policy_evaluations WHERE tenant_id = ? AND agent_id = ? AND verdict = 'deny'`
   ).get(tenant.id, agentId) as any).c
 
   // Data contribution receipts
