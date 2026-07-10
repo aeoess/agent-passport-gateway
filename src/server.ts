@@ -1152,10 +1152,10 @@ function computeContinuityScore(db: any, tenantId: string, agentId: string, ageD
   const activityScore = Math.round(Math.max(0, Math.min(40, 40 * (1 - Math.min(cv, 2) / 2))))
 
   // 2. Behavioral Consistency (0-30): recent denial rate vs historical
-  const totalDenials = evals.filter(e => e.verdict === 'DENY').length
+  const totalDenials = evals.filter(e => e.verdict === 'deny').length
   const historicalDenialRate = totalDenials / evals.length
   const recentEvals = evals.slice(0, Math.min(10, evals.length))
-  const recentDenials = recentEvals.filter(e => e.verdict === 'DENY').length
+  const recentDenials = recentEvals.filter(e => e.verdict === 'deny').length
   const recentDenialRate = recentDenials / recentEvals.length
   const denialDrift = Math.abs(recentDenialRate - historicalDenialRate)
   // drift < 0.1 = consistent, drift > 0.3 = behavioral shift
