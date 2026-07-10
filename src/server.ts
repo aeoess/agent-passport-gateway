@@ -68,6 +68,7 @@ import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
+import { CONFORMANCE_SUMMARY, conformanceBadge } from './gateway/conformance-summary.js'
 import { eventsRouter, getEventBus } from './gateway/events.js'
 import { riskQueueRouter } from './gateway/risk-queue.js'
 import { sessionsRouter } from './gateway/sessions.js'
@@ -934,10 +935,11 @@ app.get('/api/v1/public/recent-decisions', async (req, res) => {
 // Public conformance status.
 //
 // The APS conformance suite at github.com/aeoess/aps-conformance-suite ships
-// 37 byte-identical fixture vectors across 4 categories. The gateway's
-// runtime canonicalization + signature paths are tested against the same
-// vectors in CI. This endpoint exposes the current pass count so the
-// dashboard can read it without scraping GitHub.
+// fixture vectors across several categories (see CONFORMANCE_SUMMARY below for
+// the current per-category tally). The gateway's runtime canonicalization +
+// signature paths are tested against the same vectors in CI. This endpoint
+// exposes the current pass count so the dashboard can read it without scraping
+// GitHub.
 //
 // The numbers are sourced from a single hand-edited constant — when the
 // fixture set grows, bump the constant; CI ensures the code actually
@@ -947,34 +949,22 @@ const publicConformanceLimiter = new RateLimiterMemory({
   points: 60, duration: 60, keyPrefix: 'public_conformance',
 })
 
+// Single source of truth for the public conformance surface lives in
+// ./gateway/conformance-summary.js. Both the JSON endpoint and the shields
+// badge derive from the same CONFORMANCE_SUMMARY object; there is no second
+// hardcoded copy. Re-exported here for existing importers of server.ts.
+export { CONFORMANCE_SUMMARY, conformanceBadge } from './gateway/conformance-summary.js'
+
 app.get('/api/v1/public/conformance', async (req, res) => {
   try { await publicConformanceLimiter.consume(req.ip || 'unknown') }
   catch { return res.status(429).json({ error: 'Rate limit exceeded.' }) }
+  res.json(CONFORMANCE_SUMMARY)
+})
 
-  const data = {
-    repo:        'https://github.com/aeoess/aps-conformance-suite',
-    categories: [
-      { name: 'bilateral-delegation',  total: 10, passing: 10 },
-      { name: 'inference-session',     total: 7,  passing: 7  },
-      { name: 'instruction-provenance',total: 10, passing: 10 },
-      { name: 'aivss-scenarios',       total: 10, passing: 10 },
-      { name: 'canonical-bytes',       total: 1,  passing: 0, skipped: 1 },
-      { name: 'accountability-record', total: 12, passing: 12 },
-      { name: 'read-fidelity-receipt', total: 9,  passing: 9  },
-      { name: 'actionref-canonical',   total: 4,  passing: 0, skipped: 4 },
-      { name: 'bilateral-pair',        total: 6,  passing: 0, skipped: 6 },
-      { name: 'bilateral-golden',      total: 2,  passing: 2 },
-    ],
-    total_vectors:   71,
-    passing_vectors: 60,
-    failing_vectors: 0,
-    skipped_vectors: 11,
-    last_verified:  '2026-07-10',  // Bumped on each conformance-suite commit
-    rfc_8785_jcs:   true,
-    ed25519_signed: true,
-    notes: 'Canonicalization-contract vectors are byte-identical, JCS canonicalized, and Ed25519 signature-verified by the suite runner; expected-value vector classes (reported skipped by the runner) are verified upstream and by cross-language parity. Zero failures. Reproducible from fixed seeds.',
-  }
-  res.json(data)
+app.get('/api/v1/public/conformance/badge', async (req, res) => {
+  try { await publicConformanceLimiter.consume(req.ip || 'unknown') }
+  catch { return res.status(429).json({ error: 'Rate limit exceeded.' }) }
+  res.json(conformanceBadge())
 })
 
 // ═══════════════════════════════════════
