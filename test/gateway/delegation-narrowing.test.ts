@@ -68,4 +68,21 @@ describe('checkDelegationNarrowing', () => {
     // child depth 2 <= 3
     assert.equal(checkDelegationNarrowing(shallow, { scope: ['commerce:checkout'], spend_limit: 10, max_depth: 3 }).ok, true)
   })
+
+  it('rejects an absent (null) child spend_limit under a spend-bounded parent (P1 widening)', () => {
+    // Money-path narrowing violation: the parent carries a bounded spend budget, but the child
+    // omits spend_limit (null). At enforcement time a null spend_limit is treated as unlimited, so
+    // a null child would WIDEN a bounded ancestor to unbounded spend. Monotonic narrowing forbids
+    // this: authority can only decrease. The child must carry an explicit bound.
+    const r = checkDelegationNarrowing(parent, { scope: ['commerce:checkout'], spend_limit: null, max_depth: 1 })
+    assert.equal(r.ok, false, 'a null child spend_limit under a bounded parent must not widen the bound')
+    assert.match(r.violations.join(' '), /unbounded|absent|widen/i)
+  })
+
+  it('still allows an absent (null) child spend_limit when NO ancestor carries a bound', () => {
+    // If the parent itself has no spend bound, introducing a bound is narrowing (allowed) and
+    // leaving the child unbounded introduces no widening (there was no bound to widen). Preserve it.
+    const unbounded = { scope: 'commerce:checkout', spend_limit: null, spend_used: 0, max_depth: 3, current_depth: 1 }
+    assert.equal(checkDelegationNarrowing(unbounded, { scope: ['commerce:checkout'], spend_limit: null, max_depth: 3 }).ok, true)
+  })
 })
