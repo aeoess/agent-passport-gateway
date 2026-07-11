@@ -22,7 +22,7 @@ import {
   clearRootTransitionStores,
   // Types
   type PolicyContext,
-} from '../src/v2/index.js'
+} from './v2-surface.js'
 
 const pc: PolicyContext = {
   policy_version: '1.0', values_floor_version: '1.0',
@@ -486,7 +486,7 @@ import {
   recordPipelineAction, auditCompositeCapabilities,
   getCompositeFlags, isAgentInLaunderingPipeline,
   clearCompositeAuditStores,
-} from '../src/v2/index.js'
+} from './v2-surface.js'
 
 describe('v2 Semantic Drift Detection', () => {
   beforeEach(() => clearSemanticDriftStores())
@@ -679,7 +679,7 @@ import {
   getGovernanceDriftFlags, reviewGovernanceDriftFlag,
   clearGovernanceDriftStores,
   type ChangeDirection,
-} from '../src/v2/index.js'
+} from './v2-surface.js'
 
 describe('v2 Governance Drift Tracking', () => {
   beforeEach(() => clearGovernanceDriftStores())

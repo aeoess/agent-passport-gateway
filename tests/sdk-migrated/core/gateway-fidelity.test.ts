@@ -10,19 +10,19 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createProxyGateway } from '../src/core/gateway.js'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
-import { clearStores } from '../src/core/delegation.js'
-import type { GatewayConfig, FidelityAttestation } from '../src/types/gateway.js'
+import { createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { clearStores } from 'agent-passport-system'
+import type { GatewayConfig, FidelityAttestation } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(__dirname + '/../values/floor.yaml', 'utf-8')
+const floorYaml = readFileSync(__dirname + '/../../../node_modules/agent-passport-system/values/floor.yaml', 'utf-8')
 const floor = loadFloor(floorYaml)
 
 function createFidelitySetup(opts: {

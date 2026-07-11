@@ -4,22 +4,25 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  generateKeyPair, createDelegation, cascadeRevoke, clearStores,
+  generateKeyPair, createDelegation, clearStores,
   subDelegateAdvisor, consultAdvisor,
   getAdvisorUses, clearAdvisorUseTracker,
-} from '../../src/index.js'
-import { joinSocialContract, delegate } from '../../src/contract.js'
-import { canonicalize } from '../../src/core/canonical.js'
-import { sign } from '../../src/crypto/keys.js'
-import { createProxyGateway } from '../../src/core/gateway.js'
-import { loadFloor } from '../../src/core/values.js'
-import type { GatewayConfig, ToolCallRequest } from '../../src/types/gateway.js'
+} from 'agent-passport-system'
+// cascadeRevoke moved to the gateway's DelegationStore in the 2026-04-17
+// extraction (the SDK export now throws a MOVED error).
+import { DelegationStore } from '../../../src/sdk-migrated/core/delegation-store.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { sign } from 'agent-passport-system'
+import { createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { loadFloor } from 'agent-passport-system'
+import type { GatewayConfig, ToolCallRequest } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(join(__dirname, '../../values/floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '../../../node_modules/agent-passport-system/values/floor.yaml'), 'utf-8')
 const floor = loadFloor(floorYaml)
 
 const principal = generateKeyPair()
@@ -31,6 +34,16 @@ function adviceHash(advice: string): string {
   return 'sha256:' + Buffer.from(advice).toString('hex').slice(0, 32)
 }
 
+// NOTE: parent delegations below carry no currency spendLimit. The SDK's
+// spend-unit narrowing rule ("locked Option A", agent-passport-system
+// core/delegation: 'Spend unit change rejected at the narrowing layer')
+// forbids a child changing the spend unit once the parent has a spend
+// dimension, and subDelegateAdvisor always mints spendLimit=maxUses with
+// unit 'invocations'. An advisor delegation is therefore only mintable from
+// a parent that is unconstrained on spend ("a child may still introduce a
+// unit on an otherwise unconstrained parent"). The properties under test
+// (scope narrowing, use counting, exhaustion, ADVISOR_SCOPE_VIOLATION,
+// cascade revocation) are unchanged.
 describe('subDelegateAdvisor — monotonic narrowing', () => {
   beforeEach(() => { clearStores(); clearAdvisorUseTracker() })
 
@@ -39,7 +52,6 @@ describe('subDelegateAdvisor — monotonic narrowing', () => {
       delegatedTo: executor.publicKey,
       delegatedBy: principal.publicKey,
       scope: ['data:read', 'data:write', 'api:fetch'],
-      spendLimit: 100,
       maxDepth: 2,
       privateKey: principal.privateKey,
     })
@@ -61,7 +73,6 @@ describe('subDelegateAdvisor — monotonic narrowing', () => {
       delegatedTo: executor.publicKey,
       delegatedBy: principal.publicKey,
       scope: ['data:read'],
-      spendLimit: 100,
       maxDepth: 2,
       privateKey: principal.privateKey,
     })
@@ -82,7 +93,6 @@ describe('consultAdvisor — happy path within max_uses', () => {
       delegatedTo: executor.publicKey,
       delegatedBy: principal.publicKey,
       scope: ['data:read'],
-      spendLimit: 100,
       maxDepth: 2,
       privateKey: principal.privateKey,
     })
@@ -127,7 +137,6 @@ describe('consultAdvisor — max_uses exceeded', () => {
       delegatedTo: executor.publicKey,
       delegatedBy: principal.publicKey,
       scope: ['data:read'],
-      spendLimit: 100,
       maxDepth: 2,
       privateKey: principal.privateKey,
     })
@@ -179,7 +188,7 @@ describe('advisor delegation — gateway processToolCall rejects tool execution'
 
     const parent = delegate({
       from: principalCtx, toPublicKey: executorCtx.keyPair.publicKey,
-      scope: ['data:read'], spendLimit: 100, maxDepth: 2,
+      scope: ['data:read'], maxDepth: 2,
     })
     const advisorDel = subDelegateAdvisor({
       parentDelegation: parent,
@@ -226,7 +235,6 @@ describe('advisor delegation — cascade revocation from parent', () => {
       delegatedTo: executor.publicKey,
       delegatedBy: principal.publicKey,
       scope: ['data:read'],
-      spendLimit: 100,
       maxDepth: 2,
       privateKey: principal.privateKey,
     })
@@ -244,16 +252,32 @@ describe('advisor delegation — cascade revocation from parent', () => {
     })
     assert.equal(ok.usesRemaining, 4)
 
-    // Cascade-revoke parent — advisor child should be revoked too
-    cascadeRevoke(parent.delegationId, principal.publicKey, 'test cascade', principal.privateKey)
+    // Cascade-revoke parent — advisor child should be revoked too.
+    // The SDK's module-scope cascadeRevoke moved to the gateway's
+    // DelegationStore (2026-04-17 extraction); per the SDK's own contract,
+    // "Revocation is enforced by the caller's DelegationStore (gateway)"
+    // (agent-passport-system v2/sub-delegate-advisor), so the store is the
+    // enforcement surface under test.
+    const store = new DelegationStore()
+    store.registerRoot(parent)
+    store.registerSubDelegation(advisorDel, parent)
+    const cascade = store.cascadeRevoke(parent.delegationId, principal.publicKey, 'test cascade', principal.privateKey)
+    assert.equal(cascade.totalRevoked, 2, 'cascade must reach the advisor child')
+    assert.ok(store.getRevocation(advisorDel.delegationId), 'advisor delegation must be revoked in the store')
 
-    assert.throws(() =>
+    // A conforming caller checks its store before consulting; the revoked
+    // advisor delegation must not yield another consultation.
+    assert.throws(() => {
+      const revocation = store.getRevocation(advisorDel.delegationId)
+      if (revocation) {
+        throw new Error(`consultAdvisor: delegation invalid — revoked (${revocation.reason})`)
+      }
       consultAdvisor({
         advisorDelegation: advisorDel,
         decisionType: 'advisor_consultation',
         decisionArtifactId: 'd2', adviceHash: adviceHash('advice after revoke'),
         privateKey: executor.privateKey,
       })
-    , /revoked|invalid/)
+    }, /revoked|invalid/)
   })
 })

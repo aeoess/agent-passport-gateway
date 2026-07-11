@@ -13,11 +13,11 @@ import {
   createFidelityAttestation, verifyFidelityAttestation,
   shouldProbe, fidelityDelta,
   DEFAULT_PROBE_SCHEDULE,
-} from '../src/core/fidelity-probe.js'
+} from 'agent-passport-system'
 import type {
   FidelityChallenge, FidelityResponse, FidelityScore,
-} from '../src/core/fidelity-probe.js'
-import { generateKeyPair } from '../src/crypto/keys.js'
+} from 'agent-passport-system'
+import { generateKeyPair } from 'agent-passport-system'
 
 // ── Test Fixtures ──
 
@@ -318,16 +318,16 @@ describe('Fidelity Probe — Gateway Integration', () => {
     // 5. Gateway enforces
 
     // We reuse the gateway setup from gateway-fidelity tests
-    const { createProxyGateway } = await import('../src/core/gateway.js')
-    const { joinSocialContract, delegate } = await import('../src/contract.js')
-    const { loadFloor } = await import('../src/core/values.js')
-    const { clearStores } = await import('../src/core/delegation.js')
+    const { createProxyGateway } = await import('../../../src/sdk-migrated/core/proxy-gateway.js')
+    const { joinSocialContract, delegate } = await import('agent-passport-system')
+    const { loadFloor } = await import('agent-passport-system')
+    const { clearStores } = await import('agent-passport-system')
     const { readFileSync } = await import('fs')
     const { dirname } = await import('path')
     const { fileURLToPath } = await import('url')
 
     const __dir = dirname(fileURLToPath(import.meta.url))
-    const floorYaml = readFileSync(__dir + '/../values/floor.yaml', 'utf-8')
+    const floorYaml = readFileSync(__dir + '/../../../node_modules/agent-passport-system/values/floor.yaml', 'utf-8')
     const floor = loadFloor(floorYaml)
     clearStores()
 
@@ -361,8 +361,8 @@ describe('Fidelity Probe — Gateway Integration', () => {
     gateway.registerAgent(agent.passport, agent.attestation, [del])
 
     // Step 1: Agent starts with no attestation → denied (policy=deny)
-    const { canonicalize } = await import('../src/core/canonical.js')
-    const { sign } = await import('../src/crypto/keys.js')
+    const { canonicalize } = await import('agent-passport-system')
+    const { sign } = await import('agent-passport-system')
     let reqCounter = 0
     function makeReq() {
       const requestId = `probe-int-${++reqCounter}-${Date.now()}`

@@ -17,8 +17,11 @@ import {
   completeTask, createTaskUnit, assignTask, acceptTask,
   submitDeliverable, handoffEvidence,
   // Attribution (to verify commerce receipts flow in)
-  computeAttribution, traceBeneficiary,
+  traceBeneficiary,
 } from 'agent-passport-system'
+// computeAttribution moved to the gateway in the 2026-04-17 extraction
+// (src/sdk-migrated/core/attribution-reports.ts)
+import { computeAttribution } from '../../../src/sdk-migrated/core/attribution-reports.js'
 import {
   commerceWithIntent,
   commerceReceiptToActionReceipt,
@@ -394,7 +397,15 @@ describe('Commerce → Attribution', () => {
 
     assert.equal(trace.beneficiary, 'tymofii-pidlisnyi')
     assert.equal(trace.executorAgent, 'agent-tracer')
-    assert.ok(trace.verified, 'Trace should be verified')
+    // SDK drift (intentional): `verified` is now a cryptographic claim — the
+    // receipt must be signed by the tail executor (agent-passport-system
+    // core/attribution.ts: "resolved: the previous semantics, honestly
+    // renamed. Lookup success only, no cryptographic claim."). This
+    // hand-rolled receipt carries a placeholder signature, so the lookup
+    // claim this test originally made now lives in `resolved`, and
+    // `verified` must be false for an unsigned receipt.
+    assert.ok(trace.resolved, 'Trace should resolve (lookup-level; formerly `verified`)')
+    assert.equal(trace.verified, false, 'placeholder signature must not verify cryptographically')
   })
 })
 

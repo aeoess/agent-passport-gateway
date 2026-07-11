@@ -7,13 +7,13 @@
 
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { ProxyGateway, createProxyGateway } from '../src/core/gateway.js'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
-import { revokeDelegation, clearStores } from '../src/core/delegation.js'
-import type { ToolCallRequest, ToolExecutor, GatewayConfig } from '../src/types/gateway.js'
+import { ProxyGateway, createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { clearStores } from 'agent-passport-system'
+import type { ToolCallRequest, ToolExecutor, GatewayConfig } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
@@ -21,7 +21,7 @@ import { fileURLToPath } from 'url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ── Test helpers ──
-const floorYaml = readFileSync(join(__dirname, '..', 'values', 'floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '..', '..', '..', 'node_modules', 'agent-passport-system', 'values', 'floor.yaml'), 'utf-8')
 const floor = loadFloor(floorYaml)
 
 const mockExecutor: ToolExecutor = async (tool, params) => ({ success: true, result: { tool, params } })
@@ -243,7 +243,9 @@ describe('Constraint Architecture — Structured Denials', () => {
   it('revocation denial has facet=revocation code=REVOKED_AT_EXECUTION', async () => {
     const { gateway, makeRequest, del, principal } = createTestSetup()
     // Revoke the delegation
-    revokeDelegation(del.delegationId, principal.publicKey, 'test revoke', principal.keyPair.privateKey)
+    // Revocation registry lives on the gateway's DelegationStore since the
+    // 2026-04-17 extraction (src/sdk-migrated/core/delegation-store.ts).
+    gateway.delegationStore.revokeDelegation(del.delegationId, principal.publicKey, 'test revoke', principal.keyPair.privateKey)
     const result = await gateway.processToolCall(makeRequest())
 
     assert.strictEqual(result.executed, false)
