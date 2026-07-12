@@ -1,20 +1,20 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { loadFloor } from '../src/core/values.js'
-import { clearStores, createDelegation } from '../src/core/delegation.js'
-import { createProxyGateway } from '../src/core/gateway.js'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { clearStores, createDelegation } from 'agent-passport-system'
+import { createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
 import {
   createTaintLabel, createExecutionFrame, recordAccess,
   closeFrame, rotateFrame, verifyFrameChain, isFrameExpired,
   checkDataFlow, createCrossChainPermit, countersignPermit,
   deriveSAO, createSAO
-} from '../src/core/cross-chain.js'
+} from 'agent-passport-system'
 import * as fs from 'node:fs'
 
-const floorYaml = fs.readFileSync('values/floor.yaml', 'utf-8')
+const floorYaml = fs.readFileSync('node_modules/agent-passport-system/values/floor.yaml', 'utf-8')
 const floor = loadFloor(floorYaml)
 
 function setup(opts?: { crossChain?: boolean; frameTTL?: number }) {

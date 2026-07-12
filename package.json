@@ -8,7 +8,7 @@
     "copy-assets": "mkdir -p dist/gateway/regulated-action && cp src/gateway/regulated-action/*.mjs dist/gateway/regulated-action/",
     "start": "node dist/server.js",
     "dev": "npx tsx src/server.ts",
-    "test": "npx tsx --test test/*.test.ts test/**/*.test.ts",
+    "test": "npx tsx --test test/*.test.ts test/**/*.test.ts tests/sdk-migrated/*.test.ts tests/sdk-migrated/**/*.test.ts",
     "seed:bound-demo": "tsx scripts/seed-bound-demo.ts"
   },
   "keywords": [],

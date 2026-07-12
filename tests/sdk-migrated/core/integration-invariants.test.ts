@@ -13,29 +13,29 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { ProxyGateway } from '../src/core/gateway.js'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
-import { clearStores } from '../src/core/delegation.js'
-import { buildMerkleRoot, generateMerkleProof, verifyMerkleProof } from '../src/core/attribution.js'
+import { ProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { clearStores } from 'agent-passport-system'
+import { buildMerkleRoot, generateMerkleProof, verifyMerkleProof } from 'agent-passport-system'
 import { createHash } from 'crypto'
 import {
   createGovernanceArtifact, upgradeGovernanceArtifact,
   approveArtifact, createGovernanceEnvelope
-} from '../src/core/governance.js'
-import { DEFAULT_LOAD_POLICY } from '../src/types/governance.js'
+} from 'agent-passport-system'
+import { DEFAULT_LOAD_POLICY } from 'agent-passport-system'
 import {
   createEscalationGrant, requestEscalation, activateEscalation
-} from '../src/core/escalation.js'
-import type { GatewayConfig, ToolExecutor, ToolCallRequest } from '../src/types/gateway.js'
+} from 'agent-passport-system'
+import type { GatewayConfig, ToolExecutor, ToolCallRequest } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(join(__dirname, '../values/floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '../../../node_modules/agent-passport-system/values/floor.yaml'), 'utf-8')
 const floor = loadFloor(floorYaml)
 const makeExecutor = (): ToolExecutor => async () => ({ success: true, result: 'ok' })
 

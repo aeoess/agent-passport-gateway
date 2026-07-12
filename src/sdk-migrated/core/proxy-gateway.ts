@@ -34,7 +34,7 @@ import {
   verify, sign as signData,
   canonicalize,
   createActionIntent, evaluateIntent, createPolicyReceipt, FloorValidatorV1,
-  verifyDelegation, createReceipt, scopeAuthorizes, getRevocation,
+  verifyDelegation, createReceipt, scopeAuthorizes,
   evaluateCredentialCheck,
   verifyPassport,
   verifyAttestation,
@@ -54,6 +54,7 @@ import {
   checkCommerceConstraint,
 } from 'agent-passport-system'
 import { triggerDemotion } from './reputation-analytics.js'
+import { DelegationStore } from './delegation-store.js'
 import type {
   StorageBackend, StoredAgentRecord,
   ActiveEscalation, EscalationGrant,
@@ -104,6 +105,13 @@ export class ProxyGateway {
   // credentialCheckPolicy at process time. Proposed by @piiiico on
   // a2aproject/A2A governance metadata thread.
   private acceptanceStamps: Map<string, AcceptanceStamp> = new Map()
+  // ── Delegation state (post-extraction) ──
+  // The SDK's module-scope revocation/receipt/chain registries moved to the
+  // gateway's DelegationStore (see delegation-store.ts, migrated 2026-04-17).
+  // The SDK stubs (getRevocation et al.) now throw MOVED errors, so the
+  // gateway owns one store per enforcement context. Public so callers
+  // (and tests) can record out-of-band revocations the gateway must honor.
+  readonly delegationStore = new DelegationStore()
   private executor: ToolExecutor
   private storage?: StorageBackend
   // ── Transactional Integrity Layer ──
@@ -247,7 +255,7 @@ export class ProxyGateway {
     // Verify each delegation
     const delegationMap = new Map<string, Delegation>()
     for (const d of delegations) {
-      const status = verifyDelegation(d)
+      const status = verifyDelegation(d, { cachedRevocationState: this.cachedRevocationState(d.delegationId) })
       if (status.valid && !status.expired && !status.revoked) {
         delegationMap.set(d.delegationId, d)
       }
@@ -337,7 +345,7 @@ export class ProxyGateway {
   addDelegation(agentId: string, delegation: Delegation): { added: boolean; error?: string } {
     const agent = this.agents.get(agentId)
     if (!agent) return { added: false, error: 'Agent not registered' }
-    const status = verifyDelegation(delegation)
+    const status = verifyDelegation(delegation, { cachedRevocationState: this.cachedRevocationState(delegation.delegationId) })
     if (!status.valid) return { added: false, error: `Invalid delegation: ${status.errors?.join(', ')}` }
     if (status.expired) return { added: false, error: 'Delegation expired' }
     if (status.revoked) return { added: false, error: 'Delegation revoked' }
@@ -556,7 +564,7 @@ export class ProxyGateway {
       delegation = escalationDelegation!
     }
 
-    const delegationStatus = verifyDelegation(delegation)
+    const delegationStatus = verifyDelegation(delegation, { cachedRevocationState: this.cachedRevocationState(delegation.delegationId) })
     if (!delegationStatus.valid || delegationStatus.expired || delegationStatus.revoked) {
       this.stats.totalDenied++
       const facet: ConstraintFacet = delegationStatus.revoked ? 'revocation' : 'time'
@@ -801,7 +809,7 @@ export class ProxyGateway {
     //   both → require a valid acceptance stamp AND run the live recheck
     if (this.config.recheckRevocationOnExecute) {
       this.stats.revocationRechecksTriggered++
-      const liveRevoked = getRevocation(delegation.delegationId)
+      const liveRevoked = this.delegationStore.getRevocation(delegation.delegationId)
       const liveStateValid = !liveRevoked
 
       const ccpResult = evaluateCredentialCheck({
@@ -1260,7 +1268,7 @@ export class ProxyGateway {
 
     if (this.config.recheckRevocationOnExecute) {
       this.stats.revocationRechecksTriggered++
-      const delegationStatus = verifyDelegation(delegation)
+      const delegationStatus = verifyDelegation(delegation, { cachedRevocationState: this.cachedRevocationState(delegation.delegationId) })
       const liveStateValid = delegationStatus.valid && !delegationStatus.expired && !delegationStatus.revoked
       const ccpResult = evaluateCredentialCheck({
         delegation,
@@ -1911,6 +1919,20 @@ export class ProxyGateway {
     return null
   }
 
+  /**
+   * Point-in-time revocation state for the SDK's pure verifyDelegation.
+   * Pre-extraction, verifyDelegation consulted the SDK's module-scope
+   * revocation registry; that registry now lives on this gateway's
+   * DelegationStore (delegation-store.ts, migrated 2026-04-17), so every
+   * validity checkpoint feeds the store's view in explicitly — the same
+   * pattern DelegationStore.createReceipt uses.
+   */
+  private cachedRevocationState(delegationId: string): { revoked: boolean; checkedAt: string } | undefined {
+    return this.delegationStore.getRevocation(delegationId)
+      ? { revoked: true, checkedAt: new Date().toISOString() }
+      : undefined
+  }
+
   private buildValidationContext(agent: RegisteredAgent, delegation: Delegation): ValidationContext {
     return {
       floorVersion: agent.attestation.floorVersion,
@@ -1921,7 +1943,7 @@ export class ProxyGateway {
       })),
       delegation: {
         scope: delegation.scope, spendLimit: delegation.spendLimit, spentAmount: 0,
-        expiresAt: delegation.expiresAt, revoked: !!getRevocation(delegation.delegationId),
+        expiresAt: delegation.expiresAt, revoked: !!this.delegationStore.getRevocation(delegation.delegationId),
         currentDepth: delegation.currentDepth, maxDepth: delegation.maxDepth
       },
       agentRegistered: true, agentAttestationValid: true

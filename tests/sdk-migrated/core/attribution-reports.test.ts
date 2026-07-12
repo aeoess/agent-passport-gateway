@@ -126,7 +126,17 @@ describe('Attribution Computation', () => {
   })
 
   it('anti-gaming: 1000x spend gets logarithmic (not linear) weight', () => {
-    const d = makeDelegation()
+    // The SDK's createReceipt now enforces spend <= delegation remaining
+    // (agent-passport-system core/delegation: "Spend X exceeds remaining Y"),
+    // so the 10000-spend receipt must come from a delegation whose limit
+    // permits it. The weight assertion below is unchanged.
+    const d = createDelegation({
+      delegatedTo: agentA.publicKey,
+      delegatedBy: human.publicKey,
+      scope: ['code_execution', 'web_search', 'git_operations'],
+      spendLimit: 20000,
+      privateKey: human.privateKey
+    })
     const small = makeReceipt(d, 'code_execution', 10)
     const huge = makeReceipt(d, 'code_execution', 10000)
     const attrSmall = computeAttribution([small], 'agent-a', 'x', verifier.privateKey)

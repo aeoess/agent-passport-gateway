@@ -29,7 +29,7 @@ import {
   registerAffectedParty, fileComplaint, resolveComplaint,
   fileAppeal, resolveAppeal, getComplaints,
   clearAffectedPartyStores,
-} from '../src/v2/index.js'
+} from './v2-surface.js'
 
 // ═══════════════════════════════════════
 // A1: EPISTEMIC ISOLATION
