@@ -296,9 +296,19 @@ export function checkDelegationNarrowing(parent: NarrowingParent | null, child: 
       violations.push(`scope "${cs}" is not within the parent delegation scope`)
     }
   }
-  if (child.spend_limit != null && parent.spend_limit != null) {
+  // Money-path narrowing. Only gate when the ANCESTOR carries a bounded spend budget. When the
+  // parent has no bound (spend_limit null), the child may leave spend unbounded (no bound to widen)
+  // or introduce one (narrowing) -- both stay allowed, so skip. When the parent IS bounded:
+  //  - a null (absent) child spend_limit is treated as UNLIMITED at enforcement time (see the
+  //    `delegation.spend_limit != null` gate on the /evaluate path), so it would WIDEN the bounded
+  //    ancestor to unbounded spend. Monotonic narrowing forbids that: authority can only decrease.
+  //    Reject it; the child must carry an explicit bound no larger than the parent's remaining.
+  //  - a set child spend_limit may not exceed the parent's remaining budget.
+  if (parent.spend_limit != null) {
     const remaining = parent.spend_limit - (parent.spend_used || 0)
-    if (child.spend_limit > remaining) {
+    if (child.spend_limit == null) {
+      violations.push(`spend_limit is absent (unbounded), but the parent delegation is bounded (remaining budget ${remaining}); an unbounded child would widen a bounded ancestor. Set a spend_limit no greater than ${remaining}.`)
+    } else if (child.spend_limit > remaining) {
       violations.push(`spend_limit ${child.spend_limit} exceeds parent remaining budget ${remaining}`)
     }
   }
