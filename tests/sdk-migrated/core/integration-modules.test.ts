@@ -6,21 +6,21 @@
 
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { ProxyGateway, createProxyGateway } from '../src/core/gateway.js'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
-import { clearStores } from '../src/core/delegation.js'
-import { createCrossChainPermit, countersignPermit } from '../src/core/cross-chain.js'
-import { createObligation } from '../src/core/obligations.js'
-import type { ToolCallRequest, ToolExecutor, GatewayConfig } from '../src/types/gateway.js'
+import { ProxyGateway, createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { clearStores } from 'agent-passport-system'
+import { createCrossChainPermit, countersignPermit } from 'agent-passport-system'
+import { createObligation } from 'agent-passport-system'
+import type { ToolCallRequest, ToolExecutor, GatewayConfig } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(join(__dirname, '../values/floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '../../../node_modules/agent-passport-system/values/floor.yaml'), 'utf-8')
 const floor = loadFloor(floorYaml)
 
 // ── Test Helpers ──

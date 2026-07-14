@@ -29,7 +29,7 @@ import {
   // M8: Policy Profiles
   createProfile, attachProfile, checkProfileCompliance,
   detachProfile, getProfilesForTarget, clearPolicyProfileStores,
-} from '../src/v2/index.js'
+} from './v2-surface.js'
 
 // ═══════════════════════════════════════
 // M1: SEMANTIC SCOPING

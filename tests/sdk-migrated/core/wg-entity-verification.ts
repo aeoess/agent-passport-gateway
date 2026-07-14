@@ -11,10 +11,10 @@
 
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
 import {
   createPrincipalIdentity,
   endorseAgent,
@@ -26,15 +26,15 @@ import {
   createProxyGateway,
   revokeDelegation,
   clearStores,
-} from '../src/index.js'
-import type { ToolCallRequest, GatewayConfig, ToolExecutor } from '../src/types/gateway.js'
-import type { EntityBinding } from '../src/types/principal.js'
+} from 'agent-passport-system'
+import type { ToolCallRequest, GatewayConfig, ToolExecutor } from 'agent-passport-system'
+import type { EntityBinding } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(join(__dirname, '..', 'values', 'floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '..', '..', '..', 'node_modules', 'agent-passport-system', 'values', 'floor.yaml'), 'utf-8')
 const floor = loadFloor(floorYaml)
 
 describe('WG Entity Verification v1.0 — Boyd Joint Test (APS)', () => {

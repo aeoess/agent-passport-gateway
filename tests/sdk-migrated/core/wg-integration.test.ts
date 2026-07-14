@@ -13,23 +13,23 @@
 
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { joinSocialContract, delegate } from '../src/contract.js'
-import { generateKeyPair, sign, verify } from '../src/crypto/keys.js'
-import { canonicalize } from '../src/core/canonical.js'
-import { loadFloor } from '../src/core/values.js'
-import { createDID } from '../src/core/did.js'
-import { createPrincipalIdentity, endorseAgent } from '../src/core/principal.js'
-import { createProxyGateway } from '../src/core/gateway.js'
-import { classifyEvidence, resolveAuthorityTier, updateReputationFromResult } from '../src/core/reputation-authority.js'
-import type { ScopedReputation } from '../src/types/reputation-authority.js'
-import { clearStores } from '../src/core/delegation.js'
-import type { ToolCallRequest, ToolExecutor, GatewayConfig } from '../src/types/gateway.js'
+import { joinSocialContract, delegate } from 'agent-passport-system'
+import { generateKeyPair, sign, verify } from 'agent-passport-system'
+import { canonicalize } from 'agent-passport-system'
+import { loadFloor } from 'agent-passport-system'
+import { createDID } from 'agent-passport-system'
+import { createPrincipalIdentity, endorseAgent } from 'agent-passport-system'
+import { createProxyGateway } from '../../../src/sdk-migrated/core/proxy-gateway.js'
+import { classifyEvidence, resolveAuthorityTier, updateReputationFromResult } from 'agent-passport-system'
+import type { ScopedReputation } from 'agent-passport-system'
+import { clearStores } from 'agent-passport-system'
+import type { ToolCallRequest, ToolExecutor, GatewayConfig } from 'agent-passport-system'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const floorYaml = readFileSync(join(__dirname, '../values/floor.yaml'), 'utf-8')
+const floorYaml = readFileSync(join(__dirname, '../../../node_modules/agent-passport-system/values/floor.yaml'), 'utf-8')
 
 // ══════════════════════════════════════════════════════════════════
 // CROSS-PROJECT INTERFACES
@@ -481,7 +481,6 @@ describe('WG Cross-Project Integration Test', () => {
   it('revocation: cascade revocation blocks execution after approval', async () => {
     clearStores()
     const floor = loadFloor(floorYaml)
-    const { revokeDelegation } = await import('../src/core/delegation.js')
 
     const principal = joinSocialContract({
       name: 'Revoke Test Principal', mission: 'Test revocation', owner: 'tester',
@@ -522,8 +521,12 @@ describe('WG Cross-Project Integration Test', () => {
     })
     assert.ok(r1.executed, 'Revocation: first call succeeds')
 
-    // Now revoke the delegation
-    revokeDelegation(delegation.delegationId, principal.keyPair.publicKey, 'Integration test revocation', principal.keyPair.privateKey)
+    // Now revoke the delegation. Revocation state moved from the SDK's
+    // module-scope registry to the gateway's DelegationStore during the
+    // 2026-04-17 extraction (src/sdk-migrated/core/delegation-store.ts); the
+    // gateway consults its own store at execution time (proxy-gateway.ts
+    // buildValidationContext / revocation recheck).
+    gw.delegationStore.revokeDelegation(delegation.delegationId, principal.keyPair.publicKey, 'Integration test revocation', principal.keyPair.privateKey)
 
     // Second call should be denied — revocation recheck at execution time
     const reqId2 = `rev-fail-${Date.now()}`

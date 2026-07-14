@@ -13,10 +13,10 @@
 import {
   createActionIntent, evaluateIntent,
   createAgoraMessage, appendToFeed,
-  verifyDelegation, getRevocation, scopeAuthorizes,
+  verifyDelegation, scopeAuthorizes,
 } from 'agent-passport-system'
 import { commercePreflight } from './commerce-preflight.js'
-import type { SignedPassport, ActionReceipt, Delegation } from 'agent-passport-system'
+import type { SignedPassport, ActionReceipt, Delegation, RevocationRecord } from 'agent-passport-system'
 import type { ActionIntent, PolicyDecision, PolicyValidator, ValidationContext } from 'agent-passport-system'
 import type {
   CommerceDelegation, CommerceActionReceipt,
@@ -156,6 +156,17 @@ export interface DelegationValidationResult {
 export function validateCommerceDelegation(
   commerceDelegation: CommerceDelegation,
   protocolDelegation: Delegation,
+  opts?: {
+    /**
+     * Point-in-time revocation record for the protocol delegation, supplied by
+     * the caller from its DelegationStore (the SDK's module-scope revocation
+     * registry moved there in the 2026-04-17 extraction — see
+     * delegation-store.ts). Omitting it means "no cached revocation state",
+     * mirroring ScopedDelegationContract.verify(); it is not a claim of live
+     * non-revocation.
+     */
+    revocation?: RevocationRecord
+  },
 ): DelegationValidationResult {
   const errors: string[] = []
 
@@ -163,7 +174,7 @@ export function validateCommerceDelegation(
     errors.push(`Delegation ID mismatch: commerce=${commerceDelegation.delegationId}, protocol=${protocolDelegation.delegationId}`)
   }
 
-  const revocation = getRevocation(protocolDelegation.delegationId)
+  const revocation = opts?.revocation
   const notRevoked = !revocation
   if (revocation) {
     errors.push(`Delegation revoked at ${revocation.revokedAt}: ${revocation.reason || 'no reason'}`)
