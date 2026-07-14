@@ -1,0 +1,75 @@
+name: CI
+
+# The gateway guards the money path and had no CI at all until Day 148. The
+# consequence was concrete: a P1 delegation-narrowing fix and a hardcoded live
+# API key sat unmerged for three days, and 639 tests sat unexecuted since
+# 2026-04-17 (commit bdf5b8e stranded the `tests/` tree when the test glob
+# matched `test/` only). Nothing ran on push, so nothing said so.
+#
+# This is the minimum that would have caught all three.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: type-check and test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Strict ci install, no `|| npm install` fallback: a lockfile that cannot
+      # install cleanly should fail loudly, not silently resolve to different
+      # versions than the ones under review.
+      - name: Install dependencies
+        env:
+          NODE_ENV: development
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # Runs test/ AND tests/sdk-migrated. Do not narrow this glob back to
+      # test/ without moving the other tree: that is exactly how 639 tests
+      # went dark for three months.
+      - name: Test suite
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  credential-scan:
+    name: no hardcoded live credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A live gateway API key was committed to three eval scripts and stayed
+      # on main until Day 148. Removing it from HEAD does not remove it from
+      # history, so the only real defence is never landing the next one. This
+      # greps TRACKED files only, so local .gateway-credentials.md (gitignored)
+      # is not a false positive.
+      - name: Reject committed aps_live_ keys
+        run: |
+          if git grep -nE 'aps_live_[A-Za-z0-9]{16,}' -- . ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::A live API key literal (aps_live_...) is committed. Read it from an env var instead. If this key was ever pushed, rotate it: removing it from HEAD does not remove it from history."
+            exit 1
+          fi
+          echo "No committed aps_live_ key literals."
