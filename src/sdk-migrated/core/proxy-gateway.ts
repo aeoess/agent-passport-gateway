@@ -1294,6 +1294,17 @@ export class ProxyGateway {
 
     try {
       await previousLock
+      // Single-use is check-then-act unless the guard is re-evaluated INSIDE the
+      // serialized section. The check at the top of this method runs before
+      // `await previousLock`, so two concurrent calls on the same approvalId both
+      // clear it before either sets `consumed`, and both reach the tool. Re-check
+      // here, where the lock guarantees no other execution is in flight for this
+      // agent. draft-pidlisnyi-aps-03 5.3.2: an already consumed approval MUST NOT
+      // admit dispatch.
+      if (approval.consumed) {
+        this.stats.replayAttemptsBlocked++
+        return { executed: false, requestId: approval.requestId, denialReason: 'Approval already consumed (replay)' }
+      }
       return await this._executeApprovalInner(approval, agent, delegation)
     } finally {
       releaseLock!()
