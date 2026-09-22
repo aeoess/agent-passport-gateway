@@ -10,25 +10,25 @@ Build on a connected host, then carry the image in:
 
 ```sh
 # On a connected build host (context = repo root):
-docker build -f deploy/docker/Dockerfile -t aeoess-gateway:in-tenant .
-docker save aeoess-gateway:in-tenant -o aeoess-gateway-in-tenant.tar
+docker build -f deploy/docker/Dockerfile -t agent-passport-gateway:in-tenant .
+docker save agent-passport-gateway:in-tenant -o agent-passport-gateway-in-tenant.tar
 
-# Move aeoess-gateway-in-tenant.tar onto the air-gapped appliance, then:
-docker load -i aeoess-gateway-in-tenant.tar
+# Move agent-passport-gateway-in-tenant.tar onto the air-gapped appliance, then:
+docker load -i agent-passport-gateway-in-tenant.tar
 ```
 
 ## Run disconnected
 
 ```sh
 docker run -d \
-  --name aeoess-gateway \
+  --name agent-passport-gateway \
   --network none \
   -v /srv/aeoess/data:/data \
   -e ISOLATION_MODE=hard \
   -e TRUST_ROOT_SOURCE=hsm \
   -e TRUST_ROOT_KEY_REF="pkcs11:slot=0;object=tenant-signer" \
   -e DB_PATH=/data/gateway.db \
-  aeoess-gateway:in-tenant
+  agent-passport-gateway:in-tenant
 ```
 
 `--network none` removes the container's network entirely. The gateway still

@@ -109,9 +109,11 @@ export function authMiddleware(req: any, res: any, next: any) {
  * enterprise customer would have inherited platform-operator capabilities
  * including listing and soft-deleting other tenants.
  *
- * The AEOESS operator tenant (email signal@aeoess.com) is elevated to
- * role='admin' by the idempotent migration in src/db/schema.ts. All other
- * tenants default to role='user' regardless of plan.
+ * The tenant matching GATEWAY_OPERATOR_EMAIL (and, if set,
+ * GATEWAY_OPERATOR_EMAIL_ALIASES) is elevated to role='admin' by the
+ * idempotent migration in src/db/schema.ts. If that variable is unset, no
+ * tenant is elevated. All other tenants default to role='user' regardless
+ * of plan.
  *
  * Reference: CODE-AUDIT-2026-04-11.md §2.9, security triage fix 1.
  */

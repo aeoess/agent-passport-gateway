@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "aeoess-gateway.fullname" . }}-data
+  name: {{ include "agent-passport-gateway.fullname" . }}-data
   labels:
-    {{- include "aeoess-gateway.labels" . | nindent 4 }}
+    {{- include "agent-passport-gateway.labels" . | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteOnce

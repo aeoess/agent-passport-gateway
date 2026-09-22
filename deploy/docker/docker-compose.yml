@@ -10,7 +10,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: aeoess-gateway:in-tenant
+    image: agent-passport-gateway:in-tenant
     restart: unless-stopped
     ports:
       - "3200:3200"

@@ -2,7 +2,7 @@
 # Defaults are isolation-by-default (D2) and customer-owned everything.
 
 image:
-  repository: aeoess-gateway
+  repository: agent-passport-gateway
   tag: in-tenant
   pullPolicy: IfNotPresent
 

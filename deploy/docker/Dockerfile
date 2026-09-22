@@ -6,7 +6,7 @@
 # default, a customer-owned data volume, and a customer-supplied trust root.
 #
 # Build context is the repository root:
-#   docker build -f deploy/docker/Dockerfile -t aeoess-gateway:in-tenant .
+#   docker build -f deploy/docker/Dockerfile -t agent-passport-gateway:in-tenant .
 
 FROM node:22-slim
 

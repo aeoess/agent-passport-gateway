@@ -10,6 +10,21 @@ import { randomUUID } from 'node:crypto'
 let db: Database.Database
 
 /**
+ * Reads GATEWAY_OPERATOR_EMAIL and GATEWAY_OPERATOR_EMAIL_ALIASES (comma
+ * separated). Both are unset by default, with no email baked in. The
+ * operator role elevation and identity reconciliation migrations below
+ * are no-ops until an operator explicitly sets GATEWAY_OPERATOR_EMAIL.
+ */
+function operatorEmailConfig(): { email: string | null; aliases: string[] } {
+  const email = (process.env.GATEWAY_OPERATOR_EMAIL || '').trim().toLowerCase() || null
+  const aliases = (process.env.GATEWAY_OPERATOR_EMAIL_ALIASES || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+  return { email, aliases }
+}
+
+/**
  * ONE-TIME backfill for is_root (B1, Consilium): is_root is an ORIGIN property derived from HISTORY,
  * never from current edges. An agent is a root iff it has NEVER appeared as `child_agent_id` in
  * delegations under ANY status (active, revoked, expired, pending, suspended). Any agent that has
@@ -764,16 +779,25 @@ function createTables() {
   // Decouples admin authorization from the `plan` billing concept.
   // role = 'admin'  → platform operator (can access /api/v1/admin/* routes)
   // role = 'user'   → regular tenant (default)
-  // The AEOESS operator tenant is elevated to 'admin' by the idempotent
-  // UPDATE below. The WHERE clause covers both the legacy signal@aeoess.com
-  // (pre-2026-05-11) and the current operator@example.com login email — so a
-  // fresh DB reset that recreates either tenant still gets admin.
+  // The operator tenant is elevated to 'admin' by the idempotent UPDATE
+  // below, keyed on GATEWAY_OPERATOR_EMAIL and GATEWAY_OPERATOR_EMAIL_ALIASES.
+  // Neither has a default, so a fresh deployment elevates nobody until the
+  // operator explicitly configures their own login email.
   try { db.exec(`ALTER TABLE tenants ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`) } catch {}
-  try {
-    db.prepare(`UPDATE tenants SET role = 'admin'
-                WHERE email IN ('operator@example.com', 'signal@aeoess.com')
-                  AND role != 'admin'`).run()
-  } catch {}
+  {
+    const { email: operatorEmail, aliases: operatorAliases } = operatorEmailConfig()
+    const elevateEmails = operatorEmail ? [operatorEmail, ...operatorAliases] : []
+    if (elevateEmails.length === 0) {
+      console.log('[migration] GATEWAY_OPERATOR_EMAIL not set, skipping operator role elevation')
+    } else {
+      try {
+        const placeholders = elevateEmails.map(() => '?').join(', ')
+        db.prepare(`UPDATE tenants SET role = 'admin'
+                    WHERE email IN (${placeholders})
+                      AND role != 'admin'`).run(...elevateEmails)
+      } catch {}
+    }
+  }
 
   db.exec(`CREATE TABLE IF NOT EXISTS stripe_events (event_id TEXT PRIMARY KEY, processed_at TEXT DEFAULT (datetime('now')))`)
 
@@ -1096,142 +1120,137 @@ function createTables() {
   }
 
   // ───────────────────────────────────────
-  // 2026-05-11 operator-email rename (must run AFTER email_verified
-  // columns have been added above — otherwise the UPDATE references
-  // columns that do not exist yet and silently fails in the try/catch).
+  // Operator identity reconciliation (must run AFTER email_verified columns
+  // have been added above — otherwise the UPDATE references columns that
+  // do not exist yet and silently fails in the try/catch).
   //
-  // Tima requested moving his login from signal@aeoess.com (public-support
-  // alias) to operator@example.com (personal). Preserves tenant_id and every
-  // foreign-keyed row (API keys, agents, delegations, receipts). Idempotent:
-  // after the first deploy that runs this, no row matches the WHERE clause.
+  // Anchored on the only stable signal: role='admin', set by the role
+  // elevation migration above (itself gated on GATEWAY_OPERATOR_EMAIL).
+  // Anchoring on role rather than a specific email value survives a login
+  // provider (e.g. OAuth) creating a fresh tenant under one of the
+  // configured alias emails after the operator's primary email has
+  // already changed. Re-anchoring on email value in that case can
+  // tombstone the wrong row.
   //
-  // email_verified is set to 1 because the rename is itself the verification
-  // act (an admin operator authorizing the new address).
+  // Idempotent. No-op if GATEWAY_OPERATOR_EMAIL is unset. Note this does
+  // not demote a tenant that was already elevated to role='admin' while
+  // the variable was set; there is no code path that revokes role='admin'
+  // once granted. It only stops advancing that tenant's email and aliases
+  // toward whatever GATEWAY_OPERATOR_EMAIL currently says.
   //
-  // First attempt (0c56a95) failed with `UNIQUE constraint failed: tenants.email`.
-  // A non-operator tenant exists with email=operator@example.com — likely a stray
-  // signup that was later soft-deleted (status='deleted'). The unique index
-  // does not respect status, so its email still holds the slot. Step 1 below
-  // tombstones that stray row's email so step 2 can claim the address.
-  //
-  // signal@aeoess.com remains the public support address in copy throughout
-  // the site and in transactional emails — that is separate from the tenant
-  // login email.
+  // Goal end-state when GATEWAY_OPERATOR_EMAIL=E and
+  // GATEWAY_OPERATOR_EMAIL_ALIASES=A1,A2,... (idempotent):
+  //   - role='admin' tenant has email=E, email_verified=1
+  //   - any other tenant currently holding E has its data moved into the
+  //     admin and its email tombstoned + status='deleted'
+  //   - any tenant holding one of A1, A2, ... that is NOT admin has its
+  //     data merged into admin + tombstoned + status='deleted'
+  //   - E and each alias are seeded as verified tenant_aliases rows on the
+  //     admin, so any login surface (email-password, OAuth) that
+  //     authenticates one of them resolves to the same tenant
   // ───────────────────────────────────────
-
-  // ───────────────────────────────────────
-  // 2026-05-11 operator-identity reconciliation
-  //
-  // The earlier migration sequence (signal→tima rename + stray-merge)
-  // was identity-anchored on email values. That broke when a GitHub
-  // OAuth sign-in created a new tenant holding signal@aeoess.com AFTER
-  // the operator had already been renamed to operator@example.com — the
-  // "tombstone any tima@ that isn't the signal@ row" step tombstoned
-  // the ADMIN row instead of the stray, swapping the data identity.
-  //
-  // This block re-anchors on the only stable signal: role='admin'.
-  // Only the operator tenant has admin (set via the role migration
-  // above). All other tenants are role='user' regardless of how they
-  // were created.
-  //
-  // Goal end-state (idempotent):
-  //   - role='admin' tenant has email='operator@example.com', email_verified=1
-  //   - any other tenant currently holding operator@example.com has its data
-  //     moved into the admin and its email tombstoned + status='deleted'
-  //   - any tenant with email='signal@aeoess.com' that is NOT admin
-  //     gets its data merged into admin + tombstoned + status='deleted'
-  // ───────────────────────────────────────
-  try {
-    const admin = db.prepare(
-      `SELECT id, email FROM tenants WHERE role = 'admin' LIMIT 1`
-    ).get() as { id?: string; email?: string } | undefined
-
-    if (!admin?.id) {
-      console.warn('[migration] reconcile: no admin tenant found, skipping')
+  {
+    const { email: operatorEmail, aliases: operatorAliases } = operatorEmailConfig()
+    if (!operatorEmail) {
+      console.log('[migration] GATEWAY_OPERATOR_EMAIL not set, skipping operator identity reconcile')
     } else {
-      // Helper to merge all FK rows from one tenant into another, then
-      // tombstone the source.
-      const mergeInto = (sourceId: string, destId: string, label: string) => {
-        if (sourceId === destId) return
-        const tables = db.prepare(
-          `SELECT m.name AS table_name
-             FROM sqlite_master m
-            WHERE m.type = 'table'
-              AND EXISTS (
-                SELECT 1 FROM pragma_table_info(m.name) p
-                WHERE p.name = 'tenant_id'
-              )
-              AND m.name != 'tenants'`
-        ).all() as Array<{ table_name: string }>
-        for (const { table_name } of tables) {
+      try {
+        const admin = db.prepare(
+          `SELECT id, email FROM tenants WHERE role = 'admin' LIMIT 1`
+        ).get() as { id?: string; email?: string } | undefined
+
+        if (!admin?.id) {
+          console.warn('[migration] reconcile: no admin tenant found, skipping')
+        } else {
+          // Helper to merge all FK rows from one tenant into another, then
+          // tombstone the source.
+          const mergeInto = (sourceId: string, destId: string, label: string) => {
+            if (sourceId === destId) return
+            const tables = db.prepare(
+              `SELECT m.name AS table_name
+                 FROM sqlite_master m
+                WHERE m.type = 'table'
+                  AND EXISTS (
+                    SELECT 1 FROM pragma_table_info(m.name) p
+                    WHERE p.name = 'tenant_id'
+                  )
+                  AND m.name != 'tenants'`
+            ).all() as Array<{ table_name: string }>
+            for (const { table_name } of tables) {
+              try {
+                const r = db.prepare(
+                  `UPDATE "${table_name}" SET tenant_id = ? WHERE tenant_id = ?`
+                ).run(destId, sourceId)
+                if (r.changes > 0) {
+                  console.log(`[migration] reconcile/${label}: moved ${r.changes} row(s) in ${table_name} from ${sourceId} -> ${destId}`)
+                }
+              } catch (e: any) {
+                console.error(`[migration] reconcile/${label}: ${table_name} move failed:`, e?.message || e)
+              }
+            }
+            db.prepare(
+              `UPDATE tenants SET email = ?, status = 'deleted' WHERE id = ?`
+            ).run(`tombstone-${label}-${sourceId.substring(0, 8)}@deleted.local`, sourceId)
+          }
+
+          // Step 1: any non-admin tenant currently holding the configured
+          // operator email (an imposter installed before reconciliation,
+          // or a stray signup). Merge it into the admin, tombstone it.
+          const imposters = db.prepare(
+            `SELECT id FROM tenants WHERE email = ? AND id != ?`
+          ).all(operatorEmail, admin.id) as Array<{ id: string }>
+          for (const imp of imposters) {
+            mergeInto(imp.id, admin.id, 'operator-imposter')
+          }
+
+          // Step 2: any non-admin tenant currently holding one of the
+          // configured alias emails. Merge their data into admin.
+          for (const alias of operatorAliases) {
+            const strays = db.prepare(
+              `SELECT id FROM tenants WHERE email = ? AND id != ?`
+            ).all(alias, admin.id) as Array<{ id: string }>
+            for (const s of strays) {
+              mergeInto(s.id, admin.id, 'operator-alias-stray')
+            }
+          }
+
+          // Step 3: the operator email slot is guaranteed free (or was
+          // already on admin). Set the admin's email.
           try {
-            const r = db.prepare(
-              `UPDATE "${table_name}" SET tenant_id = ? WHERE tenant_id = ?`
-            ).run(destId, sourceId)
-            if (r.changes > 0) {
-              console.log(`[migration] reconcile/${label}: moved ${r.changes} row(s) in ${table_name} from ${sourceId} -> ${destId}`)
+            db.prepare(
+              `UPDATE tenants SET email = ?,
+                                  email_verified = 1,
+                                  email_verified_at = COALESCE(email_verified_at, datetime('now'))
+                WHERE id = ?`
+            ).run(operatorEmail, admin.id)
+          } catch (e: any) {
+            console.error('[migration] reconcile: admin email set failed:', e?.message || e)
+          }
+
+          if (admin.email !== operatorEmail) {
+            console.log(`[migration] reconcile: admin email was '${admin.email}', now '${operatorEmail}' (tenant_id=${admin.id})`)
+          }
+
+          // Seed admin aliases so every configured alias email resolves to
+          // the same tenant on every login surface (email-password, GitHub
+          // OAuth, forgot-password). Without this, a fresh sign-in through
+          // an alias address would re-create the tenant it is meant to
+          // resolve to.
+          try {
+            db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+                        VALUES (?, ?, 'primary', 1)`).run(operatorEmail, admin.id)
+            for (const alias of operatorAliases) {
+              db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
+                          VALUES (?, ?, 'alias', 1)`).run(alias, admin.id)
             }
           } catch (e: any) {
-            console.error(`[migration] reconcile/${label}: ${table_name} move failed:`, e?.message || e)
+            console.error('[migration] admin alias seed failed:', e?.message || e)
           }
         }
-        db.prepare(
-          `UPDATE tenants SET email = ?, status = 'deleted' WHERE id = ?`
-        ).run(`tombstone-${label}-${sourceId.substring(0, 8)}@deleted.local`, sourceId)
-      }
-
-      // Step 1: any non-admin tenant currently holding operator@example.com
-      // (the imposter installed by the prior buggy migration). Merge it
-      // into the admin, tombstone the imposter.
-      const imposters = db.prepare(
-        `SELECT id FROM tenants WHERE email = 'operator@example.com' AND id != ?`
-      ).all(admin.id) as Array<{ id: string }>
-      for (const imp of imposters) {
-        mergeInto(imp.id, admin.id, 'tima-imposter')
-      }
-
-      // Step 2: any non-admin tenant currently holding signal@aeoess.com.
-      // These are legacy or fresh stray rows; merge their data into admin.
-      const signals = db.prepare(
-        `SELECT id FROM tenants WHERE email = 'signal@aeoess.com' AND id != ?`
-      ).all(admin.id) as Array<{ id: string }>
-      for (const s of signals) {
-        mergeInto(s.id, admin.id, 'signal-stray')
-      }
-
-      // Step 3: now the operator@example.com address slot is guaranteed free
-      // (or it was already on admin). Set the admin's email.
-      try {
-        db.prepare(
-          `UPDATE tenants SET email = 'operator@example.com',
-                              email_verified = 1,
-                              email_verified_at = COALESCE(email_verified_at, datetime('now'))
-            WHERE id = ?`
-        ).run(admin.id)
       } catch (e: any) {
-        console.error('[migration] reconcile: admin email set failed:', e?.message || e)
-      }
-
-      if (admin.email !== 'operator@example.com') {
-        console.log(`[migration] reconcile: admin email was '${admin.email}', now 'operator@example.com' (tenant_id=${admin.id})`)
-      }
-
-      // Seed admin aliases so both tima@ and signal@ resolve to the same
-      // tenant on every login surface (email-password, GitHub OAuth,
-      // forgot-password). Tima's GitHub primary verified email is
-      // signal@aeoess.com; without this alias, a fresh "Continue with
-      // GitHub" click would re-create the divergence we just cleaned up.
-      try {
-        db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
-                    VALUES (?, ?, 'primary', 1)`).run('operator@example.com', admin.id)
-        db.prepare(`INSERT OR IGNORE INTO tenant_aliases (email, tenant_id, source, verified)
-                    VALUES (?, ?, 'github-primary', 1)`).run('signal@aeoess.com', admin.id)
-      } catch (e: any) {
-        console.error('[migration] admin alias seed failed:', e?.message || e)
+        console.error('[migration] operator-identity reconcile failed:', e?.message || e)
       }
     }
-  } catch (e: any) {
-    console.error('[migration] operator-identity reconcile failed:', e?.message || e)
   }
 }
 

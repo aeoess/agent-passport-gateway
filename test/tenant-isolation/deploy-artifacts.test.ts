@@ -23,12 +23,12 @@ describe('in-tenant deploy artifacts exist', () => {
     'deploy/README.md',
     'deploy/docker/Dockerfile',
     'deploy/docker/docker-compose.yml',
-    'deploy/helm/aeoess-gateway/Chart.yaml',
-    'deploy/helm/aeoess-gateway/values.yaml',
-    'deploy/helm/aeoess-gateway/templates/deployment.yaml',
-    'deploy/helm/aeoess-gateway/templates/service.yaml',
-    'deploy/helm/aeoess-gateway/templates/pvc.yaml',
-    'deploy/helm/aeoess-gateway/templates/networkpolicy.yaml',
+    'deploy/helm/agent-passport-gateway/Chart.yaml',
+    'deploy/helm/agent-passport-gateway/values.yaml',
+    'deploy/helm/agent-passport-gateway/templates/deployment.yaml',
+    'deploy/helm/agent-passport-gateway/templates/service.yaml',
+    'deploy/helm/agent-passport-gateway/templates/pvc.yaml',
+    'deploy/helm/agent-passport-gateway/templates/networkpolicy.yaml',
     'deploy/terraform/main.tf',
     'deploy/airgap/README.md',
     'deploy/.env.example',
@@ -56,13 +56,13 @@ describe('in-tenant Docker image is isolation-by-default + customer-owned volume
 
 describe('Helm chart carries the isolation + trust-root knobs', () => {
   it('values.yaml defaults isolation.mode to hard', () => {
-    assert.match(read('deploy/helm/aeoess-gateway/values.yaml'), /mode:\s*hard/)
+    assert.match(read('deploy/helm/agent-passport-gateway/values.yaml'), /mode:\s*hard/)
   })
   it('deployment templates ISOLATION_MODE from values', () => {
-    assert.match(read('deploy/helm/aeoess-gateway/templates/deployment.yaml'), /ISOLATION_MODE/)
+    assert.match(read('deploy/helm/agent-passport-gateway/templates/deployment.yaml'), /ISOLATION_MODE/)
   })
   it('trust-root key reference comes from a Secret (not inline key material)', () => {
-    assert.match(read('deploy/helm/aeoess-gateway/templates/deployment.yaml'), /secretKeyRef/)
+    assert.match(read('deploy/helm/agent-passport-gateway/templates/deployment.yaml'), /secretKeyRef/)
   })
 })
 

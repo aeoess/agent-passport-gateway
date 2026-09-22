@@ -1,5 +1,5 @@
 apiVersion: v2
-name: aeoess-gateway
+name: agent-passport-gateway
 description: In-tenant AEOESS gateway (G-D4). Customer-run, isolation-by-default, customer-owned trust root.
 type: application
 version: 0.1.0
@@ -12,6 +12,6 @@ keywords:
   - isolation
 home: https://aeoess.com
 sources:
-  - https://github.com/aeoess/aeoess-gateway
+  - https://github.com/aeoess/agent-passport-gateway
 maintainers:
   - name: Tymofii Pidlisnyi

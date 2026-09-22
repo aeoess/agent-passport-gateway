@@ -1,18 +1,18 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "aeoess-gateway.fullname" . }}
+  name: {{ include "agent-passport-gateway.fullname" . }}
   labels:
-    {{- include "aeoess-gateway.labels" . | nindent 4 }}
+    {{- include "agent-passport-gateway.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "aeoess-gateway.selectorLabels" . | nindent 6 }}
+      {{- include "agent-passport-gateway.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "aeoess-gateway.selectorLabels" . | nindent 8 }}
+        {{- include "agent-passport-gateway.selectorLabels" . | nindent 8 }}
     spec:
       containers:
         - name: gateway
@@ -67,7 +67,7 @@ spec:
         - name: data
         {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "aeoess-gateway.fullname" . }}-data
+            claimName: {{ include "agent-passport-gateway.fullname" . }}-data
         {{- else }}
           emptyDir: {}
         {{- end }}

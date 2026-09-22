@@ -127,9 +127,10 @@ export interface TenantWithPassword extends Tenant {
  * Resolve a tenant by either its primary email OR any alias in
  * tenant_aliases. Returns null if no active tenant matches.
  *
- * This makes `signal@aeoess.com` and `operator@example.com` look up the same
- * tenant (assuming both are listed as aliases) — necessary because the
- * email-password sign-in surface needs to be symmetric with GitHub OAuth.
+ * This makes a tenant's primary email and any configured alias email (see
+ * GATEWAY_OPERATOR_EMAIL_ALIASES in src/db/schema.ts) look up the same
+ * tenant. That is necessary because the email-password sign-in surface
+ * needs to be symmetric with GitHub OAuth.
  */
 export function findTenantByEmail(email: string): TenantWithPassword | null {
   const db = getDB()

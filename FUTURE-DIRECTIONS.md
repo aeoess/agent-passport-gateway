@@ -1,7 +1,6 @@
 # FUTURE DIRECTIONS: Advanced Persistence & Distributed Governance
 
 **Status:** Research notes from 8-model consilium (March 26, 2026)
-**Classification:** PRIVATE — product roadmap, not open protocol
 
 These primitives become relevant when APS moves from single-gateway to multi-gateway,
 multi-principal, enterprise-grade governance. Each is backed by published research.

@@ -46,7 +46,7 @@ variable "namespace" {
 
 variable "chart_path" {
   type        = string
-  default     = "../helm/aeoess-gateway"
+  default     = "../helm/agent-passport-gateway"
   description = "Path to the in-tenant Helm chart."
 }
 

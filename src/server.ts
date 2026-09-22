@@ -482,9 +482,9 @@ app.get('/auth/github/callback', async (req, res) => {
 
   // Find tenant by ANY verified email (primary or otherwise) through the
   // tenant_aliases table. This is what makes "one account, multiple
-  // verified emails" work: a tenant with email=operator@example.com but a
-  // GitHub primary of signal@aeoess.com resolves to the same row as
-  // long as the admin has seeded signal@aeoess.com as an alias.
+  // verified emails" work: a tenant whose primary email differs from its
+  // GitHub primary email still resolves to the same row, as long as that
+  // GitHub email has been seeded as an alias.
   const db = getDB()
   let resolvedTenantId: string | null = null
   let matchedVia: string | null = null
