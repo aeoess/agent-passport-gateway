@@ -22,6 +22,9 @@ const TENANT = 'tnt_straddle'
 let server: Server, baseUrl: string
 const post = (p: string, b: unknown) => fetch(`${baseUrl}${p}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
 function seedAgent(id: string) { getDB().prepare(`INSERT INTO agents (id, tenant_id, agent_id, public_key, status) VALUES (?, ?, ?, 'pk', 'active')`).run(`row-${id}`, TENANT, id) }
+// C1 (Day 217): these rows are inserted directly with parent_agent_id='root' and no
+// parent_delegation_id (an origination row). checkBoundAuthorityChain now requires the terminal
+// grantor to exist in the tenant, so 'root' must be a real registered agent (seeded once in before()).
 function seedDelegation(id: string, child: string, spendLimit: number, spendUsed: number): string {
   getDB().prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, status, spend_limit, spend_used) VALUES (?, ?, 'root', ?, 'data:read', 'active', ?, ?)`).run(id, TENANT, child, spendLimit, spendUsed)
   return id
@@ -32,6 +35,7 @@ before(async () => {
   initDB(':memory:')
   initGatewayIdentity()
   getDB().prepare(`INSERT OR IGNORE INTO tenants (id, name, email) VALUES (?, ?, ?)`).run(TENANT, 'Straddle', 'st@test.local')
+  seedAgent('root')
   const app = express()
   app.use(express.json())
   app.use((req: any, _res, next) => { req.tenant = { id: TENANT, role: 'user', plan: 'enterprise' }; next() })

@@ -27,6 +27,8 @@ function seedAgent(id: string) {
 // A live delegation the agent can spend against: spend_limit 100, already spent 50 -> 50 remaining.
 // Only columns present at BOTH the pre-fix commit and current are used (max_depth/current_depth
 // were introduced by the fix commit e3672c0 itself, and the /evaluate cost path never reads them).
+// C1 (Day 217): parent_agent_id='root' with no parent_delegation_id is an origination row;
+// checkBoundAuthorityChain requires the terminal grantor to exist, so 'root' is seeded in before().
 function seedDelegation(child: string, spendUsed = 50): string {
   const id = `d-${child}`
   getDB().prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, status, spend_limit, spend_used) VALUES (?, ?, 'root', ?, 'data:read', 'active', 100, ?)`)
@@ -39,6 +41,7 @@ before(async () => {
   initDB(':memory:')
   initGatewayIdentity()
   getDB().prepare(`INSERT OR IGNORE INTO tenants (id, name, email) VALUES (?, ?, ?)`).run(TENANT, 'NegCost', 'nc@test.local')
+  seedAgent('root')
   const app = express()
   app.use(express.json())
   app.use((req: any, _res, next) => { req.tenant = { id: TENANT, role: 'user', plan: 'enterprise' }; next() })
