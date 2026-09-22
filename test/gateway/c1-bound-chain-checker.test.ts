@@ -163,10 +163,23 @@ describe('checkBoundAuthorityChain - agent status decides liveness at every hop'
     assert.deepEqual(checkBoundAuthorityChain(getDB(), T, 'restg-d1'), { ok: true })
   })
 
-  it('an unknown/other agent status (frozen) fails closed, not treated as live', () => {
+  it('a frozen grantor pauses the chain with its own code, and unfreezing restores it', () => {
     seedAgent(T, 'frz-root', 'frozen'); seedAgent(T, 'frz-child')
     seedDel({ id: 'frz-d1', parent: 'frz-root', child: 'frz-child', parentDelId: null })
     const r = checkBoundAuthorityChain(getDB(), T, 'frz-d1')
+    assert.equal(r.ok, false)
+    assert.equal(r.code, 'agent_frozen')
+    getDB().prepare(`UPDATE agents SET status = 'active' WHERE tenant_id = ? AND agent_id = 'frz-root'`).run(T)
+    assert.deepEqual(checkBoundAuthorityChain(getDB(), T, 'frz-d1'), { ok: true })
+  })
+
+  it('a status outside the posture table fails closed as unknown', () => {
+    seedAgent(T, 'unk-root', 'active'); seedAgent(T, 'unk-child')
+    seedDel({ id: 'unk-d1', parent: 'unk-root', child: 'unk-child', parentDelId: null })
+    getDB().pragma('ignore_check_constraints = ON')
+    getDB().exec(`DROP TRIGGER IF EXISTS check_agents_status_update`)
+    getDB().prepare(`UPDATE agents SET status = 'mystery' WHERE tenant_id = ? AND agent_id = 'unk-root'`).run(T)
+    const r = checkBoundAuthorityChain(getDB(), T, 'unk-d1')
     assert.equal(r.ok, false)
     assert.equal(r.code, 'agent_unknown_status')
   })

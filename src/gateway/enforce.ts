@@ -336,6 +336,7 @@ export type ChainCheckCode =
   | 'max_hops_exceeded'
   | 'missing_agent'
   | 'agent_suspended'
+  | 'agent_frozen'
   | 'agent_revoked'
   | 'agent_unknown_status'
 
@@ -356,7 +357,8 @@ const MAX_CHAIN_HOPS = 64
  * row's parent_agent_id -- otherwise parent_delegation_id could point anywhere), a cycle, or a chain
  * longer than MAX_CHAIN_HOPS. At every hop the GRANTOR agent (row.parent_agent_id) -- including the
  * terminal/root grantor -- must exist in the tenant: 'active' and 'restricted' keep the chain live,
- * 'suspended' or 'revoked' invalidate it, any other or unknown status fails closed. restricted_scopes is
+ * 'suspended' and 'frozen' pause it (reversible, no row rewritten), 'revoked' invalidates it, any other
+ * or unknown status fails closed. restricted_scopes is
  * deliberately NOT consulted here (propagating a restricted ancestor's scope narrowing through the chain
  * is a separate policy question); only status decides liveness. Never require the terminal grantor to
  * be is_root -- auto-demotion on receiving a later inbound must not retroactively kill an earlier
@@ -393,6 +395,7 @@ export function checkBoundAuthorityChain(
     ).get(tenantId, row.parent_agent_id) as any
     if (!grantor) return { ok: false, code: 'missing_agent', hop }
     if (grantor.status === 'suspended') return { ok: false, code: 'agent_suspended', hop }
+    if (grantor.status === 'frozen') return { ok: false, code: 'agent_frozen', hop }
     if (grantor.status === 'revoked') return { ok: false, code: 'agent_revoked', hop }
     if (grantor.status !== 'active' && grantor.status !== 'restricted') {
       return { ok: false, code: 'agent_unknown_status', hop }
