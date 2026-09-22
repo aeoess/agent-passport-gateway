@@ -714,6 +714,19 @@ function createTables() {
   try { db.exec(`ALTER TABLE agents ADD COLUMN entity_verification_endpoint TEXT DEFAULT NULL`) } catch {}
   // Round-3: track the real chain depth so a delegation chain cannot grow past max_depth.
   try { db.exec(`ALTER TABLE delegations ADD COLUMN current_depth INTEGER NOT NULL DEFAULT 0`) } catch {}
+  // C1 (Day 217): bind every sub-delegation to the exact inbound delegation row that authorized and
+  // bounded it. NULL means an origination grant (the grantor held no inbound delegation). A narrowing
+  // grant stores the id of the specific parent delegation row selected at grant time -- not
+  // re-resolved later -- so authority is always evaluated over that BOUND chain via
+  // checkBoundAuthorityChain (src/gateway/enforce.ts), and revocation anywhere on the chain (including
+  // an ancestor's agent posture) invalidates every descendant bound to it without rewriting any row.
+  // Legacy rows predate this column and read NULL; per the D-20260921-DAY217-GW-C1-REPRO handoff this is
+  // treated as origination and is safe only because two aggregate checks (max active chain depth 1, zero
+  // orphan-state rows) show every active row today is a true origination -- rerun both immediately before
+  // any deploy that reads this column, and do NOT backfill from current_depth (DEFAULT 0 since its own
+  // migration, so pre-migration rows read 0 regardless of real depth).
+  try { db.exec(`ALTER TABLE delegations ADD COLUMN parent_delegation_id TEXT`) } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_delegations_tenant_parent_deleg ON delegations(tenant_id, parent_delegation_id)`) } catch {}
   try { db.exec(`ALTER TABLE agents ADD COLUMN metadata TEXT DEFAULT NULL`) } catch {}
   // R3-1: re-root audit fields on an existing root_designations table (additive, idempotent).
   try { db.exec(`ALTER TABLE root_designations ADD COLUMN re_root INTEGER NOT NULL DEFAULT 0`) } catch {}

@@ -325,6 +325,90 @@ export function checkDelegationNarrowing(parent: NarrowingParent | null, child: 
   return { ok: violations.length === 0, violations }
 }
 
+// C1 (Day 217): stable, row-data-free failure codes for a bound-chain check. hop is 1-indexed, counted
+// from the starting delegation row.
+export type ChainCheckCode =
+  | 'missing_row'
+  | 'cross_tenant'
+  | 'inactive_delegation'
+  | 'continuity_mismatch'
+  | 'cycle'
+  | 'max_hops_exceeded'
+  | 'missing_agent'
+  | 'agent_suspended'
+  | 'agent_frozen'
+  | 'agent_revoked'
+  | 'agent_unknown_status'
+
+export interface ChainCheckResult {
+  ok: boolean
+  code?: ChainCheckCode
+  hop?: number
+}
+
+const MAX_CHAIN_HOPS = 64
+
+/**
+ * C1 (Day 217): the one checker for bound-chain authority, read-only, used by both the grant path
+ * (the POST /delegations route gate and applyGrantWithReverify's in-transaction re-verify) and
+ * /evaluate. Walks a delegation's parent_delegation_id links up to its terminal (NULL-parent,
+ * origination) row and fails closed on the first bad hop: a missing or cross-tenant row, a delegation
+ * row whose status isn't 'active', a continuity break (the parent row's child_agent_id must equal this
+ * row's parent_agent_id -- otherwise parent_delegation_id could point anywhere), a cycle, or a chain
+ * longer than MAX_CHAIN_HOPS. At every hop the GRANTOR agent (row.parent_agent_id) -- including the
+ * terminal/root grantor -- must exist in the tenant: 'active' and 'restricted' keep the chain live,
+ * 'suspended' and 'frozen' pause it (reversible, no row rewritten), 'revoked' invalidates it, any other
+ * or unknown status fails closed. restricted_scopes is
+ * deliberately NOT consulted here (propagating a restricted ancestor's scope narrowing through the chain
+ * is a separate policy question); only status decides liveness. Never require the terminal grantor to
+ * be is_root -- auto-demotion on receiving a later inbound must not retroactively kill an earlier
+ * legitimate grant. Returns a stable code and the failing hop index only, never row data.
+ */
+export function checkBoundAuthorityChain(
+  db: Database.Database,
+  tenantId: string,
+  startDelegationId: string,
+): ChainCheckResult {
+  const visited = new Set<string>()
+  let currentId: string | null = startDelegationId
+  let expectedChildAgentId: string | null = null
+  let hop = 0
+
+  while (currentId) {
+    hop++
+    if (hop > MAX_CHAIN_HOPS) return { ok: false, code: 'max_hops_exceeded', hop }
+    if (visited.has(currentId)) return { ok: false, code: 'cycle', hop }
+    visited.add(currentId)
+
+    const row = db.prepare(
+      `SELECT id, tenant_id, parent_agent_id, child_agent_id, status, parent_delegation_id FROM delegations WHERE id = ?`
+    ).get(currentId) as any
+    if (!row) return { ok: false, code: 'missing_row', hop }
+    if (row.tenant_id !== tenantId) return { ok: false, code: 'cross_tenant', hop }
+    if (row.status !== 'active') return { ok: false, code: 'inactive_delegation', hop }
+    if (expectedChildAgentId !== null && row.child_agent_id !== expectedChildAgentId) {
+      return { ok: false, code: 'continuity_mismatch', hop }
+    }
+
+    const grantor = db.prepare(
+      `SELECT status FROM agents WHERE tenant_id = ? AND agent_id = ?`
+    ).get(tenantId, row.parent_agent_id) as any
+    if (!grantor) return { ok: false, code: 'missing_agent', hop }
+    if (grantor.status === 'suspended') return { ok: false, code: 'agent_suspended', hop }
+    if (grantor.status === 'frozen') return { ok: false, code: 'agent_frozen', hop }
+    if (grantor.status === 'revoked') return { ok: false, code: 'agent_revoked', hop }
+    if (grantor.status !== 'active' && grantor.status !== 'restricted') {
+      return { ok: false, code: 'agent_unknown_status', hop }
+    }
+
+    if (!row.parent_delegation_id) return { ok: true }
+
+    expectedChildAgentId = row.parent_agent_id
+    currentId = row.parent_delegation_id
+  }
+  return { ok: true }
+}
+
 export const gatewayRouter = Router()
 
 // ═══════════════════════════════════════
@@ -605,6 +689,17 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       verdict = 'deny'
       violations.push('No active delegation for agent')
     } else {
+      // C1 (Day 217): before scope and spend, walk the selected inbound delegation's BOUND chain
+      // (parent_delegation_id, not a re-resolved "current newest inbound" per ancestor). A revoked or
+      // suspended agent anywhere on that chain -- including the terminal root grantor -- ends this
+      // delegation's authority even though its own row is still 'active'. Intentionally fail-closed:
+      // if the acting agent holds a newer inbound whose chain is dead while an older inbound would
+      // still be valid, the newest-inbound selection above still denies (see handoff).
+      const chainCheck = checkBoundAuthorityChain(db, tenant.id, delegation.id)
+      if (!chainCheck.ok) {
+        verdict = 'deny'
+        violations.push(`Delegation authority chain is invalid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
+      }
       const allowedScopes = delegation.scope.split(',').map((s: string) => s.trim())
       // Use argument-pattern matching for broad-capability tools, fall back to simple scope
       const scopeMatched = scopeMatchesWithArguments(allowedScopes, scope_required, parsedArgs, scopeAuth)
@@ -1090,7 +1185,10 @@ gatewayRouter.post('/revoke', async (req: any, res) => {
       .run(tenant.id, target_id)
     cascadeCount = result.changes
   } else if (target_type === 'delegation') {
-    // Revoke specific delegation and downstream
+    // C1 (Day 217): revokes ONLY this row. Direct target only -- there is no downstream cascade here
+    // and there never was one; a descendant delegation bound to this row via parent_delegation_id loses
+    // authority through checkBoundAuthorityChain at evaluation/grant time, not by this UPDATE rewriting
+    // its status. Descendant rows are never touched by /revoke.
     db.prepare(`UPDATE delegations SET status = 'revoked', revoked_at = datetime('now') WHERE tenant_id = ? AND id = ?`)
       .run(tenant.id, target_id)
     cascadeCount = 1
@@ -1108,9 +1206,13 @@ gatewayRouter.post('/revoke', async (req: any, res) => {
   db.prepare(`INSERT INTO revocations (id, tenant_id, target_type, target_id, cascade_count, revoked_by) VALUES (?, ?, ?, ?, ?, ?)`)
     .run(revocationId, tenant.id, target_type, target_id, cascadeCount, revoked_by || 'api')
 
+  // C1 (Day 217): cascade_count is the number of rows this call directly updated (both sides of an
+  // agent revoke, or the single delegation row, or the count of agents who accessed a revoked data
+  // source) -- NOT a count of descendants in a delegation chain. Wording fixed to match; the JSON field
+  // name (cascade_count) is left in place for API compatibility.
   db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message) VALUES (?, ?, ?, ?, ?)`)
     .run(randomUUID(), tenant.id, 'revocation', 'critical',
-      `${target_type} "${target_id}" revoked. ${cascadeCount} downstream items affected.`)
+      `${target_type} "${target_id}" revoked. ${cascadeCount} row(s) directly updated.`)
   try { getEventBus().emit(tenant.id, { type: 'alert', data: { alert_type: 'revocation', severity: 'critical', target_type, target_id } }) } catch {}
 
   try { getEventBus().emit(tenant.id, { type: 'revocation', data: { revocationId, target_type, target_id, cascade_count: cascadeCount, revoked_by: revoked_by || 'api' } }) } catch {}
@@ -1565,6 +1667,12 @@ export class AuthorityChangedError extends Error {
  * re-read here is serialized against any concurrent authority-change commit. On a mismatch it throws
  * AuthorityChangedError (the route maps it to 409; the caller retries and gets the correct 403 from the
  * gate). Also carries the R4-1 audited demotion in the same transaction. Returns { demoted }.
+ *
+ * C1 (Day 217): the narrowing branch's re-verify is the FULL bound-chain check (checkBoundAuthorityChain
+ * on parentDelId), not just "is the immediate parentDel row still active" -- a revoked or suspended
+ * ancestor anywhere up the chain also invalidates it. The new row's parent_delegation_id is stored as
+ * parentDelId (NULL for an origination grant), permanently binding it to the exact inbound delegation
+ * that authorized it; revocation later never rewrites this or any descendant row.
  */
 export function applyGrantWithReverify(
   db: Database.Database,
@@ -1593,12 +1701,18 @@ export function applyGrantWithReverify(
       // Origination branch: the grantor must STILL be a designated root (not demoted since the gate read).
       if (!gNow.is_root) throw new AuthorityChangedError(`grantor "${opts.grantorId}" is no longer a designated root`)
     } else {
-      // Narrowing branch: the specific inbound delegation the gate bounded against must STILL be active.
-      const pd = db.prepare(`SELECT 1 FROM delegations WHERE tenant_id = ? AND id = ? AND status = 'active'`).get(opts.tenantId, opts.parentDelId)
-      if (!pd) throw new AuthorityChangedError(`the grantor's inbound delegation is no longer active`)
+      // C1 (Day 217): narrowing branch, re-verified INSIDE the write lock. The gate's route-level
+      // check (below) already ran this as an autocommit read before the transaction; a demotion,
+      // suspension, or revocation anywhere on the bound chain can still commit in the gap between that
+      // read and here (the same TOCTOU this transaction already closes for the immediate grantor), so
+      // the full chain check runs again against current rows before the insert.
+      const chainCheck = checkBoundAuthorityChain(db, opts.tenantId, opts.parentDelId as string)
+      if (!chainCheck.ok) {
+        throw new AuthorityChangedError(`the grantor's bound authority chain is no longer valid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
+      }
     }
-    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope, opts.spendLimit, opts.spendLimitCents, opts.maxDepth, opts.childDepth)
+    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth, parent_delegation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope, opts.spendLimit, opts.spendLimitCents, opts.maxDepth, opts.childDepth, opts.parentDelId)
     // R4-1 audited demotion: if the CHILD is a designated root, receiving this inbound subordinates it.
     const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.childId) as any
     if (childRoot && childRoot.is_root) {
@@ -1677,6 +1791,23 @@ gatewayRouter.post('/delegations', (req: any, res) => {
     }
     // is_root=1: a designated (or re-rooted) root originates freely; fall through to narrowing as a
     // fresh-budget root.
+  }
+
+  // C1 (Day 217): route-level gate, an autocommit read outside the write transaction. A narrowing
+  // grant (parentDel truthy) may only extend a BOUND chain that is still fully authoritative -- not
+  // just the immediate parentDel row (already status='active' by the query above), but every ancestor
+  // up to the terminal grantor. An already-dead chain 403s here before paying for a transaction;
+  // applyGrantWithReverify re-runs the same check INSIDE the write lock to close the TOCTOU gap between
+  // this read and the insert (a concurrent revoke/suspend lands 409, not a silently-granted delegation).
+  if (parentDel) {
+    const chainCheck = checkBoundAuthorityChain(db, tenant.id, parentDel.id)
+    if (!chainCheck.ok) {
+      return res.status(403).json({
+        error: 'Delegation rejected: the grantor\'s bound authority chain is invalid.',
+        code: chainCheck.code,
+        hop: chainCheck.hop,
+      })
+    }
   }
 
   const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
