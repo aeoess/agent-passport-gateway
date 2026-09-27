@@ -2,6 +2,10 @@
 
 The gateway is the runtime enforcement service for the Agent Passport System. It checks delegated authority before an action executes and signs a receipt for the result. Protocol semantics live in [agent-passport-system](https://github.com/aeoess/agent-passport-system). Changes that alter what a delegation, scope or receipt means belong there first.
 
+## Scope of this repository
+
+This repository is the public source of the gateway. The hosted service is deployed separately, so a merged PR here does not change a running deployment directly.
+
 ## Setup
 
 ```

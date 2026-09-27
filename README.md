@@ -67,7 +67,7 @@ npm test
 
 Runs the suite with the Node.js test runner.
 
-`test/trust-profile-jws.test.ts` currently has a known failure because the `jose` package is not resolvable from this tree's install.
+Install with `npm ci --include=dev`. If your shell sets `NODE_ENV=production`, npm skips devDependencies and tests that need them, such as `test/trust-profile-jws.test.ts`, fail to import.
 
 ## Container build
 
