@@ -5,12 +5,12 @@ The gateway is the runtime enforcement service for the Agent Passport System. It
 ## Setup
 
 ```
-npm ci
+npm ci --include=dev
 npm run build
 npm test
 ```
 
-`npm test` and `npx tsc --noEmit` must pass before a PR. The totals are whatever the suite reports, not a number written here.
+`npm test` and `npx tsc --noEmit` must pass before a PR. The totals are whatever the suite reports, not a number written here. `--include=dev` matters if your shell sets `NODE_ENV=production`, because npm then skips devDependencies the tests need.
 
 ## What a good PR looks like
 
