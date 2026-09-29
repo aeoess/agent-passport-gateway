@@ -61,6 +61,7 @@ import { toTeamsMessage } from '../src/notifications/connectors/adapters/teams.j
 import { toJiraIssue } from '../src/notifications/connectors/adapters/jira.js'
 import { toServiceNowIncident } from '../src/notifications/connectors/adapters/servicenow.js'
 import { makeEmailSink } from '../src/notifications/connectors/adapters/email-sink.js'
+import { makePagerDutySink, toPagerDutyEvent } from '../src/notifications/connectors/adapters/pagerduty.js'
 import {
   verifyInboundOffboard,
   applyOffboard,
@@ -356,6 +357,79 @@ describe('connectors - adapter shaping', () => {
     const sink = makeEmailSink({ to: 'ops@example.com', send: async () => ({ sent: false, queued: false }) })
     await assert.rejects(() => sink(sampleEvent('alert')))
   })
+})
+
+describe('connectors - PagerDuty Events API v2', () => {
+  const ROUTING_KEY = 'pagerduty-routing-key-must-not-leak'
+
+  function pagerDutyEvent(severity?: string, batch?: ConnectorEvent['batch']): ConnectorEvent {
+    return buildConnectorEvent({
+      eventType: 'alert',
+      eventId: 'evt-pagerduty',
+      tenantId: TENANT,
+      emittedAt: '2026-01-02T03:04:05.000Z',
+      data: severity ? { severity } : {},
+      ...(batch ? { batch } : {}),
+    })
+  }
+
+  it('maps an event to the exact deterministic PagerDuty payload', () => {
+    assert.deepEqual(toPagerDutyEvent(pagerDutyEvent('high'), ROUTING_KEY), {
+      routing_key: ROUTING_KEY,
+      event_action: 'trigger',
+      dedup_key: 'evt-pagerduty',
+      payload: {
+        summary: 'Gateway event: alert',
+        source: 'aeoess-gateway',
+        severity: 'error',
+        custom_details: {
+          event_type: 'alert',
+          event_id: 'evt-pagerduty',
+          tenant_id: TENANT,
+          emitted_at: '2026-01-02T03:04:05.000Z',
+        },
+      },
+    })
+    const event = pagerDutyEvent('high')
+    assert.equal(toPagerDutyEvent(event, ROUTING_KEY).dedup_key, toPagerDutyEvent(event, ROUTING_KEY).dedup_key)
+  })
+
+  it('maps every supported severity and defaults unknown or absent values to info', () => {
+    for (const [input, expected] of [['critical', 'critical'], ['high', 'error'], ['medium', 'warning'], ['warning', 'warning'], ['low', 'info'], [undefined, 'info']] as const) {
+      assert.equal(toPagerDutyEvent(pagerDutyEvent(input), ROUTING_KEY).payload.severity, expected)
+    }
+  })
+
+  it('includes the optional batch reference in custom details', () => {
+    const batch = { batchId: 'batch-1', merkleRoot: 'sha256:abc', epoch: 1, previousBatchId: null, previousMerkleRoot: null, receiptCount: 2, committedAt: '2026-01-02T03:00:00.000Z', summary: { total: 2, byVerdict: { permit: 2 }, byActionType: { read: 2 } } }
+    assert.deepEqual(toPagerDutyEvent(pagerDutyEvent('medium', batch), ROUTING_KEY).payload.custom_details.batch, batch)
+  })
+
+  it('resolves only when PagerDuty accepts the event and honors default and override endpoints', async () => {
+    let request: { url: string; body: string; headers: Record<string, string> } | undefined
+    const httpPost = async (req: { url: string; body: string; headers: Record<string, string> }) => {
+      request = req
+      return { status: 202 }
+    }
+    await makePagerDutySink({ routingKey: ROUTING_KEY, httpPost })(pagerDutyEvent('critical'))
+    assert.equal(request!.url, 'https://events.pagerduty.com/v2/enqueue')
+    const sink = makePagerDutySink({ endpoint: 'https://pagerduty.example/enqueue', routingKey: ROUTING_KEY, httpPost })
+    await sink(pagerDutyEvent('critical'))
+    assert.equal(request!.url, 'https://pagerduty.example/enqueue')
+    assert.equal(request!.headers['content-type'], 'application/json')
+  })
+
+  for (const status of [400, 429, 500]) {
+    it(`rejects PagerDuty status ${status} without exposing the routing key`, async () => {
+      const sink = makePagerDutySink({ routingKey: ROUTING_KEY, httpPost: async () => ({ status }) })
+      await assert.rejects(() => sink(pagerDutyEvent()), (error: Error) => {
+        assert.equal(error.name, 'ConnectorDeliveryError')
+        assert.match(error.message, new RegExp(String(status)))
+        assert.ok(!error.message.includes(ROUTING_KEY))
+        return true
+      })
+    })
+  }
 })
 
 // ── endpoint registration + filtering ─────────────────────────────

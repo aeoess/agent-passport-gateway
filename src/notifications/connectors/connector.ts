@@ -58,6 +58,7 @@ export type ConnectorKind =
   | 'teams'
   | 'jira'
   | 'servicenow'
+  | 'pagerduty'
   | 'internal-http'
   | 'email'
 
