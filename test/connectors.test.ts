@@ -419,6 +419,20 @@ describe('connectors - PagerDuty Events API v2', () => {
     assert.equal(request!.headers['content-type'], 'application/json')
   })
 
+  // PagerDuty documents 202 as the only accepted response for /v2/enqueue.
+  // Any other 2xx must be treated as not delivered.
+  for (const status of [200, 201, 204]) {
+    it(`rejects PagerDuty 2xx status ${status} because only 202 means accepted`, async () => {
+      const sink = makePagerDutySink({ routingKey: ROUTING_KEY, httpPost: async () => ({ status }) })
+      await assert.rejects(() => sink(pagerDutyEvent('critical')), (error: Error & { status?: number }) => {
+        assert.equal(error.name, 'ConnectorDeliveryError')
+        assert.equal(error.status, status)
+        assert.ok(!error.message.includes(ROUTING_KEY))
+        return true
+      })
+    })
+  }
+
   for (const status of [400, 429, 500]) {
     it(`rejects PagerDuty status ${status} without exposing the routing key`, async () => {
       const sink = makePagerDutySink({ routingKey: ROUTING_KEY, httpPost: async () => ({ status }) })
