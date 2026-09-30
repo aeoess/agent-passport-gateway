@@ -73,6 +73,7 @@ export { makeSlackSink, toSlackMessage } from './adapters/slack.js'
 export { makeTeamsSink, toTeamsMessage } from './adapters/teams.js'
 export { makeJiraSink, toJiraIssue } from './adapters/jira.js'
 export { makeServiceNowSink, toServiceNowIncident } from './adapters/servicenow.js'
+export { makePagerDutySink, toPagerDutyEvent } from './adapters/pagerduty.js'
 export { makeInternalHttpSink } from './adapters/internal-http.js'
 export { makeEmailSink, toEmail } from './adapters/email-sink.js'
 
